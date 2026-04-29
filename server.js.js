@@ -20,6 +20,13 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
+// ── Format user for frontend (camelCase) ─────────────────
+const formatUser = (u) => ({
+  ...u,
+  businessType: u.business_type,
+  staffId: u.staff_id,
+});
+
 // ── Auth middleware ───────────────────────────────────────
 const auth = (req, res, next) => {
   const header = req.headers.authorization;
@@ -123,7 +130,6 @@ async function initDB() {
     );
   `);
 
-  // Seed demo user
   const { rowCount: uc } = await pool.query('SELECT 1 FROM users LIMIT 1');
   if (uc === 0) {
     const hash = await bcrypt.hash('demo1234', 10);
@@ -133,7 +139,6 @@ async function initDB() {
     );
   }
 
-  // Seed staff
   const { rowCount: sc } = await pool.query('SELECT 1 FROM staff LIMIT 1');
   if (sc === 0) {
     await pool.query(`
@@ -206,7 +211,7 @@ app.post('/api/auth/signup', async (req, res) => {
       'INSERT INTO users (email, password_hash) VALUES ($1,$2) RETURNING *',
       [email.toLowerCase(), hash]
     );
-    res.status(201).json({ token: makeToken(rows[0]), user: rows[0] });
+    res.status(201).json({ token: makeToken(rows[0]), user: formatUser(rows[0]) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -218,7 +223,7 @@ app.post('/api/auth/login', async (req, res) => {
     if (!rows.length) return res.status(401).json({ error: 'Invalid email or password' });
     const valid = await bcrypt.compare(password, rows[0].password_hash);
     if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
-    res.json({ token: makeToken(rows[0]), user: rows[0] });
+    res.json({ token: makeToken(rows[0]), user: formatUser(rows[0]) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -229,7 +234,7 @@ app.post('/api/auth/business', auth, async (req, res) => {
       'UPDATE users SET business_type=$1 WHERE id=$2 RETURNING *',
       [businessType, req.user.id]
     );
-    res.json({ token: makeToken(rows[0]), user: rows[0] });
+    res.json({ token: makeToken(rows[0]), user: formatUser(rows[0]) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -240,7 +245,7 @@ app.post('/api/auth/role', auth, async (req, res) => {
       'UPDATE users SET role=$1, staff_id=$2 WHERE id=$3 RETURNING *',
       [role, staffId || null, req.user.id]
     );
-    res.json({ token: makeToken(rows[0]), user: rows[0] });
+    res.json({ token: makeToken(rows[0]), user: formatUser(rows[0]) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -248,7 +253,7 @@ app.get('/api/auth/me', auth, async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
     if (!rows.length) return res.status(401).json({ error: 'User not found' });
-    res.json(rows[0]);
+    res.json(formatUser(rows[0]));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
