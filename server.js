@@ -70,6 +70,21 @@ const formatUser = (u) => ({
   businessType: u.business_type,
   staffId: u.staff_id,
   createdAt: u.created_at,
+  trialStartedAt: u.trial_started_at,
+  trialEndsAt: u.trial_ends_at,
+  subscriptionStatus: u.subscription_status || 'trial',
+  businessId: u.business_id,
+  onboardingRole: u.onboarding_role,
+});
+
+const formatBusiness = (b) => ({
+  id: b.id,
+  name: b.name,
+  type: b.type,
+  ownerId: b.owner_id,
+  code: b.code,
+  staffCount: b.staff_count,
+  createdAt: b.created_at,
 });
 
 const formatStaff = (s) => ({
@@ -163,22 +178,57 @@ const auth = (req, res, next) => {
 };
 
 const makeToken = (user) => jwt.sign(
-  { id: user.id, email: user.email, role: user.role, businessType: user.business_type, staffId: user.staff_id },
+  { id: user.id, email: user.email, role: user.role, businessType: user.business_type, staffId: user.staff_id, businessId: user.business_id },
   JWT_SECRET,
   { expiresIn: '12h' }
 );
+
+function genBusinessCode() {
+  return crypto.randomBytes(3).toString('hex').toUpperCase();
+}
+
+function trialInfo(u) {
+  const now = new Date();
+  const ends = u.trial_ends_at ? new Date(u.trial_ends_at) : null;
+  const daysRemaining = ends ? Math.max(0, Math.ceil((ends - now) / (24 * 60 * 60 * 1000))) : 0;
+  const expired = ends ? now > ends : true;
+  const status = u.subscription_status || 'trial';
+  return {
+    subscriptionStatus: status,
+    trialStartedAt: u.trial_started_at,
+    trialEndsAt: u.trial_ends_at,
+    daysRemaining,
+    expired: expired && status !== 'active',
+    isPaid: status === 'active',
+  };
+}
 
 // ── DB init ───────────────────────────────────────────────
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
-      id            SERIAL PRIMARY KEY,
-      email         TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
-      role          TEXT,
-      business_type TEXT,
-      staff_id      INTEGER,
-      created_at    TIMESTAMPTZ DEFAULT NOW()
+      id                   SERIAL PRIMARY KEY,
+      email                TEXT UNIQUE NOT NULL,
+      password_hash        TEXT NOT NULL,
+      role                 TEXT,
+      business_type        TEXT,
+      staff_id             INTEGER,
+      business_id          INTEGER,
+      onboarding_role      TEXT,
+      trial_started_at     TIMESTAMPTZ DEFAULT NOW(),
+      trial_ends_at        TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '7 days'),
+      subscription_status  TEXT DEFAULT 'trial',
+      created_at           TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS businesses (
+      id          SERIAL PRIMARY KEY,
+      name        TEXT NOT NULL,
+      type        TEXT NOT NULL,
+      owner_id    INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      code        TEXT UNIQUE NOT NULL,
+      staff_count INTEGER DEFAULT 0,
+      created_at  TIMESTAMPTZ DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS password_resets (
@@ -276,6 +326,11 @@ async function initDB() {
     `ALTER TABLE requests ADD COLUMN IF NOT EXISTS product_id INTEGER REFERENCES inventory(id) ON DELETE SET NULL`,
     `ALTER TABLE requests ADD COLUMN IF NOT EXISTS quantity INTEGER DEFAULT 0`,
     `ALTER TABLE sop ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'General'`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS business_id INTEGER`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_role TEXT`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMPTZ DEFAULT NOW()`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '7 days')`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status TEXT DEFAULT 'trial'`,
   ];
   for (const q of alters) {
     try { await pool.query(q); } catch (e) { console.warn('alter skipped:', e.message); }
@@ -370,11 +425,13 @@ app.post('/api/auth/signup', async (req, res) => {
     const exists = await pool.query('SELECT id FROM users WHERE email=$1', [email.toLowerCase()]);
     if (exists.rowCount) return res.status(400).json({ error: 'Email already registered' });
     const hash = await bcrypt.hash(password, 10);
+    const trialEnd = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     const { rows } = await pool.query(
-      'INSERT INTO users (email, password_hash) VALUES ($1,$2) RETURNING *',
-      [email.toLowerCase(), hash]
+      `INSERT INTO users (email, password_hash, trial_started_at, trial_ends_at, subscription_status)
+       VALUES ($1, $2, NOW(), $3, 'trial') RETURNING *`,
+      [email.toLowerCase(), hash, trialEnd]
     );
-    res.status(201).json({ token: makeToken(rows[0]), user: formatUser(rows[0]) });
+    res.status(201).json({ token: makeToken(rows[0]), user: formatUser(rows[0]), trial: trialInfo(rows[0]) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -386,7 +443,7 @@ app.post('/api/auth/login', async (req, res) => {
     if (!rows.length) return res.status(401).json({ error: 'Invalid email or password' });
     const valid = await bcrypt.compare(password, rows[0].password_hash);
     if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
-    res.json({ token: makeToken(rows[0]), user: formatUser(rows[0]) });
+    res.json({ token: makeToken(rows[0]), user: formatUser(rows[0]), trial: trialInfo(rows[0]) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -462,6 +519,120 @@ app.get('/api/auth/me', auth, async (req, res) => {
 });
 
 app.post('/api/auth/logout', auth, (req, res) => res.json({ ok: true }));
+
+// ── Trial / Billing ───────────────────────────────────────
+app.get('/api/auth/trial-status', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
+    if (!rows.length) return res.status(404).json({ error: 'not found' });
+    res.json(trialInfo(rows[0]));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/billing/check-payment', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT subscription_status FROM users WHERE id=$1', [req.user.id]);
+    res.json({ paid: rows[0]?.subscription_status === 'active' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Mock subscription activation. Replace with Stripe checkout webhook in production.
+app.post('/api/billing/subscribe', auth, async (req, res) => {
+  try {
+    res.json({
+      checkoutUrl: null,
+      message: 'Stripe checkout not configured. Use POST /api/billing/mock-activate for testing.',
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/billing/mock-activate', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "UPDATE users SET subscription_status='active' WHERE id=$1 RETURNING *",
+      [req.user.id]
+    );
+    res.json({ ok: true, user: formatUser(rows[0]) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Businesses ────────────────────────────────────────────
+app.post('/api/businesses', auth, async (req, res) => {
+  try {
+    const { name, type, staffCount } = req.body;
+    if (!name || !type) return res.status(400).json({ error: 'name and type required' });
+    let code = null;
+    for (let i = 0; i < 8; i++) {
+      const candidate = genBusinessCode();
+      const { rowCount } = await pool.query('SELECT 1 FROM businesses WHERE code=$1', [candidate]);
+      if (!rowCount) { code = candidate; break; }
+    }
+    if (!code) return res.status(500).json({ error: 'Could not generate unique business code' });
+    const { rows } = await pool.query(
+      `INSERT INTO businesses (name, type, owner_id, code, staff_count)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [name, type, req.user.id, code, staffCount || 0]
+    );
+    const { rows: urows } = await pool.query(
+      `UPDATE users SET business_id=$1, business_type=$2, role='manager', onboarding_role='owner'
+       WHERE id=$3 RETURNING *`,
+      [rows[0].id, type, req.user.id]
+    );
+    res.status(201).json({
+      business: formatBusiness(rows[0]),
+      token: makeToken(urows[0]),
+      user: formatUser(urows[0]),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/businesses/join', auth, async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: 'business code required' });
+    const { rows } = await pool.query(
+      'SELECT * FROM businesses WHERE code=$1',
+      [code.trim().toUpperCase()]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Invalid business code' });
+    const business = rows[0];
+    const { rows: urows } = await pool.query(
+      `UPDATE users SET business_id=$1, business_type=$2, role='staff', onboarding_role='staff'
+       WHERE id=$3 RETURNING *`,
+      [business.id, business.type, req.user.id]
+    );
+    await pool.query(
+      'UPDATE businesses SET staff_count = staff_count + 1 WHERE id=$1',
+      [business.id]
+    );
+    res.json({
+      business: formatBusiness(business),
+      token: makeToken(urows[0]),
+      user: formatUser(urows[0]),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/businesses/me', auth, async (req, res) => {
+  try {
+    const { rows: urows } = await pool.query('SELECT business_id FROM users WHERE id=$1', [req.user.id]);
+    if (!urows.length || !urows[0].business_id) return res.json(null);
+    const { rows } = await pool.query('SELECT * FROM businesses WHERE id=$1', [urows[0].business_id]);
+    res.json(rows.length ? formatBusiness(rows[0]) : null);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// User can switch between owner/staff later. Resets business association.
+app.post('/api/auth/switch-onboarding', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE users SET business_id=NULL, business_type=NULL, role=NULL, onboarding_role=NULL
+       WHERE id=$1 RETURNING *`,
+      [req.user.id]
+    );
+    res.json({ token: makeToken(rows[0]), user: formatUser(rows[0]) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 // ── Staff ─────────────────────────────────────────────────
 app.get('/api/staff', auth, async (req, res) => {
