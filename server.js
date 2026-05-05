@@ -75,6 +75,7 @@ const formatUser = (u) => ({
   subscriptionStatus: u.subscription_status || 'trial',
   businessId: u.business_id,
   onboardingRole: u.onboarding_role,
+  tutorialCompleted: !!u.tutorial_completed,
 });
 
 const formatBusiness = (b) => ({
@@ -331,9 +332,51 @@ async function initDB() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMPTZ DEFAULT NOW()`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '7 days')`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status TEXT DEFAULT 'trial'`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS tutorial_completed BOOLEAN DEFAULT FALSE`,
+    // Multi-tenancy: scope all data to a business
+    `ALTER TABLE staff         ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
+    `ALTER TABLE bookings      ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
+    `ALTER TABLE inventory     ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
+    `ALTER TABLE requests      ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
+    `ALTER TABLE announcements ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
+    `ALTER TABLE sop           ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
+    `ALTER TABLE violations    ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
   ];
   for (const q of alters) {
     try { await pool.query(q); } catch (e) { console.warn('alter skipped:', e.message); }
+  }
+
+  // ── Migrations table ─────────────────────────────────
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS migrations (
+      name        TEXT PRIMARY KEY,
+      applied_at  TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  // ── One-time wipe: reset all data for fresh-start UX ─
+  // This clears every legacy record (demo seed, leftover test data) so
+  // every account — old or new — lands in a truly empty workspace and
+  // adds their own bookings/products/team. Runs only once per DB.
+  const wipeMarker = 'wipe_data_v2_fresh_start';
+  const { rows: wipeRows } = await pool.query(
+    `INSERT INTO migrations (name) VALUES ($1) ON CONFLICT DO NOTHING RETURNING name`,
+    [wipeMarker]
+  );
+  if (wipeRows.length) {
+    console.log('Running one-time data wipe migration:', wipeMarker);
+    await pool.query('DELETE FROM violations');
+    await pool.query('DELETE FROM requests');
+    await pool.query('DELETE FROM bookings');
+    await pool.query('DELETE FROM inventory');
+    await pool.query('DELETE FROM sop');
+    await pool.query('DELETE FROM announcements');
+    await pool.query('DELETE FROM staff');
+    // Clear any users.staff_id pointers that now reference deleted staff
+    await pool.query('UPDATE users SET staff_id = NULL WHERE staff_id IS NOT NULL');
+    // Reset tutorial flag so existing users see the new tutorial
+    await pool.query('UPDATE users SET tutorial_completed = FALSE');
+    console.log('Wipe complete');
   }
 
   // Drop any CHECK constraints on requests.type so stock_request is allowed
@@ -347,67 +390,18 @@ async function initDB() {
     }
   } catch (e) { console.warn('constraint drop skipped:', e.message); }
 
-  // Seed demo data
-  const { rowCount: uc } = await pool.query('SELECT 1 FROM users LIMIT 1');
-  if (uc === 0) {
+  // Ensure demo@opus.app exists for testing — but no auto-seeded data.
+  // Demo user goes through normal onboarding like any other user.
+  const { rowCount: hasDemo } = await pool.query(
+    "SELECT 1 FROM users WHERE email = 'demo@opus.app'"
+  );
+  if (!hasDemo) {
     const hash = await bcrypt.hash('demo1234', 10);
     await pool.query(
-      'INSERT INTO users (email, password_hash, role, business_type) VALUES ($1,$2,$3,$4)',
-      ['demo@opus.app', hash, 'manager', 'spa']
+      `INSERT INTO users (email, password_hash) VALUES ($1, $2)`,
+      ['demo@opus.app', hash]
     );
-  }
-
-  const { rowCount: sc } = await pool.query('SELECT 1 FROM staff LIMIT 1');
-  if (sc === 0) {
-    await pool.query(`
-      INSERT INTO staff (name, role, avatar, color, birthday, schedule) VALUES
-        ('Putri Ayu',    'Therapist',    'P', '#d4a574', '1990-03-15', ARRAY['Mon','Tue','Wed','Thu','Fri']),
-        ('Kadek Sari',   'Therapist',    'K', '#a8c5a0', '1993-07-22', ARRAY['Mon','Tue','Thu','Fri','Sat']),
-        ('Wayan Dewi',   'Receptionist', 'W', '#93c5fd', '1995-11-08', ARRAY['Mon','Tue','Wed','Fri','Sat']),
-        ('Made Surya',   'Therapist',    'M', '#c4b5fd', '1988-04-30', ARRAY['Mon','Tue','Wed','Thu','Sun']),
-        ('Nyoman Indah', 'Manager',      'N', '#2d5a4a', '1985-09-12', ARRAY['Mon','Tue','Wed','Thu','Fri']);
-    `);
-
-    await pool.query(`
-      INSERT INTO bookings (time, client, treatment, duration, staff_id, notes, status, price, allergies) VALUES
-        ('09:00', 'Sarah Mitchell', 'Deep Tissue Massage', 60, 2, 'Prefers firm pressure', 'confirmed', 350000, ''),
-        ('10:30', 'Emma Johnson',   'Swedish Massage',     90, 1, '',                      'confirmed', 450000, ''),
-        ('11:00', 'Lily Chen',      'Hot Stone Therapy',   75, 4, 'First time client',     'confirmed', 400000, ''),
-        ('12:00', 'Grace Lee',      'Aromatherapy',        60, 2, '',                      'confirmed', 300000, ''),
-        ('13:30', 'Maya Williams',  'Deep Tissue Massage', 90, 1, 'Allergic to nuts',      'confirmed', 450000, 'nuts'),
-        ('14:00', 'Zoe Martinez',   'Facial Treatment',    60, 3, '',                      'confirmed', 350000, ''),
-        ('15:30', 'Ava Thompson',   'Swedish Massage',     60, 4, '',                      'confirmed', 350000, ''),
-        ('16:00', 'Chloe Davis',    'Hot Stone Therapy',   90, 2, 'VIP client',            'confirmed', 500000, '');
-    `);
-
-    await pool.query(`
-      INSERT INTO inventory (name, category, stock, threshold, unit, supplier, last_order) VALUES
-        ('Massage Oil',            'Oils',       24,  5,  'bottles', 'BaliNaturals', '2024-03-01'),
-        ('Hot Stones Set',         'Equipment',   3,  2,  'sets',    'SpaEquip Co',  '2024-01-15'),
-        ('Bamboo Towels',          'Linens',     48, 10,  'pcs',     'LinenPro',     '2024-02-20'),
-        ('Lavender Essential Oil', 'Oils',        4,  5,  'bottles', 'BaliNaturals', '2024-02-28'),
-        ('Face Mask Sheets',       'Skincare',   60, 15,  'pcs',     'BeautySupply', '2024-03-05'),
-        ('Sandalwood Candles',     'Ambiance',   12,  8,  'pcs',     'AromaCo',      '2024-02-10'),
-        ('Exfoliating Scrub',      'Skincare',    8,  6,  'jars',    'BeautySupply', '2024-02-15'),
-        ('Disposable Sheets',      'Linens',    200, 50,  'pcs',     'LinenPro',     '2024-03-03');
-    `);
-
-    await pool.query(`
-      INSERT INTO sop (title, body, category) VALUES
-        ('Guest Greeting',    'Greet every guest with a smile and their name if known.', 'Guest Experience'),
-        ('Room Reset',        'Leave every room pristine after each treatment.', 'Hygiene'),
-        ('Product Decanting', 'Decant products carefully — respect what is given to you.', 'Products'),
-        ('Door Policy',       'Lock door from inside only when guest is present.', 'Safety'),
-        ('Noise Policy',      'Keep voice low near treatment rooms at all times.', 'Guest Experience');
-    `);
-
-    await pool.query(`
-      INSERT INTO announcements (title, body, "from") VALUES
-        ('Pavonia Training Tuesday', 'New Pavonia gold facial products arriving Monday. Crystal will train everyone Tuesday.', 'Ibu Rachel'),
-        ('Product Decanting Reminder', 'Please remember to decant products properly — we have been losing too much product this week.', 'Yanti');
-    `);
-
-    console.log('Database seeded');
+    console.log('Demo user created');
   }
 
   console.log('Database ready');
@@ -519,6 +513,17 @@ app.get('/api/auth/me', auth, async (req, res) => {
 });
 
 app.post('/api/auth/logout', auth, (req, res) => res.json({ ok: true }));
+
+app.post('/api/auth/complete-tutorial', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'UPDATE users SET tutorial_completed = TRUE WHERE id = $1 RETURNING *',
+      [req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'not found' });
+    res.json({ user: formatUser(rows[0]) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 // ── Trial / Billing ───────────────────────────────────────
 app.get('/api/auth/trial-status', auth, async (req, res) => {
@@ -634,21 +639,36 @@ app.post('/api/auth/switch-onboarding', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Multi-tenancy helper ──────────────────────────────────
+// Every data endpoint scopes to the authed user's business. Users without
+// a business_id (still in onboarding) get an empty result set / 403.
+const needBusiness = (req, res) => {
+  const bid = req.user.businessId;
+  if (!bid) {
+    res.status(403).json({ error: 'Complete onboarding first' });
+    return null;
+  }
+  return bid;
+};
+
 // ── Staff ─────────────────────────────────────────────────
 app.get('/api/staff', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM staff ORDER BY id');
+    const bid = req.user.businessId;
+    if (!bid) return res.json([]);
+    const { rows } = await pool.query('SELECT * FROM staff WHERE business_id = $1 ORDER BY id', [bid]);
     res.json(rows.map(formatStaff));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/staff', auth, async (req, res) => {
   try {
+    const bid = needBusiness(req, res); if (!bid) return;
     const { name, role, avatar, color, birthday, phone, schedule, commissionRate, permissions } = req.body;
     if (!name || !role) return res.status(400).json({ error: 'name and role required' });
     const { rows } = await pool.query(
-      'INSERT INTO staff (name, role, avatar, color, birthday, phone, schedule, commission_rate, permissions) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
-      [name, role, avatar || name[0].toUpperCase(), color || '#a8c5a0', birthday || null, phone || null, schedule || [], commissionRate || 30, JSON.stringify({ ...DEFAULT_PERMISSIONS, ...(permissions || {}) })]
+      'INSERT INTO staff (business_id, name, role, avatar, color, birthday, phone, schedule, commission_rate, permissions) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
+      [bid, name, role, avatar || name[0].toUpperCase(), color || '#a8c5a0', birthday || null, phone || null, schedule || [], commissionRate || 30, JSON.stringify({ ...DEFAULT_PERMISSIONS, ...(permissions || {}) })]
     );
     res.status(201).json(formatStaff(rows[0]));
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -656,10 +676,11 @@ app.post('/api/staff', auth, async (req, res) => {
 
 app.put('/api/staff/:id', auth, async (req, res) => {
   try {
+    const bid = needBusiness(req, res); if (!bid) return;
     const { name, role, avatar, color, birthday, phone, schedule, commissionRate, permissions } = req.body;
     const { rows } = await pool.query(
-      'UPDATE staff SET name=$1, role=$2, avatar=$3, color=$4, birthday=$5, phone=$6, schedule=$7, commission_rate=$8, permissions=$9 WHERE id=$10 RETURNING *',
-      [name, role, avatar, color, birthday || null, phone || null, schedule || [], commissionRate || 30, JSON.stringify({ ...DEFAULT_PERMISSIONS, ...(permissions || {}) }), req.params.id]
+      'UPDATE staff SET name=$1, role=$2, avatar=$3, color=$4, birthday=$5, phone=$6, schedule=$7, commission_rate=$8, permissions=$9 WHERE id=$10 AND business_id=$11 RETURNING *',
+      [name, role, avatar, color, birthday || null, phone || null, schedule || [], commissionRate || 30, JSON.stringify({ ...DEFAULT_PERMISSIONS, ...(permissions || {}) }), req.params.id, bid]
     );
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatStaff(rows[0]));
@@ -668,7 +689,8 @@ app.put('/api/staff/:id', auth, async (req, res) => {
 
 app.delete('/api/staff/:id', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query('DELETE FROM staff WHERE id=$1 RETURNING *', [req.params.id]);
+    const bid = needBusiness(req, res); if (!bid) return;
+    const { rows } = await pool.query('DELETE FROM staff WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatStaff(rows[0]));
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -677,18 +699,21 @@ app.delete('/api/staff/:id', auth, async (req, res) => {
 // ── Bookings ──────────────────────────────────────────────
 app.get('/api/bookings', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM bookings ORDER BY time');
+    const bid = req.user.businessId;
+    if (!bid) return res.json([]);
+    const { rows } = await pool.query('SELECT * FROM bookings WHERE business_id = $1 ORDER BY time', [bid]);
     res.json(rows.map(formatBooking));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/bookings', auth, async (req, res) => {
   try {
+    const bid = needBusiness(req, res); if (!bid) return;
     const { time, client, treatment, duration, staffId, notes, status, price, allergies, clientPhone } = req.body;
     if (!time || !client || !treatment || !duration) return res.status(400).json({ error: 'time, client, treatment, duration required' });
     const { rows } = await pool.query(
-      'INSERT INTO bookings (time, client, treatment, duration, staff_id, notes, status, price, allergies, client_phone) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
-      [time, client, treatment, duration, staffId || null, notes || '', status || 'confirmed', price || 0, allergies || '', clientPhone || '']
+      'INSERT INTO bookings (business_id, time, client, treatment, duration, staff_id, notes, status, price, allergies, client_phone) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
+      [bid, time, client, treatment, duration, staffId || null, notes || '', status || 'confirmed', price || 0, allergies || '', clientPhone || '']
     );
     res.status(201).json(formatBooking(rows[0]));
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -696,10 +721,11 @@ app.post('/api/bookings', auth, async (req, res) => {
 
 app.put('/api/bookings/:id', auth, async (req, res) => {
   try {
+    const bid = needBusiness(req, res); if (!bid) return;
     const { time, client, treatment, duration, staffId, notes, status, price, allergies, clientPhone } = req.body;
     const { rows } = await pool.query(
-      'UPDATE bookings SET time=$1, client=$2, treatment=$3, duration=$4, staff_id=$5, notes=$6, status=$7, price=$8, allergies=$9, client_phone=$10 WHERE id=$11 RETURNING *',
-      [time, client, treatment, duration, staffId || null, notes || '', status || 'confirmed', price || 0, allergies || '', clientPhone || '', req.params.id]
+      'UPDATE bookings SET time=$1, client=$2, treatment=$3, duration=$4, staff_id=$5, notes=$6, status=$7, price=$8, allergies=$9, client_phone=$10 WHERE id=$11 AND business_id=$12 RETURNING *',
+      [time, client, treatment, duration, staffId || null, notes || '', status || 'confirmed', price || 0, allergies || '', clientPhone || '', req.params.id, bid]
     );
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatBooking(rows[0]));
@@ -708,7 +734,8 @@ app.put('/api/bookings/:id', auth, async (req, res) => {
 
 app.delete('/api/bookings/:id', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query('DELETE FROM bookings WHERE id=$1 RETURNING *', [req.params.id]);
+    const bid = needBusiness(req, res); if (!bid) return;
+    const { rows } = await pool.query('DELETE FROM bookings WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatBooking(rows[0]));
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -717,18 +744,21 @@ app.delete('/api/bookings/:id', auth, async (req, res) => {
 // ── Inventory ─────────────────────────────────────────────
 app.get('/api/inventory', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM inventory ORDER BY id');
+    const bid = req.user.businessId;
+    if (!bid) return res.json([]);
+    const { rows } = await pool.query('SELECT * FROM inventory WHERE business_id = $1 ORDER BY id', [bid]);
     res.json(rows.map(formatInventory));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/inventory', auth, async (req, res) => {
   try {
+    const bid = needBusiness(req, res); if (!bid) return;
     const { name, category, stock, threshold, unit, supplier, lastOrder } = req.body;
     if (!name) return res.status(400).json({ error: 'name required' });
     const { rows } = await pool.query(
-      'INSERT INTO inventory (name, category, stock, threshold, unit, supplier, last_order) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
-      [name, category || '', stock || 0, threshold || 5, unit || 'pcs', supplier || '', lastOrder || '']
+      'INSERT INTO inventory (business_id, name, category, stock, threshold, unit, supplier, last_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
+      [bid, name, category || '', stock || 0, threshold || 5, unit || 'pcs', supplier || '', lastOrder || '']
     );
     res.status(201).json(formatInventory(rows[0]));
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -736,10 +766,11 @@ app.post('/api/inventory', auth, async (req, res) => {
 
 app.put('/api/inventory/:id', auth, async (req, res) => {
   try {
+    const bid = needBusiness(req, res); if (!bid) return;
     const { name, category, stock, threshold, unit, supplier, lastOrder } = req.body;
     const { rows } = await pool.query(
-      'UPDATE inventory SET name=$1, category=$2, stock=$3, threshold=$4, unit=$5, supplier=$6, last_order=$7 WHERE id=$8 RETURNING *',
-      [name, category, stock, threshold, unit, supplier, lastOrder || '', req.params.id]
+      'UPDATE inventory SET name=$1, category=$2, stock=$3, threshold=$4, unit=$5, supplier=$6, last_order=$7 WHERE id=$8 AND business_id=$9 RETURNING *',
+      [name, category, stock, threshold, unit, supplier, lastOrder || '', req.params.id, bid]
     );
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatInventory(rows[0]));
@@ -748,10 +779,11 @@ app.put('/api/inventory/:id', auth, async (req, res) => {
 
 app.patch('/api/inventory/:id/stock', auth, async (req, res) => {
   try {
+    const bid = needBusiness(req, res); if (!bid) return;
     const { delta } = req.body;
     const { rows } = await pool.query(
-      'UPDATE inventory SET stock = GREATEST(0, stock + $1) WHERE id=$2 RETURNING *',
-      [delta, req.params.id]
+      'UPDATE inventory SET stock = GREATEST(0, stock + $1) WHERE id=$2 AND business_id=$3 RETURNING *',
+      [delta, req.params.id, bid]
     );
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatInventory(rows[0]));
@@ -760,10 +792,11 @@ app.patch('/api/inventory/:id/stock', auth, async (req, res) => {
 
 app.post('/api/inventory/:id/order', auth, async (req, res) => {
   try {
+    const bid = needBusiness(req, res); if (!bid) return;
     const today = new Date().toISOString().slice(0, 10);
     const { rows } = await pool.query(
-      'UPDATE inventory SET last_order=$1 WHERE id=$2 RETURNING *',
-      [today, req.params.id]
+      'UPDATE inventory SET last_order=$1 WHERE id=$2 AND business_id=$3 RETURNING *',
+      [today, req.params.id, bid]
     );
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatInventory(rows[0]));
@@ -772,7 +805,8 @@ app.post('/api/inventory/:id/order', auth, async (req, res) => {
 
 app.delete('/api/inventory/:id', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query('DELETE FROM inventory WHERE id=$1 RETURNING *', [req.params.id]);
+    const bid = needBusiness(req, res); if (!bid) return;
+    const { rows } = await pool.query('DELETE FROM inventory WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatInventory(rows[0]));
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -781,20 +815,23 @@ app.delete('/api/inventory/:id', auth, async (req, res) => {
 // ── Requests ──────────────────────────────────────────────
 app.get('/api/requests', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM requests ORDER BY created_at DESC');
+    const bid = req.user.businessId;
+    if (!bid) return res.json([]);
+    const { rows } = await pool.query('SELECT * FROM requests WHERE business_id = $1 ORDER BY created_at DESC', [bid]);
     res.json(rows.map(formatRequest));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/requests', auth, async (req, res) => {
   try {
+    const bid = needBusiness(req, res); if (!bid) return;
     const { type, staffId, date, reason, swapWith, swapDay, productId, quantity } = req.body;
     if (!type || !staffId) return res.status(400).json({ error: 'type and staffId required' });
     const validTypes = ['sick', 'dayoff', 'swap', 'stock_request'];
     if (!validTypes.includes(type)) return res.status(400).json({ error: 'invalid type' });
     const { rows } = await pool.query(
-      'INSERT INTO requests (type, staff_id, date, reason, swap_with, swap_day, product_id, quantity) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
-      [type, Number(staffId), date || null, reason || '', swapWith || null, swapDay || null, productId || null, quantity || 0]
+      'INSERT INTO requests (business_id, type, staff_id, date, reason, swap_with, swap_day, product_id, quantity) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
+      [bid, type, Number(staffId), date || null, reason || '', swapWith || null, swapDay || null, productId || null, quantity || 0]
     );
     res.status(201).json(formatRequest(rows[0]));
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -802,8 +839,9 @@ app.post('/api/requests', auth, async (req, res) => {
 
 app.put('/api/requests/:id', auth, async (req, res) => {
   try {
+    const bid = needBusiness(req, res); if (!bid) return;
     const { status, reassignToStaffId } = req.body;
-    const { rows: reqRows } = await pool.query('SELECT * FROM requests WHERE id=$1', [req.params.id]);
+    const { rows: reqRows } = await pool.query('SELECT * FROM requests WHERE id=$1 AND business_id=$2', [req.params.id, bid]);
     if (!reqRows.length) return res.status(404).json({ error: 'not found' });
     const request = reqRows[0];
 
@@ -826,8 +864,8 @@ app.put('/api/requests/:id', auth, async (req, res) => {
       }
 
       const { rows } = await client.query(
-        'UPDATE requests SET status=$1 WHERE id=$2 RETURNING *',
-        [status, req.params.id]
+        'UPDATE requests SET status=$1 WHERE id=$2 AND business_id=$3 RETURNING *',
+        [status, req.params.id, bid]
       );
 
       await client.query('COMMIT');
@@ -844,18 +882,21 @@ app.put('/api/requests/:id', auth, async (req, res) => {
 // ── Announcements ─────────────────────────────────────────
 app.get('/api/announcements', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM announcements ORDER BY created_at DESC');
+    const bid = req.user.businessId;
+    if (!bid) return res.json([]);
+    const { rows } = await pool.query('SELECT * FROM announcements WHERE business_id = $1 ORDER BY created_at DESC', [bid]);
     res.json(rows.map(formatAnnouncement));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/announcements', auth, async (req, res) => {
   try {
+    const bid = needBusiness(req, res); if (!bid) return;
     const { title, body, from } = req.body;
     if (!body) return res.status(400).json({ error: 'body required' });
     const { rows } = await pool.query(
-      'INSERT INTO announcements (title, body, "from") VALUES ($1,$2,$3) RETURNING *',
-      [title || '', body, from || 'Management']
+      'INSERT INTO announcements (business_id, title, body, "from") VALUES ($1,$2,$3,$4) RETURNING *',
+      [bid, title || '', body, from || 'Management']
     );
     res.status(201).json(formatAnnouncement(rows[0]));
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -863,7 +904,8 @@ app.post('/api/announcements', auth, async (req, res) => {
 
 app.delete('/api/announcements/:id', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query('DELETE FROM announcements WHERE id=$1 RETURNING *', [req.params.id]);
+    const bid = needBusiness(req, res); if (!bid) return;
+    const { rows } = await pool.query('DELETE FROM announcements WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatAnnouncement(rows[0]));
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -872,18 +914,21 @@ app.delete('/api/announcements/:id', auth, async (req, res) => {
 // ── SOP ───────────────────────────────────────────────────
 app.get('/api/sop', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM sop ORDER BY id');
+    const bid = req.user.businessId;
+    if (!bid) return res.json([]);
+    const { rows } = await pool.query('SELECT * FROM sop WHERE business_id = $1 ORDER BY id', [bid]);
     res.json(rows.map(formatSop));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/sop', auth, async (req, res) => {
   try {
+    const bid = needBusiness(req, res); if (!bid) return;
     const { title, body, category } = req.body;
     if (!title) return res.status(400).json({ error: 'title required' });
     const { rows } = await pool.query(
-      'INSERT INTO sop (title, body, category) VALUES ($1,$2,$3) RETURNING *',
-      [title, body || '', category || 'General']
+      'INSERT INTO sop (business_id, title, body, category) VALUES ($1,$2,$3,$4) RETURNING *',
+      [bid, title, body || '', category || 'General']
     );
     res.status(201).json(formatSop(rows[0]));
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -892,18 +937,21 @@ app.post('/api/sop', auth, async (req, res) => {
 // ── Violations ────────────────────────────────────────────
 app.get('/api/violations', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM violations ORDER BY created_at DESC');
+    const bid = req.user.businessId;
+    if (!bid) return res.json([]);
+    const { rows } = await pool.query('SELECT * FROM violations WHERE business_id = $1 ORDER BY created_at DESC', [bid]);
     res.json(rows.map(formatViolation));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/violations', auth, async (req, res) => {
   try {
+    const bid = needBusiness(req, res); if (!bid) return;
     const { staffId, sopId, note } = req.body;
     if (!staffId) return res.status(400).json({ error: 'staffId required' });
     const { rows } = await pool.query(
-      'INSERT INTO violations (staff_id, sop_id, note) VALUES ($1,$2,$3) RETURNING *',
-      [staffId, sopId || null, note || '']
+      'INSERT INTO violations (business_id, staff_id, sop_id, note) VALUES ($1,$2,$3,$4) RETURNING *',
+      [bid, staffId, sopId || null, note || '']
     );
     res.status(201).json(formatViolation(rows[0]));
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -911,7 +959,8 @@ app.post('/api/violations', auth, async (req, res) => {
 
 app.delete('/api/violations/:id', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query('DELETE FROM violations WHERE id=$1 RETURNING *', [req.params.id]);
+    const bid = needBusiness(req, res); if (!bid) return;
+    const { rows } = await pool.query('DELETE FROM violations WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatViolation(rows[0]));
   } catch (err) { res.status(500).json({ error: err.message }); }
