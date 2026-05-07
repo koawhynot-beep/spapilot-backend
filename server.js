@@ -934,6 +934,15 @@ app.post('/api/sop', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.delete('/api/sop/:id', auth, async (req, res) => {
+  try {
+    const bid = needBusiness(req, res); if (!bid) return;
+    const { rows } = await pool.query('DELETE FROM sop WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
+    if (!rows.length) return res.status(404).json({ error: 'not found' });
+    res.json(formatSop(rows[0]));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Violations ────────────────────────────────────────────
 app.get('/api/violations', auth, async (req, res) => {
   try {
