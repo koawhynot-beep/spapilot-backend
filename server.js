@@ -244,6 +244,10 @@ const resetPasswordSchema = z.object({
   token: z.string().min(20).max(128),
   password: z.string().min(8).max(128),
 });
+const deleteAccountSchema = z.object({
+  password: z.string().min(1).max(128),
+  confirmation: z.literal('DELETE'),
+});
 
 const validate = (schema) => (req, res, next) => {
   const result = schema.safeParse(req.body);
@@ -637,6 +641,88 @@ app.post('/api/auth/logout', auth, async (req, res) => {
   } catch (err) { logger.error('logout.error', { err: err.message }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// ── GDPR: data export ────────────────────────────────────
+// Returns all data linked to the authenticated user. Heavy queries are
+// scoped to their business; user-only data (login, password resets) joined too.
+app.get('/api/auth/export-data', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const businessId = req.user.businessId;
+
+    const [user, business, staff, bookings, inventory, requests, announcements, sops, violations] = await Promise.all([
+      pool.query('SELECT id, email, role, business_type, business_id, onboarding_role, trial_started_at, trial_ends_at, subscription_status, created_at FROM users WHERE id=$1', [userId]),
+      businessId ? pool.query('SELECT * FROM businesses WHERE id=$1', [businessId]) : { rows: [] },
+      businessId ? pool.query('SELECT * FROM staff WHERE business_id=$1', [businessId]) : { rows: [] },
+      businessId ? pool.query('SELECT * FROM bookings WHERE business_id=$1', [businessId]) : { rows: [] },
+      businessId ? pool.query('SELECT * FROM inventory WHERE business_id=$1', [businessId]) : { rows: [] },
+      businessId ? pool.query('SELECT * FROM requests WHERE business_id=$1', [businessId]) : { rows: [] },
+      businessId ? pool.query('SELECT * FROM announcements WHERE business_id=$1', [businessId]) : { rows: [] },
+      businessId ? pool.query('SELECT * FROM sop WHERE business_id=$1', [businessId]) : { rows: [] },
+      businessId ? pool.query('SELECT * FROM violations WHERE business_id=$1', [businessId]) : { rows: [] },
+    ]);
+
+    logger.info('data.export', { userId });
+    res.setHeader('Content-Disposition', `attachment; filename="viroxit-data-${userId}-${Date.now()}.json"`);
+    res.json({
+      exportedAt: new Date().toISOString(),
+      user: user.rows[0] || null,
+      business: business.rows[0] || null,
+      staff: staff.rows,
+      bookings: bookings.rows,
+      inventory: inventory.rows,
+      requests: requests.rows,
+      announcements: announcements.rows,
+      sops: sops.rows,
+      violations: violations.rows,
+    });
+  } catch (err) { logger.error('export.error', { err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── GDPR: account deletion ───────────────────────────────
+// Requires password + confirmation token "DELETE". Cascade deletes user.
+// If user owns a business, that business and all its data also removed via FK CASCADE.
+app.delete('/api/auth/account', auth, validate(deleteAccountSchema), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { password } = req.body;
+
+    const { rows } = await pool.query('SELECT id, password_hash, business_id FROM users WHERE id=$1', [userId]);
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+
+    const valid = await bcrypt.compare(password, rows[0].password_hash);
+    if (!valid) {
+      logger.warn('delete.failed.bad_password', { userId });
+      return res.status(401).json({ error: 'Incorrect password' });
+    }
+
+    // If user is owner of a business, delete the business (cascades all related data).
+    // Otherwise, only the user record is deleted.
+    const businessId = rows[0].business_id;
+    if (businessId) {
+      const { rowCount: ownsCount } = await pool.query(
+        'SELECT 1 FROM businesses WHERE id=$1 AND owner_id=$2',
+        [businessId, userId]
+      );
+      if (ownsCount) {
+        await pool.query('DELETE FROM businesses WHERE id=$1', [businessId]);
+      }
+    }
+
+    // Add current token to blacklist so it cannot be reused
+    if (req.user.jti && req.user.exp) {
+      const expiresAt = new Date(req.user.exp * 1000);
+      await pool.query(
+        'INSERT INTO token_blacklist (jti, user_id, expires_at) VALUES ($1,$2,$3) ON CONFLICT (jti) DO NOTHING',
+        [req.user.jti, userId, expiresAt]
+      );
+    }
+
+    await pool.query('DELETE FROM users WHERE id=$1', [userId]);
+    logger.info('account.deleted', { userId });
+    res.json({ ok: true, message: 'Account permanently deleted' });
+  } catch (err) { logger.error('delete.error', { err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
+});
+
 app.post('/api/auth/forgot-password', passwordResetLimiter, validate(forgotPasswordSchema), async (req, res) => {
   try {
     const { email } = req.body;
@@ -706,8 +792,6 @@ app.get('/api/auth/me', auth, async (req, res) => {
     res.json(formatUser(rows[0]));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
-
-app.post('/api/auth/logout', auth, (req, res) => res.json({ ok: true }));
 
 app.post('/api/auth/complete-tutorial', auth, async (req, res) => {
   try {
