@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const winston = require('winston');
+const compression = require('compression');
 const { z } = require('zod');
 
 const logger = winston.createLogger({
@@ -33,6 +34,7 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
   : ['http://localhost:3001', 'https://spapilot-app.onrender.com'];
 
 app.use(helmet());
+app.use(compression());
 app.use(cors({ origin: allowedOrigins, credentials: true }));
 app.use(express.json({ limit: '1mb' }));
 app.set('trust proxy', 1);
@@ -212,6 +214,19 @@ const formatSop = (s) => ({
   category: s.category || 'General',
   createdAt: s.created_at,
 });
+
+// ── Pagination helper ─────────────────────────────────────
+// Backward-compatible: if no query params, returns up to MAX_DEFAULT_LIMIT rows (1000).
+// If ?limit / ?offset present, applies them. Always returns plain array (no shape change).
+const MAX_DEFAULT_LIMIT = 1000;
+const MAX_LIMIT = 500;
+function paginationClause(req) {
+  const rawLimit = req.query.limit ? parseInt(req.query.limit, 10) : null;
+  const rawOffset = req.query.offset ? parseInt(req.query.offset, 10) : 0;
+  const limit = rawLimit && rawLimit > 0 ? Math.min(rawLimit, MAX_LIMIT) : MAX_DEFAULT_LIMIT;
+  const offset = Number.isFinite(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+  return { limit, offset, sql: ` LIMIT ${limit} OFFSET ${offset}` };
+}
 
 // ── Validation schemas ────────────────────────────────────
 const signupSchema = z.object({
@@ -446,6 +461,34 @@ async function initDB() {
   ];
   for (const q of alters) {
     try { await pool.query(q); } catch (e) { logger.warn('alter.skipped', { err: e.message }); }
+  }
+
+  // ── Indexes for hot query paths ──────────────────────
+  // All multi-tenant tables filter by business_id; staff also queried by user.
+  // Bookings sorted by date; requests filtered by status. Users looked up by email.
+  const indexes = [
+    `CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)`,
+    `CREATE INDEX IF NOT EXISTS idx_users_business_id ON users(business_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_staff_business_id ON staff(business_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_bookings_business_id ON bookings(business_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_bookings_business_date ON bookings(business_id, date)`,
+    `CREATE INDEX IF NOT EXISTS idx_bookings_staff_id ON bookings(staff_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_inventory_business_id ON inventory(business_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_requests_business_id ON requests(business_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_requests_business_status ON requests(business_id, status)`,
+    `CREATE INDEX IF NOT EXISTS idx_requests_staff_id ON requests(staff_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_announcements_business_id ON announcements(business_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_announcements_created_at ON announcements(created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_sop_business_id ON sop(business_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_violations_business_id ON violations(business_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_violations_staff_id ON violations(staff_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_password_resets_user_id ON password_resets(user_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_password_resets_token ON password_resets(token)`,
+    `CREATE INDEX IF NOT EXISTS idx_businesses_owner_id ON businesses(owner_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_businesses_code ON businesses(code)`,
+  ];
+  for (const q of indexes) {
+    try { await pool.query(q); } catch (e) { logger.warn('index.skipped', { err: e.message }); }
   }
 
   // ── Migrations table ─────────────────────────────────
@@ -811,7 +854,8 @@ app.get('/api/staff', auth, async (req, res) => {
   try {
     const bid = req.user.businessId;
     if (!bid) return res.json([]);
-    const { rows } = await pool.query('SELECT * FROM staff WHERE business_id = $1 ORDER BY id', [bid]);
+    const { sql } = paginationClause(req);
+    const { rows } = await pool.query('SELECT * FROM staff WHERE business_id = $1 ORDER BY id' + sql, [bid]);
     res.json(rows.map(formatStaff));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -856,7 +900,8 @@ app.get('/api/bookings', auth, async (req, res) => {
   try {
     const bid = req.user.businessId;
     if (!bid) return res.json([]);
-    const { rows } = await pool.query('SELECT * FROM bookings WHERE business_id = $1 ORDER BY time', [bid]);
+    const { sql } = paginationClause(req);
+    const { rows } = await pool.query('SELECT * FROM bookings WHERE business_id = $1 ORDER BY date DESC, time' + sql, [bid]);
     res.json(rows.map(formatBooking));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -901,7 +946,8 @@ app.get('/api/inventory', auth, async (req, res) => {
   try {
     const bid = req.user.businessId;
     if (!bid) return res.json([]);
-    const { rows } = await pool.query('SELECT * FROM inventory WHERE business_id = $1 ORDER BY id', [bid]);
+    const { sql } = paginationClause(req);
+    const { rows } = await pool.query('SELECT * FROM inventory WHERE business_id = $1 ORDER BY id' + sql, [bid]);
     res.json(rows.map(formatInventory));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -972,7 +1018,8 @@ app.get('/api/requests', auth, async (req, res) => {
   try {
     const bid = req.user.businessId;
     if (!bid) return res.json([]);
-    const { rows } = await pool.query('SELECT * FROM requests WHERE business_id = $1 ORDER BY created_at DESC', [bid]);
+    const { sql } = paginationClause(req);
+    const { rows } = await pool.query('SELECT * FROM requests WHERE business_id = $1 ORDER BY created_at DESC' + sql, [bid]);
     res.json(rows.map(formatRequest));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -1039,7 +1086,8 @@ app.get('/api/announcements', auth, async (req, res) => {
   try {
     const bid = req.user.businessId;
     if (!bid) return res.json([]);
-    const { rows } = await pool.query('SELECT * FROM announcements WHERE business_id = $1 ORDER BY created_at DESC', [bid]);
+    const { sql } = paginationClause(req);
+    const { rows } = await pool.query('SELECT * FROM announcements WHERE business_id = $1 ORDER BY created_at DESC' + sql, [bid]);
     res.json(rows.map(formatAnnouncement));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -1071,7 +1119,8 @@ app.get('/api/sop', auth, async (req, res) => {
   try {
     const bid = req.user.businessId;
     if (!bid) return res.json([]);
-    const { rows } = await pool.query('SELECT * FROM sop WHERE business_id = $1 ORDER BY id', [bid]);
+    const { sql } = paginationClause(req);
+    const { rows } = await pool.query('SELECT * FROM sop WHERE business_id = $1 ORDER BY id' + sql, [bid]);
     res.json(rows.map(formatSop));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -1103,7 +1152,8 @@ app.get('/api/violations', auth, async (req, res) => {
   try {
     const bid = req.user.businessId;
     if (!bid) return res.json([]);
-    const { rows } = await pool.query('SELECT * FROM violations WHERE business_id = $1 ORDER BY created_at DESC', [bid]);
+    const { sql } = paginationClause(req);
+    const { rows } = await pool.query('SELECT * FROM violations WHERE business_id = $1 ORDER BY created_at DESC' + sql, [bid]);
     res.json(rows.map(formatViolation));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
