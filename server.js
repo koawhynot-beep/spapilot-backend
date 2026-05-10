@@ -5,6 +5,19 @@ const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+const winston = require('winston');
+const { z } = require('zod');
+
+const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.errors({ stack: true }),
+    winston.format.json()
+  ),
+  transports: [new winston.transports.Console()],
+});
 
 let nodemailer = null;
 try { nodemailer = require('nodemailer'); } catch {}
@@ -19,8 +32,10 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim())
   : ['http://localhost:3001', 'https://spapilot-app.onrender.com'];
 
+app.use(helmet());
 app.use(cors({ origin: allowedOrigins, credentials: true }));
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+app.set('trust proxy', 1);
 
 // Rate limiters for auth endpoints to prevent brute force
 const authLimiter = rateLimit({
@@ -198,20 +213,65 @@ const formatSop = (s) => ({
   createdAt: s.created_at,
 });
 
+// ── Validation schemas ────────────────────────────────────
+const signupSchema = z.object({
+  email: z.string().trim().toLowerCase().email().max(254),
+  password: z.string().min(8).max(128),
+});
+const loginSchema = z.object({
+  email: z.string().trim().toLowerCase().email().max(254),
+  password: z.string().min(1).max(128),
+});
+const forgotPasswordSchema = z.object({
+  email: z.string().trim().toLowerCase().email().max(254),
+});
+const resetPasswordSchema = z.object({
+  token: z.string().min(20).max(128),
+  password: z.string().min(8).max(128),
+});
+
+const validate = (schema) => (req, res, next) => {
+  const result = schema.safeParse(req.body);
+  if (!result.success) {
+    return res.status(400).json({
+      error: 'Invalid input',
+      details: result.error.issues.map(i => ({ path: i.path.join('.'), message: i.message })),
+    });
+  }
+  req.body = result.data;
+  next();
+};
+
 // ── Auth middleware ───────────────────────────────────────
-const auth = (req, res, next) => {
+const auth = async (req, res, next) => {
   const header = req.headers.authorization;
   if (!header) return res.status(401).json({ error: 'No token' });
   try {
-    req.user = jwt.verify(header.replace('Bearer ', ''), JWT_SECRET);
+    const decoded = jwt.verify(header.replace('Bearer ', ''), JWT_SECRET);
+    if (decoded.jti) {
+      const { rowCount } = await pool.query(
+        'SELECT 1 FROM token_blacklist WHERE jti=$1',
+        [decoded.jti]
+      );
+      if (rowCount) return res.status(401).json({ error: 'Token revoked' });
+    }
+    req.user = decoded;
     next();
-  } catch {
+  } catch (err) {
     res.status(401).json({ error: 'Invalid token' });
   }
 };
 
 const makeToken = (user) => jwt.sign(
-  { id: user.id, email: user.email, role: user.role, businessType: user.business_type, staffId: user.staff_id, businessId: user.business_id },
+  {
+    id: user.id,
+    email: user.email,
+    role: user.role,
+    businessType: user.business_type,
+    staffId: user.staff_id,
+    businessId: user.business_id,
+    jti: crypto.randomBytes(16).toString('hex'),
+  },
   JWT_SECRET,
   { expiresIn: '12h' }
 );
@@ -272,6 +332,14 @@ async function initDB() {
       used       BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS token_blacklist (
+      jti        TEXT PRIMARY KEY,
+      user_id    INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_token_blacklist_expires_at ON token_blacklist(expires_at);
 
     CREATE TABLE IF NOT EXISTS staff (
       id              SERIAL PRIMARY KEY,
@@ -365,6 +433,8 @@ async function initDB() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '7 days')`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status TEXT DEFAULT 'trial'`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS tutorial_completed BOOLEAN DEFAULT FALSE`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER DEFAULT 0`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ`,
     // Multi-tenancy: scope all data to a business
     `ALTER TABLE staff         ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
     `ALTER TABLE bookings      ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
@@ -375,7 +445,7 @@ async function initDB() {
     `ALTER TABLE violations    ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
   ];
   for (const q of alters) {
-    try { await pool.query(q); } catch (e) { console.warn('alter skipped:', e.message); }
+    try { await pool.query(q); } catch (e) { logger.warn('alter.skipped', { err: e.message }); }
   }
 
   // ── Migrations table ─────────────────────────────────
@@ -396,7 +466,7 @@ async function initDB() {
     [wipeMarker]
   );
   if (wipeRows.length) {
-    console.log('Running one-time data wipe migration:', wipeMarker);
+    logger.info('migration.wipe.start', { marker: wipeMarker });
     await pool.query('DELETE FROM violations');
     await pool.query('DELETE FROM requests');
     await pool.query('DELETE FROM bookings');
@@ -408,7 +478,7 @@ async function initDB() {
     await pool.query('UPDATE users SET staff_id = NULL WHERE staff_id IS NOT NULL');
     // Reset tutorial flag so existing users see the new tutorial
     await pool.query('UPDATE users SET tutorial_completed = FALSE');
-    console.log('Wipe complete');
+    logger.info('migration.wipe.done');
   }
 
   // Drop any CHECK constraints on requests.type so stock_request is allowed
@@ -420,7 +490,7 @@ async function initDB() {
     for (const c of cs) {
       await pool.query(`ALTER TABLE requests DROP CONSTRAINT IF EXISTS "${c.constraint_name}"`);
     }
-  } catch (e) { console.warn('constraint drop skipped:', e.message); }
+  } catch (e) { logger.warn('constraint.drop.skipped', { err: e.message }); }
 
   // Demo account only created in non-production environments.
   if (process.env.NODE_ENV !== 'production') {
@@ -433,52 +503,101 @@ async function initDB() {
         `INSERT INTO users (email, password_hash) VALUES ($1, $2)`,
         ['demo@opus.app', hash]
       );
-      console.log('Demo user created (dev only)');
+      logger.info('demo.user.created');
     }
   }
 
-  console.log('Database ready');
+  // Periodic cleanup of expired blacklisted tokens
+  setInterval(() => {
+    pool.query('DELETE FROM token_blacklist WHERE expires_at < NOW()')
+      .catch(err => logger.error('blacklist.cleanup.error', { err: err.message }));
+  }, 60 * 60 * 1000);
+
+  logger.info('Database ready');
 }
 
 // ── Health ────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 // ── Auth ──────────────────────────────────────────────────
-app.post('/api/auth/signup', authLimiter, async (req, res) => {
+app.post('/api/auth/signup', authLimiter, validate(signupSchema), async (req, res) => {
   try {
     const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-    if (password.length < 6) return res.status(400).json({ error: 'Password must be 6+ characters' });
-    const exists = await pool.query('SELECT id FROM users WHERE email=$1', [email.toLowerCase()]);
+    const exists = await pool.query('SELECT id FROM users WHERE email=$1', [email]);
     if (exists.rowCount) return res.status(400).json({ error: 'Email already registered' });
     const hash = await bcrypt.hash(password, 10);
     const trialEnd = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     const { rows } = await pool.query(
       `INSERT INTO users (email, password_hash, trial_started_at, trial_ends_at, subscription_status)
        VALUES ($1, $2, NOW(), $3, 'trial') RETURNING *`,
-      [email.toLowerCase(), hash, trialEnd]
+      [email, hash, trialEnd]
     );
+    logger.info('user.signup', { userId: rows[0].id, email });
     res.status(201).json({ token: makeToken(rows[0]), user: formatUser(rows[0]), trial: trialInfo(rows[0]) });
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('signup.error', { err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.post('/api/auth/login', authLimiter, async (req, res) => {
+const MAX_FAILED_LOGINS = 5;
+const LOCKOUT_MINUTES = 15;
+
+app.post('/api/auth/login', authLimiter, validate(loginSchema), async (req, res) => {
   try {
     const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-    const { rows } = await pool.query('SELECT * FROM users WHERE email=$1', [email.toLowerCase()]);
-    if (!rows.length) return res.status(401).json({ error: 'Invalid email or password' });
-    const valid = await bcrypt.compare(password, rows[0].password_hash);
-    if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
-    res.json({ token: makeToken(rows[0]), user: formatUser(rows[0]), trial: trialInfo(rows[0]) });
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+    const { rows } = await pool.query('SELECT * FROM users WHERE email=$1', [email]);
+    if (!rows.length) {
+      // Constant-ish timing to avoid email enumeration
+      await bcrypt.compare(password, '$2a$10$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalid');
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    const user = rows[0];
+    if (user.locked_until && new Date(user.locked_until) > new Date()) {
+      logger.warn('login.locked', { userId: user.id, email });
+      return res.status(423).json({ error: 'Account temporarily locked. Try again later.' });
+    }
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) {
+      const newAttempts = (user.failed_login_attempts || 0) + 1;
+      const shouldLock = newAttempts >= MAX_FAILED_LOGINS;
+      const lockedUntil = shouldLock ? new Date(Date.now() + LOCKOUT_MINUTES * 60 * 1000) : null;
+      await pool.query(
+        'UPDATE users SET failed_login_attempts=$1, locked_until=$2 WHERE id=$3',
+        [shouldLock ? 0 : newAttempts, lockedUntil, user.id]
+      );
+      logger.warn('login.failed', { userId: user.id, email, attempts: newAttempts, locked: shouldLock });
+      if (shouldLock) {
+        return res.status(423).json({ error: 'Account locked due to too many failed attempts. Try again in 15 minutes.' });
+      }
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    if (user.failed_login_attempts > 0 || user.locked_until) {
+      await pool.query(
+        'UPDATE users SET failed_login_attempts=0, locked_until=NULL WHERE id=$1',
+        [user.id]
+      );
+    }
+    logger.info('login.success', { userId: user.id, email });
+    res.json({ token: makeToken(user), user: formatUser(user), trial: trialInfo(user) });
+  } catch (err) { logger.error('login.error', { err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.post('/api/auth/forgot-password', passwordResetLimiter, async (req, res) => {
+app.post('/api/auth/logout', auth, async (req, res) => {
+  try {
+    if (req.user.jti && req.user.exp) {
+      const expiresAt = new Date(req.user.exp * 1000);
+      await pool.query(
+        'INSERT INTO token_blacklist (jti, user_id, expires_at) VALUES ($1,$2,$3) ON CONFLICT (jti) DO NOTHING',
+        [req.user.jti, req.user.id, expiresAt]
+      );
+    }
+    logger.info('logout', { userId: req.user.id });
+    res.json({ ok: true });
+  } catch (err) { logger.error('logout.error', { err: err.message }); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/auth/forgot-password', passwordResetLimiter, validate(forgotPasswordSchema), async (req, res) => {
   try {
     const { email } = req.body;
-    if (!email) return res.status(400).json({ error: 'Email required' });
-    const { rows } = await pool.query('SELECT * FROM users WHERE email=$1', [email.toLowerCase()]);
+    const { rows } = await pool.query('SELECT * FROM users WHERE email=$1', [email]);
     if (!rows.length) {
       return res.json({ message: 'If that email is registered, a reset link has been sent.' });
     }
@@ -496,24 +615,23 @@ app.post('/api/auth/forgot-password', passwordResetLimiter, async (req, res) => 
       message: 'If that email is registered, a reset link has been sent.',
       ...(includeDevLink ? { devLink: result.devLink } : {}),
     });
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.post('/api/auth/reset-password', passwordResetLimiter, async (req, res) => {
+app.post('/api/auth/reset-password', passwordResetLimiter, validate(resetPasswordSchema), async (req, res) => {
   try {
     const { token, password } = req.body;
-    if (!token || !password) return res.status(400).json({ error: 'Token and password required' });
-    if (password.length < 6) return res.status(400).json({ error: 'Password must be 6+ characters' });
     const { rows } = await pool.query(
       'SELECT * FROM password_resets WHERE token=$1 AND used=FALSE AND expires_at > NOW()',
       [token]
     );
     if (!rows.length) return res.status(400).json({ error: 'Invalid or expired reset link. Request a new one.' });
     const hash = await bcrypt.hash(password, 10);
-    await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, rows[0].user_id]);
+    await pool.query('UPDATE users SET password_hash=$1, failed_login_attempts=0, locked_until=NULL WHERE id=$2', [hash, rows[0].user_id]);
     await pool.query('UPDATE password_resets SET used=TRUE WHERE id=$1', [rows[0].id]);
+    logger.info('password.reset.success', { userId: rows[0].user_id });
     res.json({ message: 'Password reset successful' });
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('password.reset.error', { err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/auth/business', auth, async (req, res) => {
@@ -524,7 +642,7 @@ app.post('/api/auth/business', auth, async (req, res) => {
       [businessType, req.user.id]
     );
     res.json({ token: makeToken(rows[0]), user: formatUser(rows[0]) });
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/auth/role', auth, async (req, res) => {
@@ -535,7 +653,7 @@ app.post('/api/auth/role', auth, async (req, res) => {
       [role, staffId || null, req.user.id]
     );
     res.json({ token: makeToken(rows[0]), user: formatUser(rows[0]) });
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/auth/me', auth, async (req, res) => {
@@ -543,7 +661,7 @@ app.get('/api/auth/me', auth, async (req, res) => {
     const { rows } = await pool.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
     if (!rows.length) return res.status(401).json({ error: 'User not found' });
     res.json(formatUser(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/auth/logout', auth, (req, res) => res.json({ ok: true }));
@@ -556,7 +674,7 @@ app.post('/api/auth/complete-tutorial', auth, async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json({ user: formatUser(rows[0]) });
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Trial / Billing ───────────────────────────────────────
@@ -565,14 +683,14 @@ app.get('/api/auth/trial-status', auth, async (req, res) => {
     const { rows } = await pool.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(trialInfo(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/billing/check-payment', auth, async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT subscription_status FROM users WHERE id=$1', [req.user.id]);
     res.json({ paid: rows[0]?.subscription_status === 'active' });
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Mock subscription activation. Replace with Stripe checkout webhook in production.
@@ -582,7 +700,7 @@ app.post('/api/billing/subscribe', auth, async (req, res) => {
       checkoutUrl: null,
       message: 'Stripe checkout not configured. Use POST /api/billing/mock-activate for testing.',
     });
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/billing/mock-activate', auth, async (req, res) => {
@@ -595,7 +713,7 @@ app.post('/api/billing/mock-activate', auth, async (req, res) => {
       [req.user.id]
     );
     res.json({ ok: true, user: formatUser(rows[0]) });
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Businesses ────────────────────────────────────────────
@@ -625,7 +743,7 @@ app.post('/api/businesses', auth, async (req, res) => {
       token: makeToken(urows[0]),
       user: formatUser(urows[0]),
     });
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/businesses/join', auth, async (req, res) => {
@@ -652,7 +770,7 @@ app.post('/api/businesses/join', auth, async (req, res) => {
       token: makeToken(urows[0]),
       user: formatUser(urows[0]),
     });
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/businesses/me', auth, async (req, res) => {
@@ -661,7 +779,7 @@ app.get('/api/businesses/me', auth, async (req, res) => {
     if (!urows.length || !urows[0].business_id) return res.json(null);
     const { rows } = await pool.query('SELECT * FROM businesses WHERE id=$1', [urows[0].business_id]);
     res.json(rows.length ? formatBusiness(rows[0]) : null);
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // User can switch between owner/staff later. Resets business association.
@@ -673,7 +791,7 @@ app.post('/api/auth/switch-onboarding', auth, async (req, res) => {
       [req.user.id]
     );
     res.json({ token: makeToken(rows[0]), user: formatUser(rows[0]) });
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Multi-tenancy helper ──────────────────────────────────
@@ -695,7 +813,7 @@ app.get('/api/staff', auth, async (req, res) => {
     if (!bid) return res.json([]);
     const { rows } = await pool.query('SELECT * FROM staff WHERE business_id = $1 ORDER BY id', [bid]);
     res.json(rows.map(formatStaff));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/staff', auth, async (req, res) => {
@@ -708,7 +826,7 @@ app.post('/api/staff', auth, async (req, res) => {
       [bid, name, role, avatar || name[0].toUpperCase(), color || '#a8c5a0', birthday || null, phone || null, schedule || [], commissionRate || 30, JSON.stringify({ ...DEFAULT_PERMISSIONS, ...(permissions || {}) })]
     );
     res.status(201).json(formatStaff(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.put('/api/staff/:id', auth, async (req, res) => {
@@ -721,7 +839,7 @@ app.put('/api/staff/:id', auth, async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatStaff(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/staff/:id', auth, async (req, res) => {
@@ -730,7 +848,7 @@ app.delete('/api/staff/:id', auth, async (req, res) => {
     const { rows } = await pool.query('DELETE FROM staff WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatStaff(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Bookings ──────────────────────────────────────────────
@@ -740,7 +858,7 @@ app.get('/api/bookings', auth, async (req, res) => {
     if (!bid) return res.json([]);
     const { rows } = await pool.query('SELECT * FROM bookings WHERE business_id = $1 ORDER BY time', [bid]);
     res.json(rows.map(formatBooking));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/bookings', auth, async (req, res) => {
@@ -753,7 +871,7 @@ app.post('/api/bookings', auth, async (req, res) => {
       [bid, time, client, treatment, duration, staffId || null, notes || '', status || 'confirmed', price || 0, allergies || '', clientPhone || '']
     );
     res.status(201).json(formatBooking(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.put('/api/bookings/:id', auth, async (req, res) => {
@@ -766,7 +884,7 @@ app.put('/api/bookings/:id', auth, async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatBooking(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/bookings/:id', auth, async (req, res) => {
@@ -775,7 +893,7 @@ app.delete('/api/bookings/:id', auth, async (req, res) => {
     const { rows } = await pool.query('DELETE FROM bookings WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatBooking(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Inventory ─────────────────────────────────────────────
@@ -785,7 +903,7 @@ app.get('/api/inventory', auth, async (req, res) => {
     if (!bid) return res.json([]);
     const { rows } = await pool.query('SELECT * FROM inventory WHERE business_id = $1 ORDER BY id', [bid]);
     res.json(rows.map(formatInventory));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/inventory', auth, async (req, res) => {
@@ -798,7 +916,7 @@ app.post('/api/inventory', auth, async (req, res) => {
       [bid, name, category || '', stock || 0, threshold || 5, unit || 'pcs', supplier || '', lastOrder || '']
     );
     res.status(201).json(formatInventory(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.put('/api/inventory/:id', auth, async (req, res) => {
@@ -811,7 +929,7 @@ app.put('/api/inventory/:id', auth, async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatInventory(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/inventory/:id/stock', auth, async (req, res) => {
@@ -824,7 +942,7 @@ app.patch('/api/inventory/:id/stock', auth, async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatInventory(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/inventory/:id/order', auth, async (req, res) => {
@@ -837,7 +955,7 @@ app.post('/api/inventory/:id/order', auth, async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatInventory(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/inventory/:id', auth, async (req, res) => {
@@ -846,7 +964,7 @@ app.delete('/api/inventory/:id', auth, async (req, res) => {
     const { rows } = await pool.query('DELETE FROM inventory WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatInventory(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Requests ──────────────────────────────────────────────
@@ -856,7 +974,7 @@ app.get('/api/requests', auth, async (req, res) => {
     if (!bid) return res.json([]);
     const { rows } = await pool.query('SELECT * FROM requests WHERE business_id = $1 ORDER BY created_at DESC', [bid]);
     res.json(rows.map(formatRequest));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/requests', auth, async (req, res) => {
@@ -871,7 +989,7 @@ app.post('/api/requests', auth, async (req, res) => {
       [bid, type, Number(staffId), date || null, reason || '', swapWith || null, swapDay || null, productId || null, quantity || 0]
     );
     res.status(201).json(formatRequest(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.put('/api/requests/:id', auth, async (req, res) => {
@@ -913,7 +1031,7 @@ app.put('/api/requests/:id', auth, async (req, res) => {
     } finally {
       client.release();
     }
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Announcements ─────────────────────────────────────────
@@ -923,7 +1041,7 @@ app.get('/api/announcements', auth, async (req, res) => {
     if (!bid) return res.json([]);
     const { rows } = await pool.query('SELECT * FROM announcements WHERE business_id = $1 ORDER BY created_at DESC', [bid]);
     res.json(rows.map(formatAnnouncement));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/announcements', auth, async (req, res) => {
@@ -936,7 +1054,7 @@ app.post('/api/announcements', auth, async (req, res) => {
       [bid, title || '', body, from || 'Management']
     );
     res.status(201).json(formatAnnouncement(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/announcements/:id', auth, async (req, res) => {
@@ -945,7 +1063,7 @@ app.delete('/api/announcements/:id', auth, async (req, res) => {
     const { rows } = await pool.query('DELETE FROM announcements WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatAnnouncement(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── SOP ───────────────────────────────────────────────────
@@ -955,7 +1073,7 @@ app.get('/api/sop', auth, async (req, res) => {
     if (!bid) return res.json([]);
     const { rows } = await pool.query('SELECT * FROM sop WHERE business_id = $1 ORDER BY id', [bid]);
     res.json(rows.map(formatSop));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/sop', auth, async (req, res) => {
@@ -968,7 +1086,7 @@ app.post('/api/sop', auth, async (req, res) => {
       [bid, title, body || '', category || 'General']
     );
     res.status(201).json(formatSop(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/sop/:id', auth, async (req, res) => {
@@ -977,7 +1095,7 @@ app.delete('/api/sop/:id', auth, async (req, res) => {
     const { rows } = await pool.query('DELETE FROM sop WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatSop(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Violations ────────────────────────────────────────────
@@ -987,7 +1105,7 @@ app.get('/api/violations', auth, async (req, res) => {
     if (!bid) return res.json([]);
     const { rows } = await pool.query('SELECT * FROM violations WHERE business_id = $1 ORDER BY created_at DESC', [bid]);
     res.json(rows.map(formatViolation));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/violations', auth, async (req, res) => {
@@ -1000,7 +1118,7 @@ app.post('/api/violations', auth, async (req, res) => {
       [bid, staffId, sopId || null, note || '']
     );
     res.status(201).json(formatViolation(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/violations/:id', auth, async (req, res) => {
@@ -1009,17 +1127,17 @@ app.delete('/api/violations/:id', auth, async (req, res) => {
     const { rows } = await pool.query('DELETE FROM violations WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatViolation(rows[0]));
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Error handler ─────────────────────────────────────────
 app.use((err, req, res, next) => {
-  console.error(err.stack);
+  logger.error('unhandled.error', { path: req.path, method: req.method, err: err.message, stack: err.stack });
   res.status(500).json({ error: 'Internal server error' });
 });
 
 // ── Start ─────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`SpaPilot backend running on port ${PORT}`)))
-  .catch(err => { console.error('DB init failed:', err); process.exit(1); });
+  .then(() => app.listen(PORT, () => logger.info('server.started', { port: PORT })))
+  .catch(err => { logger.error('db.init.failed', { err: err.message, stack: err.stack }); process.exit(1); });
