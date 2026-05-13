@@ -270,6 +270,14 @@ const validate = (schema) => (req, res, next) => {
 };
 
 // ── Auth middleware ───────────────────────────────────────
+// Paths that remain accessible even when trial expired. User must always be able
+// to log out, view/export their data, and manage their subscription.
+const TRIAL_EXPIRED_ALLOWED_PREFIXES = [
+  '/api/auth/',
+  '/api/billing/',
+  '/api/businesses/me',
+];
+
 const auth = async (req, res, next) => {
   const header = req.headers.authorization;
   if (!header) return res.status(401).json({ error: 'No token' });
@@ -283,6 +291,27 @@ const auth = async (req, res, next) => {
       if (rowCount) return res.status(401).json({ error: 'Token revoked' });
     }
     req.user = decoded;
+
+    // Trial-expired enforcement: block mutations on data endpoints once trial ends.
+    const isMutating = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method);
+    const isAllowedPath = TRIAL_EXPIRED_ALLOWED_PREFIXES.some(p => req.path.startsWith(p));
+    if (isMutating && !isAllowedPath) {
+      const { rows: ur } = await pool.query(
+        'SELECT subscription_status, trial_ends_at FROM users WHERE id=$1',
+        [decoded.id]
+      );
+      if (ur.length) {
+        const status = ur[0].subscription_status;
+        const trialExpired = ur[0].trial_ends_at && new Date(ur[0].trial_ends_at) < new Date();
+        if (status !== 'active' && trialExpired) {
+          return res.status(402).json({
+            error: 'Your trial has ended. Subscribe to continue.',
+            code: 'TRIAL_EXPIRED',
+          });
+        }
+      }
+    }
+
     next();
   } catch (err) {
     res.status(401).json({ error: 'Invalid token' });
@@ -940,6 +969,7 @@ const needBusiness = (req, res) => {
   }
   return bid;
 };
+
 
 // ── Staff ─────────────────────────────────────────────────
 app.get('/api/staff', auth, async (req, res) => {
