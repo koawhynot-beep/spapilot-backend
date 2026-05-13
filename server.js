@@ -252,8 +252,16 @@ const deleteAccountSchema = z.object({
 const validate = (schema) => (req, res, next) => {
   const result = schema.safeParse(req.body);
   if (!result.success) {
+    const issue = result.error.issues[0];
+    const field = issue.path.join('.') || 'input';
+    let msg = issue.message;
+    // Friendlier messages for common cases
+    if (field === 'email' && issue.code === 'invalid_string') msg = 'Please enter a valid email address';
+    else if (field === 'password' && issue.code === 'too_small') msg = 'Password must be at least 8 characters';
+    else if (issue.code === 'too_small') msg = `${field}: must be at least ${issue.minimum} characters`;
+    else if (issue.code === 'too_big') msg = `${field}: must be at most ${issue.maximum} characters`;
     return res.status(400).json({
-      error: 'Invalid input',
+      error: msg,
       details: result.error.issues.map(i => ({ path: i.path.join('.'), message: i.message })),
     });
   }
@@ -1115,6 +1123,19 @@ app.post('/api/requests', auth, async (req, res) => {
     if (!type || !staffId) return res.status(400).json({ error: 'type and staffId required' });
     const validTypes = ['sick', 'dayoff', 'swap', 'stock_request'];
     if (!validTypes.includes(type)) return res.status(400).json({ error: 'invalid type' });
+
+    // Prevent duplicate pending requests of same type per staff per date (skip stock_request)
+    if (type !== 'stock_request' && date) {
+      const { rowCount: dupCount } = await pool.query(
+        `SELECT 1 FROM requests
+         WHERE business_id=$1 AND staff_id=$2 AND type=$3 AND date=$4 AND status='pending'`,
+        [bid, Number(staffId), type, date]
+      );
+      if (dupCount) {
+        return res.status(409).json({ error: 'You already have a pending request for this date.' });
+      }
+    }
+
     const { rows } = await pool.query(
       'INSERT INTO requests (business_id, type, staff_id, date, reason, swap_with, swap_day, product_id, quantity) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
       [bid, type, Number(staffId), date || null, reason || '', swapWith || null, swapDay || null, productId || null, quantity || 0]
@@ -1139,6 +1160,37 @@ app.put('/api/requests/:id', auth, async (req, res) => {
         await client.query(
           `UPDATE bookings SET staff_id=$1 WHERE staff_id=$2 AND date = $3::date`,
           [reassignToStaffId, request.staff_id, request.date]
+        );
+      }
+
+      // Shift swap: requester's bookings on their date go to swap_with, swap_with's
+      // bookings on swap_day go to requester. Two-step swap via temp NULL to avoid
+      // accidentally overwriting in one move.
+      if (status === 'approved' && request.type === 'swap' && request.swap_with && request.swap_day) {
+        // Tag requester's bookings with NULL temporarily so the second update
+        // doesn't accidentally re-grab them.
+        await client.query(
+          `UPDATE bookings SET staff_id=NULL WHERE staff_id=$1 AND date=$2::date AND business_id=$3`,
+          [request.staff_id, request.date, bid]
+        );
+        // Move swap_with staff's bookings on swap_day to requester
+        await client.query(
+          `UPDATE bookings SET staff_id=$1 WHERE staff_id=$2 AND date=$3::date AND business_id=$4`,
+          [request.staff_id, request.swap_with, request.swap_day, bid]
+        );
+        // Move the NULL-tagged bookings to swap_with
+        await client.query(
+          `UPDATE bookings SET staff_id=$1 WHERE staff_id IS NULL AND date=$2::date AND business_id=$3`,
+          [request.swap_with, request.date, bid]
+        );
+      }
+
+      // Day-off approval: cancel requester's bookings on that date or leave to manager.
+      // Manager UI should reassign manually first; we just record approval.
+      if (status === 'approved' && request.type === 'dayoff' && reassignToStaffId) {
+        await client.query(
+          `UPDATE bookings SET staff_id=$1 WHERE staff_id=$2 AND date=$3::date AND business_id=$4`,
+          [reassignToStaffId, request.staff_id, request.date, bid]
         );
       }
 
