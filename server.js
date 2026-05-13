@@ -215,6 +215,16 @@ const formatSop = (s) => ({
   createdAt: s.created_at,
 });
 
+const formatService = (s) => ({
+  id: s.id,
+  name: s.name,
+  category: s.category || 'General',
+  durationMin: s.duration_min,
+  price: Number(s.price) || 0,
+  color: s.color || '#2d5a4a',
+  createdAt: s.created_at,
+});
+
 // ── Pagination helper ─────────────────────────────────────
 // Backward-compatible: if no query params, returns up to MAX_DEFAULT_LIMIT rows (1000).
 // If ?limit / ?offset present, applies them. Always returns plain array (no shape change).
@@ -473,6 +483,16 @@ async function initDB() {
       note        TEXT DEFAULT '',
       created_at  TIMESTAMPTZ DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS services (
+      id           SERIAL PRIMARY KEY,
+      name         TEXT NOT NULL,
+      category     TEXT DEFAULT 'General',
+      duration_min INTEGER DEFAULT 60,
+      price        NUMERIC DEFAULT 0,
+      color        TEXT DEFAULT '#2d5a4a',
+      created_at   TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
 
   // Add columns to existing tables idempotently
@@ -499,6 +519,7 @@ async function initDB() {
     `ALTER TABLE announcements ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
     `ALTER TABLE sop           ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
     `ALTER TABLE violations    ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
+    `ALTER TABLE services      ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
   ];
   for (const q of alters) {
     try { await pool.query(q); } catch (e) { logger.warn('alter.skipped', { err: e.message }); }
@@ -523,6 +544,7 @@ async function initDB() {
     `CREATE INDEX IF NOT EXISTS idx_sop_business_id ON sop(business_id)`,
     `CREATE INDEX IF NOT EXISTS idx_violations_business_id ON violations(business_id)`,
     `CREATE INDEX IF NOT EXISTS idx_violations_staff_id ON violations(staff_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_services_business_id ON services(business_id)`,
     `CREATE INDEX IF NOT EXISTS idx_password_resets_user_id ON password_resets(user_id)`,
     `CREATE INDEX IF NOT EXISTS idx_password_resets_token ON password_resets(token)`,
     `CREATE INDEX IF NOT EXISTS idx_businesses_owner_id ON businesses(owner_id)`,
@@ -1343,6 +1365,55 @@ app.delete('/api/violations/:id', auth, async (req, res) => {
     const { rows } = await pool.query('DELETE FROM violations WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatViolation(rows[0]));
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── Services ──────────────────────────────────────────────
+app.get('/api/services', auth, async (req, res) => {
+  try {
+    const bid = req.user.businessId;
+    if (!bid) return res.json([]);
+    const { sql } = paginationClause(req);
+    const { rows } = await pool.query('SELECT * FROM services WHERE business_id = $1 ORDER BY category, name' + sql, [bid]);
+    res.json(rows.map(formatService));
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/services', auth, async (req, res) => {
+  try {
+    const bid = needBusiness(req, res); if (!bid) return;
+    const { name, category, durationMin, price, color } = req.body;
+    if (!name) return res.status(400).json({ error: 'name required' });
+    const { rows } = await pool.query(
+      `INSERT INTO services (business_id, name, category, duration_min, price, color)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [bid, name, category || 'General', Number(durationMin) || 60, Number(price) || 0, color || '#2d5a4a']
+    );
+    res.status(201).json(formatService(rows[0]));
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.put('/api/services/:id', auth, async (req, res) => {
+  try {
+    const bid = needBusiness(req, res); if (!bid) return;
+    const { name, category, durationMin, price, color } = req.body;
+    const { rows } = await pool.query(
+      `UPDATE services
+         SET name=$1, category=$2, duration_min=$3, price=$4, color=$5
+       WHERE id=$6 AND business_id=$7 RETURNING *`,
+      [name, category || 'General', Number(durationMin) || 60, Number(price) || 0, color || '#2d5a4a', req.params.id, bid]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'not found' });
+    res.json(formatService(rows[0]));
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.delete('/api/services/:id', auth, async (req, res) => {
+  try {
+    const bid = needBusiness(req, res); if (!bid) return;
+    const { rows } = await pool.query('DELETE FROM services WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
+    if (!rows.length) return res.status(404).json({ error: 'not found' });
+    res.json(formatService(rows[0]));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
