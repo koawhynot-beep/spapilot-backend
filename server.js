@@ -255,6 +255,22 @@ const genCode = () => {
 
 // ── DB init ───────────────────────────────────────────────
 async function initDB() {
+  // ── One-time migration: wipe old SpaPilot schema ─────────
+  // If stock_items doesn't exist yet → first StockPilot deploy → nuke everything.
+  // After first successful run, stock_items exists and this is skipped forever.
+  const { rows: schemaCheck } = await pool.query(`
+    SELECT 1 FROM information_schema.tables
+    WHERE table_schema='public' AND table_name='stock_items'
+  `);
+  if (!schemaCheck.length) {
+    logger.info('db.migration.wipe: stock_items not found — wiping old schema and rebuilding for StockPilot');
+    await pool.query('DROP SCHEMA public CASCADE');
+    await pool.query('CREATE SCHEMA public');
+    await pool.query('GRANT ALL ON SCHEMA public TO PUBLIC');
+    await pool.query('GRANT ALL ON SCHEMA public TO postgres');
+    logger.info('db.migration.wipe: done');
+  }
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id                   SERIAL PRIMARY KEY,
