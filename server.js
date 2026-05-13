@@ -133,6 +133,7 @@ const formatUser = (u) => ({
   email: u.email,
   role: u.role,
   businessId: u.business_id,
+  permissions: u.permissions || {},
   trialEndsAt: u.trial_ends_at,
   subscriptionStatus: u.subscription_status || 'trial',
   createdAt: u.created_at,
