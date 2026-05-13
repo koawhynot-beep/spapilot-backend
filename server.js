@@ -267,7 +267,8 @@ async function initDB() {
     await pool.query('DROP SCHEMA public CASCADE');
     await pool.query('CREATE SCHEMA public');
     await pool.query('GRANT ALL ON SCHEMA public TO PUBLIC');
-    await pool.query('GRANT ALL ON SCHEMA public TO postgres');
+    // best-effort: postgres role may not exist on all hosts
+    try { await pool.query('GRANT ALL ON SCHEMA public TO postgres'); } catch (_) {}
     logger.info('db.migration.wipe: done');
   }
 
