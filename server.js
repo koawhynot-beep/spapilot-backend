@@ -92,6 +92,8 @@ const shopSchema = z.object({
 const stockItemSchema = z.object({
   name: z.string().trim().min(1).max(200),
   category: z.string().trim().max(100).optional().default(''),
+  fabric: z.string().trim().max(100).optional().default(''),
+  print: z.string().trim().max(100).optional().default(''),
   size: z.string().trim().max(50).optional().default(''),
   color: z.string().trim().max(50).optional().default(''),
   sku: z.string().trim().max(100).optional().default(''),
@@ -152,6 +154,8 @@ const formatStock = (s) => ({
   shopId: s.shop_id,
   name: s.name,
   category: s.category || '',
+  fabric: s.fabric || '',
+  print: s.print || '',
   size: s.size || '',
   color: s.color || '',
   sku: s.sku || '',
@@ -160,6 +164,8 @@ const formatStock = (s) => ({
   threshold: s.threshold,
   supplier: s.supplier || '',
   notes: s.notes || '',
+  lastSoldAt: s.last_sold_at,
+  createdAt: s.created_at,
   updatedAt: s.updated_at,
 });
 
@@ -306,20 +312,23 @@ async function initDB() {
     );
 
     CREATE TABLE IF NOT EXISTS stock_items (
-      id          SERIAL PRIMARY KEY,
-      shop_id     INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
-      name        TEXT NOT NULL,
-      category    TEXT DEFAULT '',
-      size        TEXT DEFAULT '',
-      color       TEXT DEFAULT '',
-      sku         TEXT DEFAULT '',
-      brand       TEXT DEFAULT '',
-      qty         INTEGER DEFAULT 0,
-      threshold   INTEGER DEFAULT 5,
-      supplier    TEXT DEFAULT '',
-      notes       TEXT DEFAULT '',
-      created_at  TIMESTAMPTZ DEFAULT NOW(),
-      updated_at  TIMESTAMPTZ DEFAULT NOW()
+      id            SERIAL PRIMARY KEY,
+      shop_id       INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+      name          TEXT NOT NULL,
+      category      TEXT DEFAULT '',
+      fabric        TEXT DEFAULT '',
+      print         TEXT DEFAULT '',
+      size          TEXT DEFAULT '',
+      color         TEXT DEFAULT '',
+      sku           TEXT DEFAULT '',
+      brand         TEXT DEFAULT '',
+      qty           INTEGER DEFAULT 0,
+      threshold     INTEGER DEFAULT 5,
+      supplier      TEXT DEFAULT '',
+      notes         TEXT DEFAULT '',
+      last_sold_at  TIMESTAMPTZ,
+      created_at    TIMESTAMPTZ DEFAULT NOW(),
+      updated_at    TIMESTAMPTZ DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS invite_codes (
@@ -355,6 +364,13 @@ async function initDB() {
       ALTER TABLE users ADD CONSTRAINT users_business_id_fkey
         FOREIGN KEY (business_id) REFERENCES businesses(id) ON DELETE SET NULL;
     EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+  `);
+
+  // Idempotent column adds for stock_items (so deploys before fabric/print/last_sold_at upgrade cleanly)
+  await pool.query(`
+    ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS fabric       TEXT DEFAULT '';
+    ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS print        TEXT DEFAULT '';
+    ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS last_sold_at TIMESTAMPTZ;
   `);
 
   // Indexes
@@ -696,7 +712,7 @@ app.get('/api/shops/:shopId/stock', auth, async (req, res) => {
     let sql = 'SELECT * FROM stock_items WHERE shop_id=$1';
     if (search) {
       params.push(`%${search}%`);
-      sql += ` AND (LOWER(name) LIKE $2 OR LOWER(category) LIKE $2 OR LOWER(sku) LIKE $2 OR LOWER(brand) LIKE $2)`;
+      sql += ` AND (LOWER(name) LIKE $2 OR LOWER(category) LIKE $2 OR LOWER(fabric) LIKE $2 OR LOWER(print) LIKE $2 OR LOWER(color) LIKE $2 OR LOWER(size) LIKE $2 OR LOWER(sku) LIKE $2 OR LOWER(brand) LIKE $2)`;
     }
     sql += ' ORDER BY name LIMIT 1000';
     const { rows } = await pool.query(sql, params);
@@ -735,9 +751,9 @@ app.post('/api/shops/:shopId/stock', auth, validate(stockItemSchema), async (req
     }
     const b = req.body;
     const { rows } = await pool.query(
-      `INSERT INTO stock_items (shop_id, name, category, size, color, sku, brand, qty, threshold, supplier, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-      [req.params.shopId, b.name, b.category, b.size, b.color, b.sku, b.brand, b.qty, b.threshold, b.supplier, b.notes]
+      `INSERT INTO stock_items (shop_id, name, category, fabric, print, size, color, sku, brand, qty, threshold, supplier, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+      [req.params.shopId, b.name, b.category, b.fabric, b.print, b.size, b.color, b.sku, b.brand, b.qty, b.threshold, b.supplier, b.notes]
     );
     res.status(201).json(formatStock(rows[0]));
   } catch (err) {
@@ -760,9 +776,9 @@ app.put('/api/stock/:id', auth, validate(stockItemSchema), async (req, res) => {
     const b = req.body;
     const { rows } = await pool.query(
       `UPDATE stock_items
-       SET name=$1, category=$2, size=$3, color=$4, sku=$5, brand=$6, qty=$7, threshold=$8, supplier=$9, notes=$10, updated_at=NOW()
-       WHERE id=$11 RETURNING *`,
-      [b.name, b.category, b.size, b.color, b.sku, b.brand, b.qty, b.threshold, b.supplier, b.notes, req.params.id]
+       SET name=$1, category=$2, fabric=$3, print=$4, size=$5, color=$6, sku=$7, brand=$8, qty=$9, threshold=$10, supplier=$11, notes=$12, updated_at=NOW()
+       WHERE id=$13 RETURNING *`,
+      [b.name, b.category, b.fabric, b.print, b.size, b.color, b.sku, b.brand, b.qty, b.threshold, b.supplier, b.notes, req.params.id]
     );
     res.json(formatStock(rows[0]));
   } catch (err) {
@@ -777,15 +793,18 @@ app.patch('/api/stock/:id/qty', auth, async (req, res) => {
     const { qty } = req.body;
     if (typeof qty !== 'number' || qty < 0) return res.status(400).json({ error: 'qty must be a non-negative number' });
     const { rows: own } = await pool.query(
-      `SELECT s.id FROM stock_items s JOIN shops sh ON sh.id=s.shop_id WHERE s.id=$1 AND sh.business_id=$2`,
+      `SELECT s.id, s.qty FROM stock_items s JOIN shops sh ON sh.id=s.shop_id WHERE s.id=$1 AND sh.business_id=$2`,
       [req.params.id, req.user.businessId]
     );
     if (!own.length) return res.status(404).json({ error: 'Item not found' });
     if (!await ensureStaffStockPerm(req, 'edit')) {
       return res.status(403).json({ error: 'You do not have permission to edit stock' });
     }
+    const decreased = qty < own[0].qty;
     const { rows } = await pool.query(
-      `UPDATE stock_items SET qty=$1, updated_at=NOW() WHERE id=$2 RETURNING *`,
+      decreased
+        ? `UPDATE stock_items SET qty=$1, last_sold_at=NOW(), updated_at=NOW() WHERE id=$2 RETURNING *`
+        : `UPDATE stock_items SET qty=$1, updated_at=NOW() WHERE id=$2 RETURNING *`,
       [qty, req.params.id]
     );
     res.json(formatStock(rows[0]));
