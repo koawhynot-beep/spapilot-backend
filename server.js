@@ -109,6 +109,8 @@ const stockItemSchema = z.object({
   threshold: z.coerce.number().int().min(0).default(5),
   supplier: z.string().trim().max(200).optional().default(''),
   notes: z.string().trim().max(2000).optional().default(''),
+  imageUrl: z.string().trim().max(2000).optional().default(''),
+  price: z.coerce.number().min(0).max(1e12).optional().default(0),
 });
 
 const validate = (schema) => (req, res, next) => {
@@ -171,6 +173,8 @@ const formatStock = (s) => ({
   threshold: s.threshold,
   supplier: s.supplier || '',
   notes: s.notes || '',
+  imageUrl: s.image_url || '',
+  price: s.price !== null && s.price !== undefined ? Number(s.price) : 0,
   groupId: s.group_id ?? null,
   position: s.position ?? 0,
   lastSoldAt: s.last_sold_at,
@@ -424,6 +428,8 @@ async function initDB() {
     ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS last_sold_at TIMESTAMPTZ;
     ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS group_id     INTEGER REFERENCES item_groups(id) ON DELETE SET NULL;
     ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS position     INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS image_url    TEXT DEFAULT '';
+    ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS price        NUMERIC(14,2) DEFAULT 0;
   `);
 
   // Indexes
@@ -822,9 +828,9 @@ app.post('/api/shops/:shopId/stock', auth, validate(stockItemSchema), async (req
     );
     const newPos = posRows[0].p;
     const { rows } = await pool.query(
-      `INSERT INTO stock_items (shop_id, name, category, fabric, print, size, color, sku, brand, qty, threshold, supplier, notes, position)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
-      [req.params.shopId, b.name, b.category, b.fabric, b.print, b.size, b.color, b.sku, b.brand, b.qty, b.threshold, b.supplier, b.notes, newPos]
+      `INSERT INTO stock_items (shop_id, name, category, fabric, print, size, color, sku, brand, qty, threshold, supplier, notes, position, image_url, price)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+      [req.params.shopId, b.name, b.category, b.fabric, b.print, b.size, b.color, b.sku, b.brand, b.qty, b.threshold, b.supplier, b.notes, newPos, b.imageUrl, b.price]
     );
     res.status(201).json(formatStock(rows[0]));
   } catch (err) {
@@ -847,9 +853,9 @@ app.put('/api/stock/:id', auth, validate(stockItemSchema), async (req, res) => {
     const b = req.body;
     const { rows } = await pool.query(
       `UPDATE stock_items
-       SET name=$1, category=$2, fabric=$3, print=$4, size=$5, color=$6, sku=$7, brand=$8, qty=$9, threshold=$10, supplier=$11, notes=$12, updated_at=NOW()
-       WHERE id=$13 RETURNING *`,
-      [b.name, b.category, b.fabric, b.print, b.size, b.color, b.sku, b.brand, b.qty, b.threshold, b.supplier, b.notes, req.params.id]
+       SET name=$1, category=$2, fabric=$3, print=$4, size=$5, color=$6, sku=$7, brand=$8, qty=$9, threshold=$10, supplier=$11, notes=$12, image_url=$13, price=$14, updated_at=NOW()
+       WHERE id=$15 RETURNING *`,
+      [b.name, b.category, b.fabric, b.print, b.size, b.color, b.sku, b.brand, b.qty, b.threshold, b.supplier, b.notes, b.imageUrl, b.price, req.params.id]
     );
     res.json(formatStock(rows[0]));
   } catch (err) {
