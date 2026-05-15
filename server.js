@@ -171,9 +171,19 @@ const formatStock = (s) => ({
   threshold: s.threshold,
   supplier: s.supplier || '',
   notes: s.notes || '',
+  groupId: s.group_id ?? null,
+  position: s.position ?? 0,
   lastSoldAt: s.last_sold_at,
   createdAt: s.created_at,
   updatedAt: s.updated_at,
+});
+
+const formatGroup = (g) => ({
+  id: g.id,
+  shopId: g.shop_id,
+  name: g.name,
+  position: g.position ?? 0,
+  createdAt: g.created_at,
 });
 
 const formatMovement = (m) => ({
@@ -389,6 +399,14 @@ async function initDB() {
       note         TEXT DEFAULT '',
       created_at   TIMESTAMPTZ DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS item_groups (
+      id           SERIAL PRIMARY KEY,
+      shop_id      INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+      name         TEXT NOT NULL,
+      position     INTEGER NOT NULL DEFAULT 0,
+      created_at   TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
 
   // Add foreign key from users.business_id → businesses after both tables exist
@@ -404,6 +422,8 @@ async function initDB() {
     ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS fabric       TEXT DEFAULT '';
     ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS print        TEXT DEFAULT '';
     ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS last_sold_at TIMESTAMPTZ;
+    ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS group_id     INTEGER REFERENCES item_groups(id) ON DELETE SET NULL;
+    ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS position     INTEGER NOT NULL DEFAULT 0;
   `);
 
   // Indexes
@@ -422,6 +442,9 @@ async function initDB() {
     `CREATE INDEX IF NOT EXISTS idx_movements_item_id ON stock_movements(item_id)`,
     `CREATE INDEX IF NOT EXISTS idx_movements_shop_id ON stock_movements(shop_id)`,
     `CREATE INDEX IF NOT EXISTS idx_movements_occurred ON stock_movements(occurred_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_groups_shop_id ON item_groups(shop_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_stock_group_id ON stock_items(group_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_stock_position ON stock_items(shop_id, position)`,
   ];
   for (const q of indexes) {
     try { await pool.query(q); } catch (e) { logger.warn('index.skipped', { err: e.message }); }
@@ -744,13 +767,20 @@ app.get('/api/shops/:shopId/stock', auth, async (req, res) => {
       return res.status(404).json({ error: 'Shop not found' });
     }
     const search = (req.query.search || '').trim().toLowerCase();
+    const groupParam = req.query.group; // 'all' | id | 'none'
     const params = [req.params.shopId];
     let sql = 'SELECT * FROM stock_items WHERE shop_id=$1';
     if (search) {
       params.push(`%${search}%`);
-      sql += ` AND (LOWER(name) LIKE $2 OR LOWER(category) LIKE $2 OR LOWER(fabric) LIKE $2 OR LOWER(print) LIKE $2 OR LOWER(color) LIKE $2 OR LOWER(size) LIKE $2 OR LOWER(sku) LIKE $2 OR LOWER(brand) LIKE $2)`;
+      sql += ` AND (LOWER(name) LIKE $${params.length} OR LOWER(category) LIKE $${params.length} OR LOWER(fabric) LIKE $${params.length} OR LOWER(print) LIKE $${params.length} OR LOWER(color) LIKE $${params.length} OR LOWER(size) LIKE $${params.length} OR LOWER(sku) LIKE $${params.length} OR LOWER(brand) LIKE $${params.length})`;
     }
-    sql += ' ORDER BY name LIMIT 1000';
+    if (groupParam === 'none') {
+      sql += ' AND group_id IS NULL';
+    } else if (groupParam && groupParam !== 'all' && !Number.isNaN(Number(groupParam))) {
+      params.push(Number(groupParam));
+      sql += ` AND group_id=$${params.length}`;
+    }
+    sql += ' ORDER BY position ASC, name ASC LIMIT 1000';
     const { rows } = await pool.query(sql, params);
     res.json(rows.map(formatStock));
   } catch (err) {
@@ -786,10 +816,15 @@ app.post('/api/shops/:shopId/stock', auth, validate(stockItemSchema), async (req
       return res.status(403).json({ error: 'You do not have permission to add stock items' });
     }
     const b = req.body;
+    const { rows: posRows } = await pool.query(
+      `SELECT COALESCE(MAX(position), -1) + 1 AS p FROM stock_items WHERE shop_id=$1`,
+      [req.params.shopId]
+    );
+    const newPos = posRows[0].p;
     const { rows } = await pool.query(
-      `INSERT INTO stock_items (shop_id, name, category, fabric, print, size, color, sku, brand, qty, threshold, supplier, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
-      [req.params.shopId, b.name, b.category, b.fabric, b.print, b.size, b.color, b.sku, b.brand, b.qty, b.threshold, b.supplier, b.notes]
+      `INSERT INTO stock_items (shop_id, name, category, fabric, print, size, color, sku, brand, qty, threshold, supplier, notes, position)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+      [req.params.shopId, b.name, b.category, b.fabric, b.print, b.size, b.color, b.sku, b.brand, b.qty, b.threshold, b.supplier, b.notes, newPos]
     );
     res.status(201).json(formatStock(rows[0]));
   } catch (err) {
@@ -958,6 +993,139 @@ app.get('/api/shops/:shopId/movements', auth, async (req, res) => {
   } catch (err) {
     logger.error('movement.shoplist.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── Item groups (per shop) ────────────────────────────────
+const groupSchema = z.object({
+  name: z.string().trim().min(1).max(80),
+});
+
+app.get('/api/shops/:shopId/groups', auth, async (req, res) => {
+  try {
+    if (!await shopGuard(req.params.shopId, req.user.businessId)) {
+      return res.status(404).json({ error: 'Shop not found' });
+    }
+    const { rows } = await pool.query(
+      `SELECT * FROM item_groups WHERE shop_id=$1 ORDER BY position ASC, created_at ASC`,
+      [req.params.shopId]
+    );
+    res.json(rows.map(formatGroup));
+  } catch (err) {
+    logger.error('group.list.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/shops/:shopId/groups', auth, validate(groupSchema), async (req, res) => {
+  try {
+    if (!await shopGuard(req.params.shopId, req.user.businessId)) {
+      return res.status(404).json({ error: 'Shop not found' });
+    }
+    if (!await ensureStaffStockPerm(req, 'add')) {
+      return res.status(403).json({ error: 'You do not have permission to add groups' });
+    }
+    const { rows: posRows } = await pool.query(
+      `SELECT COALESCE(MAX(position), -1) + 1 AS p FROM item_groups WHERE shop_id=$1`,
+      [req.params.shopId]
+    );
+    const { rows } = await pool.query(
+      `INSERT INTO item_groups (shop_id, name, position) VALUES ($1,$2,$3) RETURNING *`,
+      [req.params.shopId, req.body.name, posRows[0].p]
+    );
+    res.status(201).json(formatGroup(rows[0]));
+  } catch (err) {
+    logger.error('group.create.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.delete('/api/groups/:id', auth, async (req, res) => {
+  try {
+    const { rows: own } = await pool.query(
+      `SELECT g.id FROM item_groups g JOIN shops sh ON sh.id=g.shop_id WHERE g.id=$1 AND sh.business_id=$2`,
+      [req.params.id, req.user.businessId]
+    );
+    if (!own.length) return res.status(404).json({ error: 'Group not found' });
+    if (!await ensureStaffStockPerm(req, 'delete')) {
+      return res.status(403).json({ error: 'You do not have permission to delete groups' });
+    }
+    await pool.query(`DELETE FROM item_groups WHERE id=$1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error('group.delete.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Assign item to group (or remove with groupId=null)
+app.patch('/api/stock/:id/group', auth, async (req, res) => {
+  try {
+    const groupId = req.body?.groupId;
+    const validGroupId = groupId === null || groupId === undefined || (Number.isInteger(groupId) && groupId > 0);
+    if (!validGroupId) return res.status(400).json({ error: 'groupId must be a positive integer or null' });
+
+    const { rows: own } = await pool.query(
+      `SELECT s.id, s.shop_id FROM stock_items s JOIN shops sh ON sh.id=s.shop_id WHERE s.id=$1 AND sh.business_id=$2`,
+      [req.params.id, req.user.businessId]
+    );
+    if (!own.length) return res.status(404).json({ error: 'Item not found' });
+    if (!await ensureStaffStockPerm(req, 'edit')) {
+      return res.status(403).json({ error: 'You do not have permission to edit stock' });
+    }
+    if (groupId) {
+      const { rows: g } = await pool.query(
+        `SELECT 1 FROM item_groups WHERE id=$1 AND shop_id=$2`,
+        [groupId, own[0].shop_id]
+      );
+      if (!g.length) return res.status(404).json({ error: 'Group not found in this shop' });
+    }
+    const { rows } = await pool.query(
+      `UPDATE stock_items SET group_id=$1, updated_at=NOW() WHERE id=$2 RETURNING *`,
+      [groupId || null, req.params.id]
+    );
+    res.json(formatStock(rows[0]));
+  } catch (err) {
+    logger.error('stock.group.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Reorder items — body: { orderedIds: number[] }
+// Reassigns the positions among those items to match the new order, preserving the slot set.
+app.patch('/api/shops/:shopId/stock/reorder', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const orderedIds = Array.isArray(req.body?.orderedIds) ? req.body.orderedIds : null;
+    if (!orderedIds || !orderedIds.every(n => Number.isInteger(n) && n > 0)) {
+      return res.status(400).json({ error: 'orderedIds must be an array of positive integers' });
+    }
+    if (!await shopGuard(req.params.shopId, req.user.businessId)) {
+      return res.status(404).json({ error: 'Shop not found' });
+    }
+    if (!await ensureStaffStockPerm(req, 'edit')) {
+      return res.status(403).json({ error: 'You do not have permission to reorder stock' });
+    }
+    const { rows: existing } = await client.query(
+      `SELECT id, position FROM stock_items WHERE id = ANY($1::int[]) AND shop_id=$2`,
+      [orderedIds, req.params.shopId]
+    );
+    if (existing.length !== orderedIds.length) {
+      return res.status(400).json({ error: 'Some items not found in this shop' });
+    }
+    const slots = existing.map(r => r.position).sort((a, b) => a - b);
+    await client.query('BEGIN');
+    for (let i = 0; i < orderedIds.length; i++) {
+      await client.query(`UPDATE stock_items SET position=$1 WHERE id=$2`, [slots[i], orderedIds[i]]);
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    logger.error('stock.reorder.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
   }
 });
 
