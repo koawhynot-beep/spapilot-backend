@@ -319,6 +319,18 @@ const genCode = () => {
 
 // ── DB init ───────────────────────────────────────────────
 async function initDB() {
+  // ── Operator-triggered full wipe ─────────────────────────
+  // Set WIPE_DB_ON_BOOT=true on Render to nuke all data on next deploy.
+  // REMOVE THE ENV VAR AFTERWARD so future deploys don't re-wipe.
+  if (process.env.WIPE_DB_ON_BOOT === 'true') {
+    logger.warn('db.wipe.requested: WIPE_DB_ON_BOOT=true — dropping all tables');
+    await pool.query('DROP SCHEMA public CASCADE');
+    await pool.query('CREATE SCHEMA public');
+    await pool.query('GRANT ALL ON SCHEMA public TO PUBLIC');
+    try { await pool.query('GRANT ALL ON SCHEMA public TO postgres'); } catch (_) {}
+    logger.warn('db.wipe.requested: done. REMOVE WIPE_DB_ON_BOOT env var now to prevent re-wipe.');
+  }
+
   // ── One-time migration: wipe old SpaPilot schema ─────────
   // If stock_items doesn't exist yet → first StockPilot deploy → nuke everything.
   // After first successful run, stock_items exists and this is skipped forever.
