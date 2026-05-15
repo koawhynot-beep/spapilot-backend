@@ -89,6 +89,13 @@ const shopSchema = z.object({
   name: z.string().trim().min(1).max(120),
   address: z.string().trim().max(500).optional().default(''),
 });
+const movementSchema = z.object({
+  type: z.enum(['in', 'out', 'adjust']),
+  qty: z.coerce.number().int().min(0),
+  occurredAt: z.string().datetime().optional(),
+  note: z.string().trim().max(500).optional().default(''),
+});
+
 const stockItemSchema = z.object({
   name: z.string().trim().min(1).max(200),
   category: z.string().trim().max(100).optional().default(''),
@@ -167,6 +174,19 @@ const formatStock = (s) => ({
   lastSoldAt: s.last_sold_at,
   createdAt: s.created_at,
   updatedAt: s.updated_at,
+});
+
+const formatMovement = (m) => ({
+  id: m.id,
+  itemId: m.item_id,
+  shopId: m.shop_id,
+  userId: m.user_id,
+  type: m.type,
+  qtyChange: m.qty_change,
+  qtyAfter: m.qty_after,
+  occurredAt: m.occurred_at,
+  note: m.note || '',
+  createdAt: m.created_at,
 });
 
 const formatInvite = (i) => ({
@@ -356,6 +376,19 @@ async function initDB() {
       expires_at   TIMESTAMPTZ NOT NULL,
       created_at   TIMESTAMPTZ DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS stock_movements (
+      id           SERIAL PRIMARY KEY,
+      item_id      INTEGER NOT NULL REFERENCES stock_items(id) ON DELETE CASCADE,
+      shop_id      INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+      user_id      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      type         TEXT NOT NULL,
+      qty_change   INTEGER NOT NULL,
+      qty_after    INTEGER NOT NULL,
+      occurred_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      note         TEXT DEFAULT '',
+      created_at   TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
 
   // Add foreign key from users.business_id → businesses after both tables exist
@@ -386,6 +419,9 @@ async function initDB() {
     `CREATE INDEX IF NOT EXISTS idx_invite_expires ON invite_codes(expires_at)`,
     `CREATE INDEX IF NOT EXISTS idx_announcements_business_id ON announcements(business_id)`,
     `CREATE INDEX IF NOT EXISTS idx_blacklist_expires ON token_blacklist(expires_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_movements_item_id ON stock_movements(item_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_movements_shop_id ON stock_movements(shop_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_movements_occurred ON stock_movements(occurred_at DESC)`,
   ];
   for (const q of indexes) {
     try { await pool.query(q); } catch (e) { logger.warn('index.skipped', { err: e.message }); }
@@ -787,30 +823,46 @@ app.put('/api/stock/:id', auth, validate(stockItemSchema), async (req, res) => {
   }
 });
 
-// Quick qty update
+// Quick qty update (also auto-logs movement)
 app.patch('/api/stock/:id/qty', auth, async (req, res) => {
+  const client = await pool.connect();
   try {
     const { qty } = req.body;
     if (typeof qty !== 'number' || qty < 0) return res.status(400).json({ error: 'qty must be a non-negative number' });
-    const { rows: own } = await pool.query(
-      `SELECT s.id, s.qty FROM stock_items s JOIN shops sh ON sh.id=s.shop_id WHERE s.id=$1 AND sh.business_id=$2`,
+    const { rows: own } = await client.query(
+      `SELECT s.id, s.qty, s.shop_id FROM stock_items s JOIN shops sh ON sh.id=s.shop_id WHERE s.id=$1 AND sh.business_id=$2`,
       [req.params.id, req.user.businessId]
     );
     if (!own.length) return res.status(404).json({ error: 'Item not found' });
     if (!await ensureStaffStockPerm(req, 'edit')) {
       return res.status(403).json({ error: 'You do not have permission to edit stock' });
     }
-    const decreased = qty < own[0].qty;
-    const { rows } = await pool.query(
+    const current = own[0].qty;
+    const qtyChange = qty - current;
+    const decreased = qty < current;
+    await client.query('BEGIN');
+    const { rows } = await client.query(
       decreased
         ? `UPDATE stock_items SET qty=$1, last_sold_at=NOW(), updated_at=NOW() WHERE id=$2 RETURNING *`
         : `UPDATE stock_items SET qty=$1, updated_at=NOW() WHERE id=$2 RETURNING *`,
       [qty, req.params.id]
     );
+    if (qtyChange !== 0) {
+      const mvType = qtyChange > 0 ? 'in' : 'out';
+      await client.query(
+        `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note)
+         VALUES ($1,$2,$3,$4,$5,$6,NOW(),'quick adjust')`,
+        [req.params.id, own[0].shop_id, req.user.id, mvType, qtyChange, qty]
+      );
+    }
+    await client.query('COMMIT');
     res.json(formatStock(rows[0]));
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     logger.error('stock.qty.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
   }
 });
 
@@ -828,6 +880,83 @@ app.delete('/api/stock/:id', auth, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     logger.error('stock.delete.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── Stock movements (history of in/out events) ────────────
+app.post('/api/stock/:id/movements', auth, validate(movementSchema), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { type, qty, occurredAt, note } = req.body;
+    const { rows: own } = await client.query(
+      `SELECT s.id, s.qty, s.shop_id FROM stock_items s JOIN shops sh ON sh.id=s.shop_id WHERE s.id=$1 AND sh.business_id=$2`,
+      [req.params.id, req.user.businessId]
+    );
+    if (!own.length) return res.status(404).json({ error: 'Item not found' });
+    if (!await ensureStaffStockPerm(req, 'edit')) {
+      return res.status(403).json({ error: 'You do not have permission to log movements' });
+    }
+    const currentQty = own[0].qty;
+    let newQty, qtyChange;
+    if (type === 'in') { newQty = currentQty + qty; qtyChange = qty; }
+    else if (type === 'out') { newQty = Math.max(0, currentQty - qty); qtyChange = -(currentQty - newQty); }
+    else { newQty = qty; qtyChange = qty - currentQty; }
+    const occurred = occurredAt ? new Date(occurredAt) : new Date();
+    await client.query('BEGIN');
+    const mv = await client.query(
+      `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [req.params.id, own[0].shop_id, req.user.id, type, qtyChange, newQty, occurred, note]
+    );
+    const updateSql = type === 'out'
+      ? `UPDATE stock_items SET qty=$1, last_sold_at=$2, updated_at=NOW() WHERE id=$3 RETURNING *`
+      : `UPDATE stock_items SET qty=$1, updated_at=NOW() WHERE id=$2 RETURNING *`;
+    const updateParams = type === 'out' ? [newQty, occurred, req.params.id] : [newQty, req.params.id];
+    const { rows: itemRows } = await client.query(updateSql, updateParams);
+    await client.query('COMMIT');
+    res.status(201).json({ item: formatStock(itemRows[0]), movement: formatMovement(mv.rows[0]) });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    logger.error('movement.create.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/stock/:id/movements', auth, async (req, res) => {
+  try {
+    const { rows: own } = await pool.query(
+      `SELECT s.id FROM stock_items s JOIN shops sh ON sh.id=s.shop_id WHERE s.id=$1 AND sh.business_id=$2`,
+      [req.params.id, req.user.businessId]
+    );
+    if (!own.length) return res.status(404).json({ error: 'Item not found' });
+    const { rows } = await pool.query(
+      `SELECT * FROM stock_movements WHERE item_id=$1 ORDER BY occurred_at DESC LIMIT 100`,
+      [req.params.id]
+    );
+    res.json(rows.map(formatMovement));
+  } catch (err) {
+    logger.error('movement.list.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/shops/:shopId/movements', auth, async (req, res) => {
+  try {
+    if (!await shopGuard(req.params.shopId, req.user.businessId)) {
+      return res.status(404).json({ error: 'Shop not found' });
+    }
+    const { rows } = await pool.query(
+      `SELECT m.*, s.name AS item_name FROM stock_movements m
+       JOIN stock_items s ON s.id=m.item_id
+       WHERE m.shop_id=$1 ORDER BY m.occurred_at DESC LIMIT 200`,
+      [req.params.shopId]
+    );
+    res.json(rows.map(r => ({ ...formatMovement(r), itemName: r.item_name })));
+  } catch (err) {
+    logger.error('movement.shoplist.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
