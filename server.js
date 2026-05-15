@@ -481,6 +481,10 @@ async function initDB() {
     ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS position     INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS image_url    TEXT DEFAULT '';
     ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS price        NUMERIC(14,2) DEFAULT 0;
+    ALTER TABLE email_verification_tokens ADD COLUMN IF NOT EXISTS code TEXT;
+    ALTER TABLE email_verification_tokens ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE password_reset_tokens ADD COLUMN IF NOT EXISTS code TEXT;
+    ALTER TABLE password_reset_tokens ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;
   `);
 
   // Indexes
@@ -700,49 +704,64 @@ app.get('/api/auth/me', auth, async (req, res) => {
   }
 });
 
-// ── Auth: Email verification ──────────────────────────────
+// ── Auth: Email verification & password reset (6-digit codes) ──
 const forgotSchema = z.object({
   email: emailSchema,
 });
-const resetSchema = z.object({
-  token: z.string().min(20).max(200),
+const resetWithCodeSchema = z.object({
+  email: emailSchema,
+  code: z.string().trim().regex(/^\d{6}$/, 'Code must be 6 digits'),
   password: passwordSchema,
 });
-const verifySchema = z.object({
-  token: z.string().min(20).max(200),
+const verifyCodeSchema = z.object({
+  code: z.string().trim().regex(/^\d{6}$/, 'Code must be 6 digits'),
 });
 
-const escapeHtml = (s) => String(s).replace(/[&<>"']/g, c => ({
-  '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-}[c]));
+const gen6Digit = () => String(crypto.randomInt(0, 1000000)).padStart(6, '0');
 
-async function issueVerificationEmail(userId, email) {
-  const token = crypto.randomBytes(32).toString('hex');
-  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
-  await pool.query(
-    `INSERT INTO email_verification_tokens (token, user_id, expires_at) VALUES ($1,$2,$3)`,
-    [token, userId, expiresAt]
-  );
-  const link = `${APP_URL}/?action=verify&token=${token}`;
-  const safeLink = escapeHtml(link);
-  const html = `<!doctype html>
+function codeEmailHtml({ heading, intro, code, ttlMinutes }) {
+  return `<!doctype html>
 <html><body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background:#f5f7fa; padding:24px;">
-<div style="max-width:520px; margin:0 auto; background:white; border-radius:12px; padding:32px; box-shadow:0 1px 3px rgba(0,0,0,0.06);">
-  <h1 style="color:#1e3a5f; font-size:24px; margin:0 0 16px;">Verify your email</h1>
-  <p style="font-size:16px; color:#1a1a1a; line-height:1.5;">Welcome to StockPilot! Click the button below to confirm your email address.</p>
-  <p style="margin:24px 0;">
-    <a href="${safeLink}" style="display:inline-block; background:#1e3a5f; color:white; text-decoration:none; padding:14px 28px; border-radius:10px; font-weight:600; font-size:16px;">Verify email</a>
-  </p>
-  <p style="font-size:13px; color:#666; line-height:1.5;">Or paste this link into your browser:<br><a href="${safeLink}" style="color:#1e3a5f; word-break:break-all;">${safeLink}</a></p>
-  <p style="font-size:13px; color:#666; margin-top:24px;">This link expires in 24 hours. If you didn't sign up for StockPilot, you can ignore this email.</p>
+<div style="max-width:480px; margin:0 auto; background:white; border-radius:14px; padding:32px; box-shadow:0 1px 3px rgba(0,0,0,0.06);">
+  <h1 style="color:#1e3a5f; font-size:24px; margin:0 0 12px;">${heading}</h1>
+  <p style="font-size:15px; color:#444; line-height:1.5; margin:0 0 24px;">${intro}</p>
+  <div style="background:#f5f7fa; border:2px solid #e0e4eb; border-radius:12px; padding:24px; text-align:center; margin-bottom:24px;">
+    <div style="font-size:13px; color:#666; text-transform:uppercase; letter-spacing:1px; margin-bottom:10px;">Your code</div>
+    <div style="font-size:42px; font-weight:700; color:#1e3a5f; letter-spacing:10px; font-family: 'SF Mono', Menlo, monospace;">${code}</div>
+  </div>
+  <p style="font-size:13px; color:#666; line-height:1.5; margin:0;">This code expires in ${ttlMinutes} minutes. If you didn't request it, you can ignore this email.</p>
 </div>
 </body></html>`;
-  const text = `Welcome to StockPilot!\n\nVerify your email: ${link}\n\nLink expires in 24 hours.`;
-  await sendEmail({ to: email, subject: 'Verify your StockPilot email', html, text });
-  return token;
 }
 
-// Resend verification email (authed)
+async function issueVerificationEmail(userId, email) {
+  // Invalidate previous pending codes for this user
+  await pool.query(
+    `UPDATE email_verification_tokens SET used_at=NOW() WHERE user_id=$1 AND used_at IS NULL`,
+    [userId]
+  );
+  const code = gen6Digit();
+  const token = crypto.randomBytes(16).toString('hex'); // satisfies PK uniqueness
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 min
+  await pool.query(
+    `INSERT INTO email_verification_tokens (token, code, user_id, expires_at) VALUES ($1,$2,$3,$4)`,
+    [token, code, userId, expiresAt]
+  );
+  await sendEmail({
+    to: email,
+    subject: `${code} is your StockPilot verification code`,
+    html: codeEmailHtml({
+      heading: 'Verify your email',
+      intro: 'Welcome to StockPilot! Enter this code in the app to confirm your email address.',
+      code,
+      ttlMinutes: 15,
+    }),
+    text: `Your StockPilot verification code: ${code}\n\nExpires in 15 minutes.`,
+  });
+  return code;
+}
+
+// Resend verification code (authed)
 app.post('/api/auth/send-verification', auth, async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT id, email, email_verified FROM users WHERE id=$1', [req.user.id]);
@@ -756,64 +775,79 @@ app.post('/api/auth/send-verification', auth, async (req, res) => {
   }
 });
 
-// Verify email (public, token from email link)
-app.post('/api/auth/verify-email', authLimiter, validate(verifySchema), async (req, res) => {
+// Verify code (authed — uses the current user's pending code)
+app.post('/api/auth/verify-code', auth, validate(verifyCodeSchema), async (req, res) => {
   const client = await pool.connect();
   try {
-    const { token } = req.body;
+    const code = req.body.code;
+    const { rows: userRows } = await client.query('SELECT email_verified FROM users WHERE id=$1', [req.user.id]);
+    if (!userRows.length) return res.status(404).json({ error: 'User not found' });
+    if (userRows[0].email_verified) return res.json({ ok: true, alreadyVerified: true });
+
     const { rows } = await client.query(
-      `SELECT * FROM email_verification_tokens WHERE token=$1`,
-      [token]
+      `SELECT * FROM email_verification_tokens
+       WHERE user_id=$1 AND used_at IS NULL
+       ORDER BY created_at DESC LIMIT 1`,
+      [req.user.id]
     );
-    if (!rows.length) return res.status(400).json({ error: 'Invalid verification link' });
+    if (!rows.length) return res.status(400).json({ error: 'No active code. Tap Resend.' });
     const t = rows[0];
-    if (t.used_at) return res.status(400).json({ error: 'This link has already been used' });
-    if (new Date(t.expires_at) < new Date()) return res.status(400).json({ error: 'This verification link has expired. Sign in and request a new one.' });
+    if (new Date(t.expires_at) < new Date()) {
+      return res.status(400).json({ error: 'Code expired. Tap Resend for a new one.' });
+    }
+    if ((t.attempts || 0) >= 5) {
+      return res.status(429).json({ error: 'Too many wrong attempts. Tap Resend for a new code.' });
+    }
+    if (t.code !== code) {
+      await client.query(`UPDATE email_verification_tokens SET attempts=attempts+1 WHERE token=$1`, [t.token]);
+      return res.status(400).json({ error: 'Wrong code. Try again.' });
+    }
     await client.query('BEGIN');
-    await client.query(`UPDATE users SET email_verified=TRUE WHERE id=$1`, [t.user_id]);
-    await client.query(`UPDATE email_verification_tokens SET used_at=NOW() WHERE token=$1`, [token]);
+    await client.query(`UPDATE users SET email_verified=TRUE WHERE id=$1`, [req.user.id]);
+    await client.query(`UPDATE email_verification_tokens SET used_at=NOW() WHERE token=$1`, [t.token]);
     await client.query('COMMIT');
-    logger.info('verify.success', { userId: t.user_id });
+    logger.info('verify.success', { userId: req.user.id });
     res.json({ ok: true });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
-    logger.error('verify.error', { err: err.message });
+    logger.error('verify.code.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
   } finally {
     client.release();
   }
 });
 
-// Forgot password (public — does not leak whether email exists)
+// Forgot password — emails a 6-digit reset code. Always returns 200.
 app.post('/api/auth/forgot-password', authLimiter, validate(forgotSchema), async (req, res) => {
   try {
     const { email } = req.body;
     const { rows } = await pool.query('SELECT id, email FROM users WHERE email=$1', [email]);
     if (rows.length) {
       const user = rows[0];
-      const token = crypto.randomBytes(32).toString('hex');
-      const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1h
+      // Invalidate previous codes
       await pool.query(
-        `INSERT INTO password_reset_tokens (token, user_id, expires_at) VALUES ($1,$2,$3)`,
-        [token, user.id, expiresAt]
+        `UPDATE password_reset_tokens SET used_at=NOW() WHERE user_id=$1 AND used_at IS NULL`,
+        [user.id]
       );
-      const link = `${APP_URL}/?action=reset&token=${token}`;
-      const safeLink = escapeHtml(link);
-      const html = `<!doctype html>
-<html><body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background:#f5f7fa; padding:24px;">
-<div style="max-width:520px; margin:0 auto; background:white; border-radius:12px; padding:32px; box-shadow:0 1px 3px rgba(0,0,0,0.06);">
-  <h1 style="color:#1e3a5f; font-size:24px; margin:0 0 16px;">Reset your password</h1>
-  <p style="font-size:16px; color:#1a1a1a; line-height:1.5;">Someone requested a password reset for your StockPilot account. If that was you, click the button below to choose a new password.</p>
-  <p style="margin:24px 0;">
-    <a href="${safeLink}" style="display:inline-block; background:#1e3a5f; color:white; text-decoration:none; padding:14px 28px; border-radius:10px; font-weight:600; font-size:16px;">Reset password</a>
-  </p>
-  <p style="font-size:13px; color:#666; line-height:1.5;">Or paste this link into your browser:<br><a href="${safeLink}" style="color:#1e3a5f; word-break:break-all;">${safeLink}</a></p>
-  <p style="font-size:13px; color:#666; margin-top:24px;">This link expires in 1 hour. If you didn't request a reset, you can safely ignore this email — your password won't change.</p>
-</div>
-</body></html>`;
-      const text = `Reset your StockPilot password: ${link}\n\nLink expires in 1 hour. Ignore if you didn't request this.`;
+      const code = gen6Digit();
+      const token = crypto.randomBytes(16).toString('hex');
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 min
+      await pool.query(
+        `INSERT INTO password_reset_tokens (token, code, user_id, expires_at) VALUES ($1,$2,$3,$4)`,
+        [token, code, user.id, expiresAt]
+      );
       try {
-        await sendEmail({ to: user.email, subject: 'Reset your StockPilot password', html, text });
+        await sendEmail({
+          to: user.email,
+          subject: `${code} is your StockPilot reset code`,
+          html: codeEmailHtml({
+            heading: 'Reset your password',
+            intro: 'Enter this code in the app to set a new password.',
+            code,
+            ttlMinutes: 15,
+          }),
+          text: `Your StockPilot password reset code: ${code}\n\nExpires in 15 minutes. If you didn't request this, ignore this email.`,
+        });
       } catch (err) {
         logger.error('forgot.send.error', { err: err.message, userId: user.id });
       }
@@ -821,36 +855,52 @@ app.post('/api/auth/forgot-password', authLimiter, validate(forgotSchema), async
     } else {
       logger.info('forgot.unknown-email', { email });
     }
-    // Always return success to prevent email enumeration
     res.json({ ok: true });
   } catch (err) {
     logger.error('forgot.error', { err: err.message });
-    // Still return ok to avoid revealing internal errors
     res.json({ ok: true });
   }
 });
 
-// Reset password (public, token from email link)
-app.post('/api/auth/reset-password', authLimiter, validate(resetSchema), async (req, res) => {
+// Reset password using the 6-digit code that was emailed
+app.post('/api/auth/reset-password', authLimiter, validate(resetWithCodeSchema), async (req, res) => {
   const client = await pool.connect();
   try {
-    const { token, password } = req.body;
+    const { email, code, password } = req.body;
+    const userR = await client.query('SELECT id FROM users WHERE email=$1', [email]);
+    if (!userR.rows.length) return res.status(400).json({ error: 'Wrong code or email' });
+    const userId = userR.rows[0].id;
     const { rows } = await client.query(
-      `SELECT * FROM password_reset_tokens WHERE token=$1`,
-      [token]
+      `SELECT * FROM password_reset_tokens
+       WHERE user_id=$1 AND used_at IS NULL
+       ORDER BY created_at DESC LIMIT 1`,
+      [userId]
     );
-    if (!rows.length) return res.status(400).json({ error: 'Invalid reset link' });
+    if (!rows.length) return res.status(400).json({ error: 'No active reset code. Request a new one.' });
     const t = rows[0];
-    if (t.used_at) return res.status(400).json({ error: 'This reset link has already been used' });
-    if (new Date(t.expires_at) < new Date()) return res.status(400).json({ error: 'This reset link has expired. Request a new one from the sign-in page.' });
+    if (new Date(t.expires_at) < new Date()) {
+      return res.status(400).json({ error: 'Code expired. Request a new one.' });
+    }
+    if ((t.attempts || 0) >= 5) {
+      return res.status(429).json({ error: 'Too many wrong attempts. Request a new code.' });
+    }
+    if (t.code !== code) {
+      await client.query(`UPDATE password_reset_tokens SET attempts=attempts+1 WHERE token=$1`, [t.token]);
+      return res.status(400).json({ error: 'Wrong code or email' });
+    }
     const hash = await bcrypt.hash(password, 10);
     await client.query('BEGIN');
-    await client.query(`UPDATE users SET password_hash=$1, failed_login_attempts=0, locked_until=NULL WHERE id=$2`, [hash, t.user_id]);
-    await client.query(`UPDATE password_reset_tokens SET used_at=NOW() WHERE token=$1`, [token]);
-    // Invalidate other unused reset tokens for this user
-    await client.query(`UPDATE password_reset_tokens SET used_at=NOW() WHERE user_id=$1 AND used_at IS NULL`, [t.user_id]);
+    await client.query(
+      `UPDATE users SET password_hash=$1, failed_login_attempts=0, locked_until=NULL WHERE id=$2`,
+      [hash, userId]
+    );
+    await client.query(`UPDATE password_reset_tokens SET used_at=NOW() WHERE token=$1`, [t.token]);
+    await client.query(
+      `UPDATE password_reset_tokens SET used_at=NOW() WHERE user_id=$1 AND used_at IS NULL`,
+      [userId]
+    );
     await client.query('COMMIT');
-    logger.info('reset.success', { userId: t.user_id });
+    logger.info('reset.success', { userId });
     res.json({ ok: true });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
