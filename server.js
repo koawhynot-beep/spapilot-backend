@@ -9,6 +9,7 @@ const helmet = require('helmet');
 const winston = require('winston');
 const compression = require('compression');
 const { z } = require('zod');
+const { Resend } = require('resend');
 
 const logger = winston.createLogger({
   level: process.env.LOG_LEVEL || 'info',
@@ -37,6 +38,27 @@ if (!process.env.ALLOWED_ORIGINS && process.env.NODE_ENV === 'production') {
 
 const JWT_SECRET = process.env.JWT_SECRET || 'stockpilot-dev-secret-change-me';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://spapilot-app.onrender.com';
+const APP_URL = process.env.APP_URL || FRONTEND_URL;
+const EMAIL_FROM = process.env.EMAIL_FROM || 'StockPilot <onboarding@resend.dev>';
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+if (!resend) {
+  logger.warn('email.disabled', { reason: 'RESEND_API_KEY not set; emails will be logged only' });
+}
+
+async function sendEmail({ to, subject, html, text }) {
+  if (!resend) {
+    logger.info('email.skipped', { to, subject, text: text?.slice(0, 200) });
+    return { skipped: true };
+  }
+  try {
+    const result = await resend.emails.send({ from: EMAIL_FROM, to, subject, html, text });
+    logger.info('email.sent', { to, subject, id: result?.data?.id });
+    return result;
+  } catch (err) {
+    logger.error('email.send.error', { err: err.message, to, subject });
+    throw err;
+  }
+}
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim())
   : ['http://localhost:3001', 'https://spapilot-app.onrender.com'];
@@ -145,6 +167,7 @@ const formatUser = (u) => ({
   role: u.role,
   businessId: u.business_id,
   permissions: u.permissions || {},
+  emailVerified: !!u.email_verified,
   trialEndsAt: u.trial_ends_at,
   subscriptionStatus: u.subscription_status || 'trial',
   createdAt: u.created_at,
@@ -411,7 +434,35 @@ async function initDB() {
       position     INTEGER NOT NULL DEFAULT 0,
       created_at   TIMESTAMPTZ DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS email_verification_tokens (
+      token        TEXT PRIMARY KEY,
+      user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      expires_at   TIMESTAMPTZ NOT NULL,
+      used_at      TIMESTAMPTZ,
+      created_at   TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      token        TEXT PRIMARY KEY,
+      user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      expires_at   TIMESTAMPTZ NOT NULL,
+      used_at      TIMESTAMPTZ,
+      created_at   TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
+
+  // Detect first-time addition of email_verified so we can grandfather existing users in
+  const { rows: emailColCheck } = await pool.query(`
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema='public' AND table_name='users' AND column_name='email_verified'
+  `);
+  const isFirstEmailVerifiedMigration = !emailColCheck.length;
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE`);
+  if (isFirstEmailVerifiedMigration) {
+    const { rowCount } = await pool.query(`UPDATE users SET email_verified=TRUE`);
+    logger.info('migration.email_verified.grandfathered', { rows: rowCount });
+  }
 
   // Add foreign key from users.business_id → businesses after both tables exist
   await pool.query(`
@@ -451,15 +502,23 @@ async function initDB() {
     `CREATE INDEX IF NOT EXISTS idx_groups_shop_id ON item_groups(shop_id)`,
     `CREATE INDEX IF NOT EXISTS idx_stock_group_id ON stock_items(group_id)`,
     `CREATE INDEX IF NOT EXISTS idx_stock_position ON stock_items(shop_id, position)`,
+    `CREATE INDEX IF NOT EXISTS idx_verify_user ON email_verification_tokens(user_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_verify_expires ON email_verification_tokens(expires_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_reset_user ON password_reset_tokens(user_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_reset_expires ON password_reset_tokens(expires_at)`,
   ];
   for (const q of indexes) {
     try { await pool.query(q); } catch (e) { logger.warn('index.skipped', { err: e.message }); }
   }
 
-  // Cleanup expired blacklist tokens hourly
+  // Cleanup expired blacklist + verification + reset tokens hourly
   setInterval(() => {
     pool.query('DELETE FROM token_blacklist WHERE expires_at < NOW()')
       .catch(err => logger.error('blacklist.cleanup.error', { err: err.message }));
+    pool.query('DELETE FROM email_verification_tokens WHERE expires_at < NOW()')
+      .catch(err => logger.error('verify.cleanup.error', { err: err.message }));
+    pool.query('DELETE FROM password_reset_tokens WHERE expires_at < NOW()')
+      .catch(err => logger.error('reset.cleanup.error', { err: err.message }));
   }, 60 * 60 * 1000);
 
   logger.info('db.ready');
@@ -498,6 +557,10 @@ app.post('/api/auth/signup', authLimiter, validate(signupSchema), async (req, re
     )).rows[0];
     await client.query('COMMIT');
     logger.info('user.signup.owner', { userId: finalUser.id, email });
+    // Fire-and-forget verification email (does not block response)
+    issueVerificationEmail(finalUser.id, finalUser.email).catch(err =>
+      logger.error('signup.verify-email.error', { err: err.message, userId: finalUser.id })
+    );
     res.status(201).json({
       token: makeToken(finalUser),
       user: formatUser(finalUser),
@@ -553,6 +616,9 @@ app.post('/api/auth/signup-with-code', authLimiter, validate(signupWithCodeSchem
     const bizResult = await client.query('SELECT * FROM businesses WHERE id=$1', [invite.business_id]);
     await client.query('COMMIT');
     logger.info('user.signup.staff', { userId: user.id, businessId: invite.business_id, email });
+    issueVerificationEmail(user.id, user.email).catch(err =>
+      logger.error('signup-code.verify-email.error', { err: err.message, userId: user.id })
+    );
     res.status(201).json({
       token: makeToken(user),
       user: formatUser(user),
@@ -631,6 +697,167 @@ app.get('/api/auth/me', auth, async (req, res) => {
   } catch (err) {
     logger.error('me.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── Auth: Email verification ──────────────────────────────
+const forgotSchema = z.object({
+  email: emailSchema,
+});
+const resetSchema = z.object({
+  token: z.string().min(20).max(200),
+  password: passwordSchema,
+});
+const verifySchema = z.object({
+  token: z.string().min(20).max(200),
+});
+
+const escapeHtml = (s) => String(s).replace(/[&<>"']/g, c => ({
+  '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+}[c]));
+
+async function issueVerificationEmail(userId, email) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
+  await pool.query(
+    `INSERT INTO email_verification_tokens (token, user_id, expires_at) VALUES ($1,$2,$3)`,
+    [token, userId, expiresAt]
+  );
+  const link = `${APP_URL}/?action=verify&token=${token}`;
+  const safeLink = escapeHtml(link);
+  const html = `<!doctype html>
+<html><body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background:#f5f7fa; padding:24px;">
+<div style="max-width:520px; margin:0 auto; background:white; border-radius:12px; padding:32px; box-shadow:0 1px 3px rgba(0,0,0,0.06);">
+  <h1 style="color:#1e3a5f; font-size:24px; margin:0 0 16px;">Verify your email</h1>
+  <p style="font-size:16px; color:#1a1a1a; line-height:1.5;">Welcome to StockPilot! Click the button below to confirm your email address.</p>
+  <p style="margin:24px 0;">
+    <a href="${safeLink}" style="display:inline-block; background:#1e3a5f; color:white; text-decoration:none; padding:14px 28px; border-radius:10px; font-weight:600; font-size:16px;">Verify email</a>
+  </p>
+  <p style="font-size:13px; color:#666; line-height:1.5;">Or paste this link into your browser:<br><a href="${safeLink}" style="color:#1e3a5f; word-break:break-all;">${safeLink}</a></p>
+  <p style="font-size:13px; color:#666; margin-top:24px;">This link expires in 24 hours. If you didn't sign up for StockPilot, you can ignore this email.</p>
+</div>
+</body></html>`;
+  const text = `Welcome to StockPilot!\n\nVerify your email: ${link}\n\nLink expires in 24 hours.`;
+  await sendEmail({ to: email, subject: 'Verify your StockPilot email', html, text });
+  return token;
+}
+
+// Resend verification email (authed)
+app.post('/api/auth/send-verification', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT id, email, email_verified FROM users WHERE id=$1', [req.user.id]);
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    if (rows[0].email_verified) return res.json({ ok: true, alreadyVerified: true });
+    await issueVerificationEmail(rows[0].id, rows[0].email);
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error('verify.send.error', { err: err.message });
+    res.status(500).json({ error: 'Could not send verification email' });
+  }
+});
+
+// Verify email (public, token from email link)
+app.post('/api/auth/verify-email', authLimiter, validate(verifySchema), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { token } = req.body;
+    const { rows } = await client.query(
+      `SELECT * FROM email_verification_tokens WHERE token=$1`,
+      [token]
+    );
+    if (!rows.length) return res.status(400).json({ error: 'Invalid verification link' });
+    const t = rows[0];
+    if (t.used_at) return res.status(400).json({ error: 'This link has already been used' });
+    if (new Date(t.expires_at) < new Date()) return res.status(400).json({ error: 'This verification link has expired. Sign in and request a new one.' });
+    await client.query('BEGIN');
+    await client.query(`UPDATE users SET email_verified=TRUE WHERE id=$1`, [t.user_id]);
+    await client.query(`UPDATE email_verification_tokens SET used_at=NOW() WHERE token=$1`, [token]);
+    await client.query('COMMIT');
+    logger.info('verify.success', { userId: t.user_id });
+    res.json({ ok: true });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    logger.error('verify.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Forgot password (public — does not leak whether email exists)
+app.post('/api/auth/forgot-password', authLimiter, validate(forgotSchema), async (req, res) => {
+  try {
+    const { email } = req.body;
+    const { rows } = await pool.query('SELECT id, email FROM users WHERE email=$1', [email]);
+    if (rows.length) {
+      const user = rows[0];
+      const token = crypto.randomBytes(32).toString('hex');
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1h
+      await pool.query(
+        `INSERT INTO password_reset_tokens (token, user_id, expires_at) VALUES ($1,$2,$3)`,
+        [token, user.id, expiresAt]
+      );
+      const link = `${APP_URL}/?action=reset&token=${token}`;
+      const safeLink = escapeHtml(link);
+      const html = `<!doctype html>
+<html><body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background:#f5f7fa; padding:24px;">
+<div style="max-width:520px; margin:0 auto; background:white; border-radius:12px; padding:32px; box-shadow:0 1px 3px rgba(0,0,0,0.06);">
+  <h1 style="color:#1e3a5f; font-size:24px; margin:0 0 16px;">Reset your password</h1>
+  <p style="font-size:16px; color:#1a1a1a; line-height:1.5;">Someone requested a password reset for your StockPilot account. If that was you, click the button below to choose a new password.</p>
+  <p style="margin:24px 0;">
+    <a href="${safeLink}" style="display:inline-block; background:#1e3a5f; color:white; text-decoration:none; padding:14px 28px; border-radius:10px; font-weight:600; font-size:16px;">Reset password</a>
+  </p>
+  <p style="font-size:13px; color:#666; line-height:1.5;">Or paste this link into your browser:<br><a href="${safeLink}" style="color:#1e3a5f; word-break:break-all;">${safeLink}</a></p>
+  <p style="font-size:13px; color:#666; margin-top:24px;">This link expires in 1 hour. If you didn't request a reset, you can safely ignore this email — your password won't change.</p>
+</div>
+</body></html>`;
+      const text = `Reset your StockPilot password: ${link}\n\nLink expires in 1 hour. Ignore if you didn't request this.`;
+      try {
+        await sendEmail({ to: user.email, subject: 'Reset your StockPilot password', html, text });
+      } catch (err) {
+        logger.error('forgot.send.error', { err: err.message, userId: user.id });
+      }
+      logger.info('forgot.issued', { userId: user.id });
+    } else {
+      logger.info('forgot.unknown-email', { email });
+    }
+    // Always return success to prevent email enumeration
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error('forgot.error', { err: err.message });
+    // Still return ok to avoid revealing internal errors
+    res.json({ ok: true });
+  }
+});
+
+// Reset password (public, token from email link)
+app.post('/api/auth/reset-password', authLimiter, validate(resetSchema), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { token, password } = req.body;
+    const { rows } = await client.query(
+      `SELECT * FROM password_reset_tokens WHERE token=$1`,
+      [token]
+    );
+    if (!rows.length) return res.status(400).json({ error: 'Invalid reset link' });
+    const t = rows[0];
+    if (t.used_at) return res.status(400).json({ error: 'This reset link has already been used' });
+    if (new Date(t.expires_at) < new Date()) return res.status(400).json({ error: 'This reset link has expired. Request a new one from the sign-in page.' });
+    const hash = await bcrypt.hash(password, 10);
+    await client.query('BEGIN');
+    await client.query(`UPDATE users SET password_hash=$1, failed_login_attempts=0, locked_until=NULL WHERE id=$2`, [hash, t.user_id]);
+    await client.query(`UPDATE password_reset_tokens SET used_at=NOW() WHERE token=$1`, [token]);
+    // Invalidate other unused reset tokens for this user
+    await client.query(`UPDATE password_reset_tokens SET used_at=NOW() WHERE user_id=$1 AND used_at IS NULL`, [t.user_id]);
+    await client.query('COMMIT');
+    logger.info('reset.success', { userId: t.user_id });
+    res.json({ ok: true });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    logger.error('reset.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
   }
 });
 
