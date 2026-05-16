@@ -286,7 +286,7 @@ const validate = (schema) => (req, res, next) => {
 const TRIAL_EXPIRED_ALLOWED_PREFIXES = [
   '/api/auth/',
   '/api/billing/',
-  '/api/businesses/me',
+  '/api/businesses', // POST/me/join — onboarding must always work
 ];
 
 // Re-read role from DB (not JWT) so staff cannot self-promote via /api/auth/role mass-assignment.
