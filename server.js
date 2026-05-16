@@ -289,6 +289,21 @@ const TRIAL_EXPIRED_ALLOWED_PREFIXES = [
   '/api/businesses/me',
 ];
 
+// Re-read role from DB (not JWT) so staff cannot self-promote via /api/auth/role mass-assignment.
+// Apply this middleware AFTER `auth` on routes that must be manager-only.
+const requireManager = async (req, res, next) => {
+  try {
+    const { rows } = await pool.query('SELECT role FROM users WHERE id=$1', [req.user?.id]);
+    if (!rows.length || rows[0].role !== 'manager') {
+      return res.status(403).json({ error: 'Manager role required' });
+    }
+    next();
+  } catch (err) {
+    logger.error('requireManager.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
 const auth = async (req, res, next) => {
   const header = req.headers.authorization;
   if (!header) return res.status(401).json({ error: 'No token' });
@@ -1007,7 +1022,7 @@ app.get('/api/staff', auth, async (req, res) => {
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.post('/api/staff', auth, async (req, res) => {
+app.post('/api/staff', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { name, role, avatar, color, birthday, phone, schedule, commissionRate, permissions } = req.body;
@@ -1020,7 +1035,7 @@ app.post('/api/staff', auth, async (req, res) => {
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.put('/api/staff/:id', auth, async (req, res) => {
+app.put('/api/staff/:id', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { name, role, avatar, color, birthday, phone, schedule, commissionRate, permissions } = req.body;
@@ -1033,7 +1048,7 @@ app.put('/api/staff/:id', auth, async (req, res) => {
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.delete('/api/staff/:id', auth, async (req, res) => {
+app.delete('/api/staff/:id', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { rows } = await pool.query('DELETE FROM staff WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
@@ -1202,7 +1217,7 @@ app.post('/api/requests', auth, async (req, res) => {
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.put('/api/requests/:id', auth, async (req, res) => {
+app.put('/api/requests/:id', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { status, reassignToStaffId } = req.body;
@@ -1286,7 +1301,7 @@ app.get('/api/announcements', auth, async (req, res) => {
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.post('/api/announcements', auth, async (req, res) => {
+app.post('/api/announcements', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { title, body, from } = req.body;
@@ -1299,7 +1314,7 @@ app.post('/api/announcements', auth, async (req, res) => {
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.delete('/api/announcements/:id', auth, async (req, res) => {
+app.delete('/api/announcements/:id', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { rows } = await pool.query('DELETE FROM announcements WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
@@ -1319,7 +1334,7 @@ app.get('/api/sop', auth, async (req, res) => {
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.post('/api/sop', auth, async (req, res) => {
+app.post('/api/sop', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { title, body, category } = req.body;
@@ -1332,7 +1347,7 @@ app.post('/api/sop', auth, async (req, res) => {
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.delete('/api/sop/:id', auth, async (req, res) => {
+app.delete('/api/sop/:id', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { rows } = await pool.query('DELETE FROM sop WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
@@ -1352,7 +1367,7 @@ app.get('/api/violations', auth, async (req, res) => {
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.post('/api/violations', auth, async (req, res) => {
+app.post('/api/violations', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { staffId, sopId, note } = req.body;
@@ -1365,7 +1380,7 @@ app.post('/api/violations', auth, async (req, res) => {
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.delete('/api/violations/:id', auth, async (req, res) => {
+app.delete('/api/violations/:id', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { rows } = await pool.query('DELETE FROM violations WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
@@ -1385,7 +1400,7 @@ app.get('/api/services', auth, async (req, res) => {
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.post('/api/services', auth, async (req, res) => {
+app.post('/api/services', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { name, category, durationMin, price, color } = req.body;
@@ -1399,7 +1414,7 @@ app.post('/api/services', auth, async (req, res) => {
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.put('/api/services/:id', auth, async (req, res) => {
+app.put('/api/services/:id', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { name, category, durationMin, price, color } = req.body;
@@ -1414,7 +1429,7 @@ app.put('/api/services/:id', auth, async (req, res) => {
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.delete('/api/services/:id', auth, async (req, res) => {
+app.delete('/api/services/:id', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { rows } = await pool.query('DELETE FROM services WHERE id=$1 AND business_id=$2 RETURNING *', [req.params.id, bid]);
