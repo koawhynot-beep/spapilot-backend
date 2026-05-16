@@ -174,6 +174,7 @@ const formatInventory = (i) => ({
   unit: i.unit,
   supplier: i.supplier,
   lastOrder: i.last_order,
+  cost: i.cost == null ? 0 : Number(i.cost),
 });
 
 const formatRequest = (r) => ({
@@ -520,6 +521,8 @@ async function initDB() {
     `ALTER TABLE sop           ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
     `ALTER TABLE violations    ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
     `ALTER TABLE services      ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
+    // Cost per unit for inventory items (used in inventory valuation reports)
+    `ALTER TABLE inventory     ADD COLUMN IF NOT EXISTS cost NUMERIC DEFAULT 0`,
   ];
   for (const q of alters) {
     try { await pool.query(q); } catch (e) { logger.warn('alter.skipped', { err: e.message }); }
@@ -721,7 +724,7 @@ app.get('/api/auth/export-data', auth, async (req, res) => {
     ]);
 
     logger.info('data.export', { userId });
-    res.setHeader('Content-Disposition', `attachment; filename="viroxit-data-${userId}-${Date.now()}.json"`);
+    res.setHeader('Content-Disposition', `attachment; filename="spapilot-data-${userId}-${Date.now()}.json"`);
     res.json({
       exportedAt: new Date().toISOString(),
       user: user.rows[0] || null,
@@ -1045,7 +1048,8 @@ app.get('/api/bookings', auth, async (req, res) => {
     const bid = req.user.businessId;
     if (!bid) return res.json([]);
     const { sql } = paginationClause(req);
-    const { rows } = await pool.query('SELECT * FROM bookings WHERE business_id = $1 ORDER BY date DESC, time' + sql, [bid]);
+    // Order by date desc, then by time ascending (HH:MM strings sort lexicographically; padded times work).
+    const { rows } = await pool.query("SELECT * FROM bookings WHERE business_id = $1 ORDER BY date DESC NULLS LAST, time ASC NULLS LAST" + sql, [bid]);
     res.json(rows.map(formatBooking));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -1053,11 +1057,12 @@ app.get('/api/bookings', auth, async (req, res) => {
 app.post('/api/bookings', auth, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
-    const { time, client, treatment, duration, staffId, notes, status, price, allergies, clientPhone } = req.body;
+    const { date, time, client, treatment, duration, staffId, notes, status, price, allergies, clientPhone } = req.body;
     if (!time || !client || !treatment || !duration) return res.status(400).json({ error: 'time, client, treatment, duration required' });
+    const bookingDate = date || new Date().toISOString().slice(0, 10);
     const { rows } = await pool.query(
-      'INSERT INTO bookings (business_id, time, client, treatment, duration, staff_id, notes, status, price, allergies, client_phone) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
-      [bid, time, client, treatment, duration, staffId || null, notes || '', status || 'confirmed', price || 0, allergies || '', clientPhone || '']
+      'INSERT INTO bookings (business_id, date, time, client, treatment, duration, staff_id, notes, status, price, allergies, client_phone) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *',
+      [bid, bookingDate, time, client, treatment, duration, staffId || null, notes || '', status || 'confirmed', price || 0, allergies || '', clientPhone || '']
     );
     res.status(201).json(formatBooking(rows[0]));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
@@ -1066,10 +1071,11 @@ app.post('/api/bookings', auth, async (req, res) => {
 app.put('/api/bookings/:id', auth, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
-    const { time, client, treatment, duration, staffId, notes, status, price, allergies, clientPhone } = req.body;
+    const { date, time, client, treatment, duration, staffId, notes, status, price, allergies, clientPhone } = req.body;
+    const bookingDate = date || new Date().toISOString().slice(0, 10);
     const { rows } = await pool.query(
-      'UPDATE bookings SET time=$1, client=$2, treatment=$3, duration=$4, staff_id=$5, notes=$6, status=$7, price=$8, allergies=$9, client_phone=$10 WHERE id=$11 AND business_id=$12 RETURNING *',
-      [time, client, treatment, duration, staffId || null, notes || '', status || 'confirmed', price || 0, allergies || '', clientPhone || '', req.params.id, bid]
+      'UPDATE bookings SET date=$1, time=$2, client=$3, treatment=$4, duration=$5, staff_id=$6, notes=$7, status=$8, price=$9, allergies=$10, client_phone=$11 WHERE id=$12 AND business_id=$13 RETURNING *',
+      [bookingDate, time, client, treatment, duration, staffId || null, notes || '', status || 'confirmed', price || 0, allergies || '', clientPhone || '', req.params.id, bid]
     );
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatBooking(rows[0]));
@@ -1099,11 +1105,11 @@ app.get('/api/inventory', auth, async (req, res) => {
 app.post('/api/inventory', auth, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
-    const { name, category, stock, threshold, unit, supplier, lastOrder } = req.body;
+    const { name, category, stock, threshold, unit, supplier, lastOrder, cost } = req.body;
     if (!name) return res.status(400).json({ error: 'name required' });
     const { rows } = await pool.query(
-      'INSERT INTO inventory (business_id, name, category, stock, threshold, unit, supplier, last_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
-      [bid, name, category || '', stock || 0, threshold || 5, unit || 'pcs', supplier || '', lastOrder || '']
+      'INSERT INTO inventory (business_id, name, category, stock, threshold, unit, supplier, last_order, cost) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
+      [bid, name, category || '', stock || 0, threshold || 5, unit || 'pcs', supplier || '', lastOrder || '', cost || 0]
     );
     res.status(201).json(formatInventory(rows[0]));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
@@ -1112,10 +1118,10 @@ app.post('/api/inventory', auth, async (req, res) => {
 app.put('/api/inventory/:id', auth, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
-    const { name, category, stock, threshold, unit, supplier, lastOrder } = req.body;
+    const { name, category, stock, threshold, unit, supplier, lastOrder, cost } = req.body;
     const { rows } = await pool.query(
-      'UPDATE inventory SET name=$1, category=$2, stock=$3, threshold=$4, unit=$5, supplier=$6, last_order=$7 WHERE id=$8 AND business_id=$9 RETURNING *',
-      [name, category, stock, threshold, unit, supplier, lastOrder || '', req.params.id, bid]
+      'UPDATE inventory SET name=$1, category=$2, stock=$3, threshold=$4, unit=$5, supplier=$6, last_order=$7, cost=$8 WHERE id=$9 AND business_id=$10 RETURNING *',
+      [name, category, stock, threshold, unit, supplier, lastOrder || '', cost || 0, req.params.id, bid]
     );
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatInventory(rows[0]));
