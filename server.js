@@ -538,8 +538,10 @@ async function initDB() {
     `ALTER TABLE services      ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
     // Cost per unit for inventory items (used in inventory valuation reports)
     `ALTER TABLE inventory     ADD COLUMN IF NOT EXISTS cost NUMERIC DEFAULT 0`,
-    // Businesses table — columns added post-launch via CREATE TABLE IF NOT EXISTS
-    // get skipped when the table already exists, so add columns explicitly.
+    // Businesses table — CREATE TABLE IF NOT EXISTS skipped on existing prod DBs,
+    // so add EVERY column explicitly. Catches schema drift across all production envs.
+    `ALTER TABLE businesses    ADD COLUMN IF NOT EXISTS name TEXT`,
+    `ALTER TABLE businesses    ADD COLUMN IF NOT EXISTS type TEXT`,
     `ALTER TABLE businesses    ADD COLUMN IF NOT EXISTS code TEXT`,
     `ALTER TABLE businesses    ADD COLUMN IF NOT EXISTS staff_count INTEGER DEFAULT 0`,
     `ALTER TABLE businesses    ADD COLUMN IF NOT EXISTS owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE`,
