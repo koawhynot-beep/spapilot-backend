@@ -54,6 +54,26 @@ const passwordResetLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: 'Too many password reset requests. Try again in 1 hour.' },
 });
+// Generic mutating-route limiter — caps write traffic to 300 req per IP per 15 min.
+// Wide enough not to bite legit power users (a busy salon may save 200 bookings/day,
+// but that's spread across the day, not a 15-min burst), narrow enough to slow scrapers.
+const writeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please slow down.' },
+});
+const writeMethods = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+app.use((req, res, next) => {
+  // Skip auth + password-reset paths — they already have stricter limiters.
+  if (req.path.startsWith('/api/auth/login') || req.path.startsWith('/api/auth/signup') ||
+      req.path.startsWith('/api/auth/forgot-password') || req.path.startsWith('/api/auth/reset-password')) {
+    return next();
+  }
+  if (writeMethods.has(req.method)) return writeLimiter(req, res, next);
+  return next();
+});
 
 if (!process.env.JWT_SECRET) {
   if (process.env.NODE_ENV === 'production') {
@@ -1199,7 +1219,13 @@ app.put('/api/inventory/:id', auth, async (req, res) => {
 app.patch('/api/inventory/:id/stock', auth, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
-    const { delta } = req.body;
+    const deltaRaw = Number(req.body?.delta);
+    if (!Number.isFinite(deltaRaw)) {
+      return res.status(400).json({ error: 'delta must be a number' });
+    }
+    // Bound the delta to a sane range so a fat-finger or malicious caller can't bump
+    // stock by 9 quadrillion units in one request. Real adjustments are tiny (±1..±100).
+    const delta = Math.max(-10000, Math.min(10000, Math.trunc(deltaRaw)));
     const { rows } = await pool.query(
       'UPDATE inventory SET stock = GREATEST(0, stock + $1) WHERE id=$2 AND business_id=$3 RETURNING *',
       [delta, req.params.id, bid]
