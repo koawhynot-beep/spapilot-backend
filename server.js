@@ -538,10 +538,22 @@ async function initDB() {
     `ALTER TABLE services      ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
     // Cost per unit for inventory items (used in inventory valuation reports)
     `ALTER TABLE inventory     ADD COLUMN IF NOT EXISTS cost NUMERIC DEFAULT 0`,
+    // Businesses table — columns added post-launch via CREATE TABLE IF NOT EXISTS
+    // get skipped when the table already exists, so add columns explicitly.
+    `ALTER TABLE businesses    ADD COLUMN IF NOT EXISTS code TEXT`,
+    `ALTER TABLE businesses    ADD COLUMN IF NOT EXISTS staff_count INTEGER DEFAULT 0`,
+    `ALTER TABLE businesses    ADD COLUMN IF NOT EXISTS owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE`,
+    `ALTER TABLE businesses    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`,
   ];
   for (const q of alters) {
     try { await pool.query(q); } catch (e) { logger.warn('alter.skipped', { err: e.message }); }
   }
+  // Backfill businesses.code with random 6-char codes for any legacy rows missing it,
+  // then add unique index. Runs AFTER ALTER TABLE so column exists.
+  try {
+    await pool.query("UPDATE businesses SET code = UPPER(SUBSTRING(MD5(RANDOM()::TEXT) FROM 1 FOR 6)) WHERE code IS NULL");
+    await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS businesses_code_unique ON businesses(code)");
+  } catch (e) { logger.warn('businesses.code.backfill.skipped', { err: e.message }); }
 
   // ── Indexes for hot query paths ──────────────────────
   // All multi-tenant tables filter by business_id; staff also queried by user.
