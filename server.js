@@ -1095,14 +1095,24 @@ app.get('/api/staff', auth, async (req, res) => {
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
+function clampStaffFields(b) {
+  const name = String(b.name || '').slice(0, 80);
+  const role = String(b.role || '').slice(0, 60);
+  const phone = b.phone != null ? String(b.phone).slice(0, 40) : null;
+  const rateRaw = Number(b.commissionRate);
+  const commissionRate = Number.isFinite(rateRaw) ? Math.max(0, Math.min(100, rateRaw)) : 30;
+  return { name, role, phone, commissionRate };
+}
+
 app.post('/api/staff', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
-    const { name, role, avatar, color, birthday, phone, schedule, commissionRate, permissions } = req.body;
+    const { avatar, color, birthday, schedule, permissions } = req.body;
+    const { name, role, phone, commissionRate } = clampStaffFields(req.body);
     if (!name || !role) return res.status(400).json({ error: 'name and role required' });
     const { rows } = await pool.query(
       'INSERT INTO staff (business_id, name, role, avatar, color, birthday, phone, schedule, commission_rate, permissions) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
-      [bid, name, role, avatar || name[0].toUpperCase(), color || '#a8c5a0', birthday || null, phone || null, schedule || [], commissionRate || 30, JSON.stringify({ ...DEFAULT_PERMISSIONS, ...(permissions || {}) })]
+      [bid, name, role, avatar || name[0].toUpperCase(), color || '#a8c5a0', birthday || null, phone, schedule || [], commissionRate, JSON.stringify({ ...DEFAULT_PERMISSIONS, ...(permissions || {}) })]
     );
     res.status(201).json(formatStaff(rows[0]));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
@@ -1111,10 +1121,11 @@ app.post('/api/staff', auth, requireManager, async (req, res) => {
 app.put('/api/staff/:id', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
-    const { name, role, avatar, color, birthday, phone, schedule, commissionRate, permissions } = req.body;
+    const { avatar, color, birthday, schedule, permissions } = req.body;
+    const { name, role, phone, commissionRate } = clampStaffFields(req.body);
     const { rows } = await pool.query(
       'UPDATE staff SET name=$1, role=$2, avatar=$3, color=$4, birthday=$5, phone=$6, schedule=$7, commission_rate=$8, permissions=$9 WHERE id=$10 AND business_id=$11 RETURNING *',
-      [name, role, avatar, color, birthday || null, phone || null, schedule || [], commissionRate || 30, JSON.stringify({ ...DEFAULT_PERMISSIONS, ...(permissions || {}) }), req.params.id, bid]
+      [name, role, avatar, color, birthday || null, phone, schedule || [], commissionRate, JSON.stringify({ ...DEFAULT_PERMISSIONS, ...(permissions || {}) }), req.params.id, bid]
     );
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatStaff(rows[0]));
@@ -1142,15 +1153,25 @@ app.get('/api/bookings', auth, async (req, res) => {
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// Bounds for booking duration (1 min .. 1440 min = 1 day) and price (0 .. 1,000,000)
+// so a bad request can't create wildly out-of-range rows.
+function clampBookingFields(b) {
+  const dur = Math.max(1, Math.min(1440, Math.trunc(Number(b.duration) || 0)));
+  const priceRaw = Number(b.price);
+  const pri = Number.isFinite(priceRaw) ? Math.max(0, Math.min(1000000, priceRaw)) : 0;
+  return { dur, pri };
+}
+
 app.post('/api/bookings', auth, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { date, time, client, treatment, duration, staffId, notes, status, price, allergies, clientPhone } = req.body;
     if (!time || !client || !treatment || !duration) return res.status(400).json({ error: 'time, client, treatment, duration required' });
+    const { dur, pri } = clampBookingFields({ duration, price });
     const bookingDate = date || new Date().toISOString().slice(0, 10);
     const { rows } = await pool.query(
       'INSERT INTO bookings (business_id, date, time, client, treatment, duration, staff_id, notes, status, price, allergies, client_phone) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *',
-      [bid, bookingDate, time, client, treatment, duration, staffId || null, notes || '', status || 'confirmed', price || 0, allergies || '', clientPhone || '']
+      [bid, bookingDate, time, client, treatment, dur, staffId || null, notes || '', status || 'confirmed', pri, allergies || '', clientPhone || '']
     );
     res.status(201).json(formatBooking(rows[0]));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
@@ -1160,10 +1181,11 @@ app.put('/api/bookings/:id', auth, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { date, time, client, treatment, duration, staffId, notes, status, price, allergies, clientPhone } = req.body;
+    const { dur, pri } = clampBookingFields({ duration, price });
     const bookingDate = date || new Date().toISOString().slice(0, 10);
     const { rows } = await pool.query(
       'UPDATE bookings SET date=$1, time=$2, client=$3, treatment=$4, duration=$5, staff_id=$6, notes=$7, status=$8, price=$9, allergies=$10, client_phone=$11 WHERE id=$12 AND business_id=$13 RETURNING *',
-      [bookingDate, time, client, treatment, duration, staffId || null, notes || '', status || 'confirmed', price || 0, allergies || '', clientPhone || '', req.params.id, bid]
+      [bookingDate, time, client, treatment, dur, staffId || null, notes || '', status || 'confirmed', pri, allergies || '', clientPhone || '', req.params.id, bid]
     );
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatBooking(rows[0]));
@@ -1190,14 +1212,24 @@ app.get('/api/inventory', auth, async (req, res) => {
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// Bound inventory numeric fields so writes can't store absurd values.
+function clampInventoryFields(b) {
+  const stock = Math.max(0, Math.min(1000000, Math.trunc(Number(b.stock) || 0)));
+  const threshold = Math.max(0, Math.min(1000000, Math.trunc(Number(b.threshold) || 5)));
+  const costRaw = Number(b.cost);
+  const cost = Number.isFinite(costRaw) ? Math.max(0, Math.min(1000000, costRaw)) : 0;
+  return { stock, threshold, cost };
+}
+
 app.post('/api/inventory', auth, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
-    const { name, category, stock, threshold, unit, supplier, lastOrder, cost } = req.body;
+    const { name, category, unit, supplier, lastOrder } = req.body;
     if (!name) return res.status(400).json({ error: 'name required' });
+    const { stock, threshold, cost } = clampInventoryFields(req.body);
     const { rows } = await pool.query(
       'INSERT INTO inventory (business_id, name, category, stock, threshold, unit, supplier, last_order, cost) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
-      [bid, name, category || '', stock || 0, threshold || 5, unit || 'pcs', supplier || '', lastOrder || '', cost || 0]
+      [bid, name, category || '', stock, threshold, unit || 'pcs', supplier || '', lastOrder || '', cost]
     );
     res.status(201).json(formatInventory(rows[0]));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
@@ -1206,10 +1238,11 @@ app.post('/api/inventory', auth, async (req, res) => {
 app.put('/api/inventory/:id', auth, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
-    const { name, category, stock, threshold, unit, supplier, lastOrder, cost } = req.body;
+    const { name, category, unit, supplier, lastOrder } = req.body;
+    const { stock, threshold, cost } = clampInventoryFields(req.body);
     const { rows } = await pool.query(
       'UPDATE inventory SET name=$1, category=$2, stock=$3, threshold=$4, unit=$5, supplier=$6, last_order=$7, cost=$8 WHERE id=$9 AND business_id=$10 RETURNING *',
-      [name, category, stock, threshold, unit, supplier, lastOrder || '', cost || 0, req.params.id, bid]
+      [name, category, stock, threshold, unit, supplier, lastOrder || '', cost, req.params.id, bid]
     );
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatInventory(rows[0]));
@@ -1383,11 +1416,13 @@ app.get('/api/announcements', auth, async (req, res) => {
 app.post('/api/announcements', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
-    const { title, body, from } = req.body;
+    const title = String(req.body.title || '').slice(0, 120);
+    const body = String(req.body.body || '').slice(0, 4000);
+    const from = String(req.body.from || 'Management').slice(0, 80);
     if (!body) return res.status(400).json({ error: 'body required' });
     const { rows } = await pool.query(
       'INSERT INTO announcements (business_id, title, body, "from") VALUES ($1,$2,$3,$4) RETURNING *',
-      [bid, title || '', body, from || 'Management']
+      [bid, title, body, from]
     );
     res.status(201).json(formatAnnouncement(rows[0]));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
@@ -1416,11 +1451,13 @@ app.get('/api/sop', auth, async (req, res) => {
 app.post('/api/sop', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
-    const { title, body, category } = req.body;
+    const title = String(req.body.title || '').slice(0, 120);
+    const body = String(req.body.body || '').slice(0, 2000);
+    const category = String(req.body.category || 'General').slice(0, 60);
     if (!title) return res.status(400).json({ error: 'title required' });
     const { rows } = await pool.query(
       'INSERT INTO sop (business_id, title, body, category) VALUES ($1,$2,$3,$4) RETURNING *',
-      [bid, title, body || '', category || 'General']
+      [bid, title, body, category]
     );
     res.status(201).json(formatSop(rows[0]));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
@@ -1479,15 +1516,23 @@ app.get('/api/services', auth, async (req, res) => {
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
+function clampServiceFields(b) {
+  const durationMin = Math.max(1, Math.min(1440, Math.trunc(Number(b.durationMin) || 60)));
+  const priceRaw = Number(b.price);
+  const price = Number.isFinite(priceRaw) ? Math.max(0, Math.min(1000000, priceRaw)) : 0;
+  return { durationMin, price };
+}
+
 app.post('/api/services', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
-    const { name, category, durationMin, price, color } = req.body;
+    const { name, category, color } = req.body;
     if (!name) return res.status(400).json({ error: 'name required' });
+    const { durationMin, price } = clampServiceFields(req.body);
     const { rows } = await pool.query(
       `INSERT INTO services (business_id, name, category, duration_min, price, color)
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [bid, name, category || 'General', Number(durationMin) || 60, Number(price) || 0, color || '#2d5a4a']
+      [bid, name, category || 'General', durationMin, price, color || '#2d5a4a']
     );
     res.status(201).json(formatService(rows[0]));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
@@ -1496,12 +1541,13 @@ app.post('/api/services', auth, requireManager, async (req, res) => {
 app.put('/api/services/:id', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
-    const { name, category, durationMin, price, color } = req.body;
+    const { name, category, color } = req.body;
+    const { durationMin, price } = clampServiceFields(req.body);
     const { rows } = await pool.query(
       `UPDATE services
          SET name=$1, category=$2, duration_min=$3, price=$4, color=$5
        WHERE id=$6 AND business_id=$7 RETURNING *`,
-      [name, category || 'General', Number(durationMin) || 60, Number(price) || 0, color || '#2d5a4a', req.params.id, bid]
+      [name, category || 'General', durationMin, price, color || '#2d5a4a', req.params.id, bid]
     );
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatService(rows[0]));
