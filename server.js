@@ -33,11 +33,24 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim())
   : ['http://localhost:3001', 'https://spapilot-app.onrender.com'];
 
-app.use(helmet());
+// Helmet defaults are mostly fine — we mainly need a slightly looser CSP because the
+// React frontend pulls Google Fonts and Stripe checkout uses inline scripts. The
+// frontend is served from Render (not from this API) so the strict CSP here only
+// applies to API responses (typically JSON, never rendered) — keep defaults strict.
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+}));
 app.use(compression());
 app.use(cors({ origin: allowedOrigins, credentials: true }));
 app.use(express.json({ limit: '1mb' }));
 app.set('trust proxy', 1);
+// Disable client/proxy caching of API responses — every request gets fresh data.
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/')) {
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
+  }
+  next();
+});
 
 // Rate limiters for auth endpoints to prevent brute force
 const authLimiter = rateLimit({
@@ -714,7 +727,8 @@ async function initDB() {
 }
 
 // ── Health ────────────────────────────────────────────────
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
 
 // ── Auth ──────────────────────────────────────────────────
 app.post('/api/auth/signup', authLimiter, validate(signupSchema), async (req, res) => {
@@ -1565,6 +1579,15 @@ app.delete('/api/services/:id', auth, requireManager, async (req, res) => {
 
 // ── Error handler ─────────────────────────────────────────
 app.use((err, req, res, next) => {
+  // Body-parser throws SyntaxError when JSON is malformed and PayloadTooLargeError
+  // when over the 1mb limit. Surface a 400 instead of leaking 500 + stack.
+  if (err.type === 'entity.parse.failed' || err instanceof SyntaxError) {
+    logger.warn('bad.json', { path: req.path, method: req.method });
+    return res.status(400).json({ error: 'Invalid JSON' });
+  }
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Request body too large' });
+  }
   logger.error('unhandled.error', { path: req.path, method: req.method, err: err.message, stack: err.stack });
   res.status(500).json({ error: 'Internal server error' });
 });
