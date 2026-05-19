@@ -756,8 +756,10 @@ app.post('/api/auth/login', authLimiter, validate(loginSchema), async (req, res)
     const { email, password } = req.body;
     const { rows } = await pool.query('SELECT * FROM users WHERE email=$1', [email]);
     if (!rows.length) {
-      // Constant-ish timing to avoid email enumeration
-      await bcrypt.compare(password, '$2a$10$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalid');
+      // Constant-time pad — compare against a real bcrypt-format hash with cost
+      // factor matching production hashes (10) so timing leaks don't distinguish
+      // "no such email" from "wrong password".
+      await bcrypt.compare(password, '$2a$10$abcdefghijklmnopqrstuv0123456789012345678901234567890123');
       return res.status(401).json({ error: 'Invalid email or password' });
     }
     const user = rows[0];
@@ -927,9 +929,18 @@ app.post('/api/auth/reset-password', passwordResetLimiter, validate(resetPasswor
   } catch (err) { logger.error('password.reset.error', { err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
+const ALLOWED_BUSINESS_TYPES = new Set([
+  'services', 'products', 'space', 'mix',
+  'spa', 'salon', 'barbershop', 'gym', 'hotel', 'clinic', 'restaurant', 'other',
+]);
+const ALLOWED_ROLES = new Set(['manager', 'staff', 'owner']);
+
 app.post('/api/auth/business', auth, async (req, res) => {
   try {
     const { businessType } = req.body;
+    if (!ALLOWED_BUSINESS_TYPES.has(String(businessType))) {
+      return res.status(400).json({ error: 'Invalid business type' });
+    }
     const { rows } = await pool.query(
       'UPDATE users SET business_type=$1 WHERE id=$2 RETURNING *',
       [businessType, req.user.id]
@@ -941,6 +952,16 @@ app.post('/api/auth/business', auth, async (req, res) => {
 app.post('/api/auth/role', auth, async (req, res) => {
   try {
     const { role, staffId } = req.body;
+    if (!ALLOWED_ROLES.has(String(role))) {
+      return res.status(400).json({ error: 'Invalid role' });
+    }
+    // This endpoint is for onboarding only. Once the user has a business + role,
+    // role changes go through /api/auth/switch-onboarding which restarts the flow.
+    const { rows: meRows } = await pool.query('SELECT business_id, role FROM users WHERE id=$1', [req.user.id]);
+    const me = meRows[0];
+    if (me && me.business_id && me.role) {
+      return res.status(403).json({ error: 'Role already set. Use switch-onboarding to change it.' });
+    }
     const { rows } = await pool.query(
       'UPDATE users SET role=$1, staff_id=$2 WHERE id=$3 RETURNING *',
       [role, staffId || null, req.user.id]
@@ -1012,25 +1033,42 @@ app.post('/api/businesses', auth, async (req, res) => {
   try {
     const { name, type, staffCount } = req.body;
     if (!name || !type) return res.status(400).json({ error: 'name and type required' });
-    let code = null;
-    for (let i = 0; i < 8; i++) {
-      const candidate = genBusinessCode();
-      const { rowCount } = await pool.query('SELECT 1 FROM businesses WHERE code=$1', [candidate]);
-      if (!rowCount) { code = candidate; break; }
+    if (!ALLOWED_BUSINESS_TYPES.has(String(type))) {
+      return res.status(400).json({ error: 'Invalid business type' });
     }
-    if (!code) return res.status(500).json({ error: 'Could not generate unique business code' });
-    const { rows } = await pool.query(
-      `INSERT INTO businesses (name, type, owner_id, code, staff_count)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [name, type, req.user.id, code, staffCount || 0]
-    );
+    const trimmedName = String(name).trim().slice(0, 120);
+    if (!trimmedName) return res.status(400).json({ error: 'name required' });
+    // Retry-on-unique-violation pattern: SELECT-then-INSERT is racy under load.
+    // Try up to 12 random codes; if a duplicate slips past the SELECT, catch the
+    // 23505 unique_violation and try again with a fresh code.
+    let business = null;
+    let lastErr = null;
+    for (let i = 0; i < 12; i++) {
+      const candidate = genBusinessCode();
+      try {
+        const { rows } = await pool.query(
+          `INSERT INTO businesses (name, type, owner_id, code, staff_count)
+           VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+          [trimmedName, type, req.user.id, candidate, staffCount || 0]
+        );
+        business = rows[0];
+        break;
+      } catch (e) {
+        lastErr = e;
+        if (e.code !== '23505') throw e; // not a unique-violation — bubble up
+      }
+    }
+    if (!business) {
+      logger.error('businesses.code.exhausted', { err: lastErr && lastErr.message });
+      return res.status(500).json({ error: 'Could not generate unique business code' });
+    }
     const { rows: urows } = await pool.query(
       `UPDATE users SET business_id=$1, business_type=$2, role='manager', onboarding_role='owner'
        WHERE id=$3 RETURNING *`,
-      [rows[0].id, type, req.user.id]
+      [business.id, type, req.user.id]
     );
     res.status(201).json({
-      business: formatBusiness(rows[0]),
+      business: formatBusiness(business),
       token: makeToken(urows[0]),
       user: formatUser(urows[0]),
     });
@@ -1176,13 +1214,23 @@ function clampBookingFields(b) {
   return { dur, pri };
 }
 
+// YYYY-MM-DD anchor — backed by server local time, not UTC, so end-of-day
+// edits don't shift the booking forward or backward by a day.
+function localToday() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+
 app.post('/api/bookings', auth, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { date, time, client, treatment, duration, staffId, notes, status, price, allergies, clientPhone } = req.body;
     if (!time || !client || !treatment || !duration) return res.status(400).json({ error: 'time, client, treatment, duration required' });
     const { dur, pri } = clampBookingFields({ duration, price });
-    const bookingDate = date || new Date().toISOString().slice(0, 10);
+    const bookingDate = date || localToday();
     const { rows } = await pool.query(
       'INSERT INTO bookings (business_id, date, time, client, treatment, duration, staff_id, notes, status, price, allergies, client_phone) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *',
       [bid, bookingDate, time, client, treatment, dur, staffId || null, notes || '', status || 'confirmed', pri, allergies || '', clientPhone || '']
@@ -1196,7 +1244,7 @@ app.put('/api/bookings/:id', auth, async (req, res) => {
     const bid = needBusiness(req, res); if (!bid) return;
     const { date, time, client, treatment, duration, staffId, notes, status, price, allergies, clientPhone } = req.body;
     const { dur, pri } = clampBookingFields({ duration, price });
-    const bookingDate = date || new Date().toISOString().slice(0, 10);
+    const bookingDate = date || localToday();
     const { rows } = await pool.query(
       'UPDATE bookings SET date=$1, time=$2, client=$3, treatment=$4, duration=$5, staff_id=$6, notes=$7, status=$8, price=$9, allergies=$10, client_phone=$11 WHERE id=$12 AND business_id=$13 RETURNING *',
       [bookingDate, time, client, treatment, dur, staffId || null, notes || '', status || 'confirmed', pri, allergies || '', clientPhone || '', req.params.id, bid]
@@ -1363,25 +1411,36 @@ app.put('/api/requests/:id', auth, requireManager, async (req, res) => {
       }
 
       // Shift swap: requester's bookings on their date go to swap_with, swap_with's
-      // bookings on swap_day go to requester. Two-step swap via temp NULL to avoid
-      // accidentally overwriting in one move.
+      // bookings on swap_day go to requester. Capture the requester's booking IDs
+      // first so the third UPDATE only touches THOSE rows — not any other booking
+      // that happens to have NULL staff_id on that date (regression: previous
+      // implementation re-assigned every unassigned booking).
       if (status === 'approved' && request.type === 'swap' && request.swap_with && request.swap_day) {
-        // Tag requester's bookings with NULL temporarily so the second update
-        // doesn't accidentally re-grab them.
-        await client.query(
-          `UPDATE bookings SET staff_id=NULL WHERE staff_id=$1 AND date=$2::date AND business_id=$3`,
+        const { rows: requesterRows } = await client.query(
+          `SELECT id FROM bookings WHERE staff_id=$1 AND date=$2::date AND business_id=$3`,
           [request.staff_id, request.date, bid]
         );
+        const requesterIds = requesterRows.map(r => r.id);
+        // Tag requester's bookings with NULL temporarily so the second update
+        // doesn't accidentally re-grab them.
+        if (requesterIds.length) {
+          await client.query(
+            `UPDATE bookings SET staff_id=NULL WHERE id = ANY($1::int[]) AND business_id=$2`,
+            [requesterIds, bid]
+          );
+        }
         // Move swap_with staff's bookings on swap_day to requester
         await client.query(
           `UPDATE bookings SET staff_id=$1 WHERE staff_id=$2 AND date=$3::date AND business_id=$4`,
           [request.staff_id, request.swap_with, request.swap_day, bid]
         );
-        // Move the NULL-tagged bookings to swap_with
-        await client.query(
-          `UPDATE bookings SET staff_id=$1 WHERE staff_id IS NULL AND date=$2::date AND business_id=$3`,
-          [request.swap_with, request.date, bid]
-        );
+        // Move only the originally-captured bookings to swap_with — not every NULL row.
+        if (requesterIds.length) {
+          await client.query(
+            `UPDATE bookings SET staff_id=$1 WHERE id = ANY($2::int[]) AND business_id=$3`,
+            [request.swap_with, requesterIds, bid]
+          );
+        }
       }
 
       // Day-off approval: cancel requester's bookings on that date or leave to manager.
@@ -1394,9 +1453,12 @@ app.put('/api/requests/:id', auth, requireManager, async (req, res) => {
       }
 
       if (status === 'approved' && request.type === 'stock_request' && request.product_id) {
+        // Scope to this business — without business_id a crafted product_id from
+        // another tenant would mutate cross-tenant inventory.
+        const qty = Math.max(0, Math.min(10000, Math.trunc(Number(request.quantity) || 0)));
         await client.query(
-          'UPDATE inventory SET stock = stock + $1 WHERE id=$2',
-          [request.quantity || 0, request.product_id]
+          'UPDATE inventory SET stock = stock + $1 WHERE id=$2 AND business_id=$3',
+          [qty, request.product_id, bid]
         );
       }
 
