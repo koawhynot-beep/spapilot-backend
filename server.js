@@ -2,13 +2,20 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { Pool } = require('pg');
+const pg = require('pg');
+const { Pool } = pg;
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const winston = require('winston');
 const compression = require('compression');
 const { z } = require('zod');
+
+// Force DATE columns (OID 1082) to come back as plain 'YYYY-MM-DD' strings.
+// node-pg's default parser converts them to JS Date objects, which serialize as
+// ISO timestamps and break the frontend's `b.date === '2025-12-25'` equality
+// checks. Keep them as text so client comparisons just work.
+pg.types.setTypeParser(1082, v => v);
 
 const logger = winston.createLogger({
   level: process.env.LOG_LEVEL || 'info',
@@ -962,9 +969,24 @@ app.post('/api/auth/role', auth, async (req, res) => {
     if (me && me.business_id && me.role) {
       return res.status(403).json({ error: 'Role already set. Use switch-onboarding to change it.' });
     }
+    // If a staff_id is supplied, the user must have already joined a business and
+    // that staff row must belong to that business — otherwise a mid-onboarding
+    // user could claim any tenant's staff_id.
+    let resolvedStaffId = null;
+    if (staffId != null && staffId !== '') {
+      if (!me || !me.business_id) {
+        return res.status(400).json({ error: 'Join a business before selecting a staff profile' });
+      }
+      const { rows: sRows } = await pool.query(
+        'SELECT id FROM staff WHERE id=$1 AND business_id=$2',
+        [Number(staffId), me.business_id]
+      );
+      if (!sRows.length) return res.status(400).json({ error: 'Invalid staff profile' });
+      resolvedStaffId = sRows[0].id;
+    }
     const { rows } = await pool.query(
       'UPDATE users SET role=$1, staff_id=$2 WHERE id=$3 RETURNING *',
-      [role, staffId || null, req.user.id]
+      [role, resolvedStaffId, req.user.id]
     );
     res.json({ token: makeToken(rows[0]), user: formatUser(rows[0]) });
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
@@ -1224,16 +1246,33 @@ function localToday() {
   return `${y}-${m}-${dd}`;
 }
 
+// Validate that a supplied staff_id belongs to this business. Returns numeric id
+// or null. Returns false (sentinel) if a staffId was supplied but doesn't match.
+async function resolveStaffIdForBusiness(staffId, bid) {
+  if (staffId == null || staffId === '') return null;
+  const n = Number(staffId);
+  if (!Number.isFinite(n)) return false;
+  const { rows } = await pool.query('SELECT id FROM staff WHERE id=$1 AND business_id=$2', [n, bid]);
+  return rows.length ? n : false;
+}
+
 app.post('/api/bookings', auth, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { date, time, client, treatment, duration, staffId, notes, status, price, allergies, clientPhone } = req.body;
     if (!time || !client || !treatment || !duration) return res.status(400).json({ error: 'time, client, treatment, duration required' });
+    const resolvedStaffId = await resolveStaffIdForBusiness(staffId, bid);
+    if (resolvedStaffId === false) return res.status(400).json({ error: 'Invalid staffId' });
     const { dur, pri } = clampBookingFields({ duration, price });
     const bookingDate = date || localToday();
+    const safeClient = String(client).slice(0, 120);
+    const safeTreatment = String(treatment).slice(0, 120);
+    const safeNotes = String(notes || '').slice(0, 2000);
+    const safeAllergies = String(allergies || '').slice(0, 500);
+    const safePhone = String(clientPhone || '').slice(0, 40);
     const { rows } = await pool.query(
       'INSERT INTO bookings (business_id, date, time, client, treatment, duration, staff_id, notes, status, price, allergies, client_phone) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *',
-      [bid, bookingDate, time, client, treatment, dur, staffId || null, notes || '', status || 'confirmed', pri, allergies || '', clientPhone || '']
+      [bid, bookingDate, time, safeClient, safeTreatment, dur, resolvedStaffId, safeNotes, status || 'confirmed', pri, safeAllergies, safePhone]
     );
     res.status(201).json(formatBooking(rows[0]));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
@@ -1243,11 +1282,18 @@ app.put('/api/bookings/:id', auth, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { date, time, client, treatment, duration, staffId, notes, status, price, allergies, clientPhone } = req.body;
+    const resolvedStaffId = await resolveStaffIdForBusiness(staffId, bid);
+    if (resolvedStaffId === false) return res.status(400).json({ error: 'Invalid staffId' });
     const { dur, pri } = clampBookingFields({ duration, price });
     const bookingDate = date || localToday();
+    const safeClient = String(client).slice(0, 120);
+    const safeTreatment = String(treatment).slice(0, 120);
+    const safeNotes = String(notes || '').slice(0, 2000);
+    const safeAllergies = String(allergies || '').slice(0, 500);
+    const safePhone = String(clientPhone || '').slice(0, 40);
     const { rows } = await pool.query(
       'UPDATE bookings SET date=$1, time=$2, client=$3, treatment=$4, duration=$5, staff_id=$6, notes=$7, status=$8, price=$9, allergies=$10, client_phone=$11 WHERE id=$12 AND business_id=$13 RETURNING *',
-      [bookingDate, time, client, treatment, dur, staffId || null, notes || '', status || 'confirmed', pri, allergies || '', clientPhone || '', req.params.id, bid]
+      [bookingDate, time, safeClient, safeTreatment, dur, resolvedStaffId, safeNotes, status || 'confirmed', pri, safeAllergies, safePhone, req.params.id, bid]
     );
     if (!rows.length) return res.status(404).json({ error: 'not found' });
     res.json(formatBooking(rows[0]));
@@ -1371,6 +1417,28 @@ app.post('/api/requests', auth, async (req, res) => {
     const validTypes = ['sick', 'dayoff', 'swap', 'stock_request'];
     if (!validTypes.includes(type)) return res.status(400).json({ error: 'invalid type' });
 
+    // Staff must belong to this business — prevent submitting requests against
+    // a foreign tenant's staff_id.
+    const { rows: sRows } = await pool.query(
+      'SELECT 1 FROM staff WHERE id=$1 AND business_id=$2',
+      [Number(staffId), bid]
+    );
+    if (!sRows.length) return res.status(400).json({ error: 'Invalid staffId' });
+    if (swapWith) {
+      const { rows: swRows } = await pool.query(
+        'SELECT 1 FROM staff WHERE id=$1 AND business_id=$2',
+        [Number(swapWith), bid]
+      );
+      if (!swRows.length) return res.status(400).json({ error: 'Invalid swapWith' });
+    }
+    if (productId) {
+      const { rows: pRows } = await pool.query(
+        'SELECT 1 FROM inventory WHERE id=$1 AND business_id=$2',
+        [Number(productId), bid]
+      );
+      if (!pRows.length) return res.status(400).json({ error: 'Invalid productId' });
+    }
+
     // Prevent duplicate pending requests of same type per staff per date (skip stock_request)
     if (type !== 'stock_request' && date) {
       const { rowCount: dupCount } = await pool.query(
@@ -1383,9 +1451,14 @@ app.post('/api/requests', auth, async (req, res) => {
       }
     }
 
+    // Clamp quantity to [0, 10000] at write time so the displayed request can't
+    // mislead a manager into approving a huge increment.
+    const qty = Math.max(0, Math.min(10000, Math.trunc(Number(quantity) || 0)));
+    const safeReason = String(reason || '').slice(0, 1000);
+
     const { rows } = await pool.query(
       'INSERT INTO requests (business_id, type, staff_id, date, reason, swap_with, swap_day, product_id, quantity) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
-      [bid, type, Number(staffId), date || null, reason || '', swapWith || null, swapDay || null, productId || null, quantity || 0]
+      [bid, type, Number(staffId), date || null, safeReason, swapWith ? Number(swapWith) : null, swapDay || null, productId ? Number(productId) : null, qty]
     );
     res.status(201).json(formatRequest(rows[0]));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
@@ -1395,18 +1468,44 @@ app.put('/api/requests/:id', auth, requireManager, async (req, res) => {
   try {
     const bid = needBusiness(req, res); if (!bid) return;
     const { status, reassignToStaffId } = req.body;
-    const { rows: reqRows } = await pool.query('SELECT * FROM requests WHERE id=$1 AND business_id=$2', [req.params.id, bid]);
-    if (!reqRows.length) return res.status(404).json({ error: 'not found' });
-    const request = reqRows[0];
+    if (!['approved', 'declined'].includes(String(status))) {
+      return res.status(400).json({ error: 'status must be approved or declined' });
+    }
+    // If a reassignment target is supplied, it must belong to this business — prevents
+    // a manager from setting another tenant's staff as the new owner of bookings.
+    if (reassignToStaffId) {
+      const { rows: sRows } = await pool.query(
+        'SELECT 1 FROM staff WHERE id=$1 AND business_id=$2',
+        [Number(reassignToStaffId), bid]
+      );
+      if (!sRows.length) return res.status(400).json({ error: 'Invalid reassignToStaffId' });
+    }
 
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
 
+      // Lock the request row + atomically gate on status='pending' so a double-click
+      // (or a parallel manager session) can't run the swap/reassign logic twice.
+      const { rows: reqRows } = await client.query(
+        'SELECT * FROM requests WHERE id=$1 AND business_id=$2 FOR UPDATE',
+        [req.params.id, bid]
+      );
+      if (!reqRows.length) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'not found' });
+      }
+      const request = reqRows[0];
+      if (request.status !== 'pending') {
+        await client.query('ROLLBACK');
+        // Idempotent: return current state so client UI converges.
+        return res.json(formatRequest(request));
+      }
+
       if (status === 'approved' && request.type === 'sick' && reassignToStaffId) {
         await client.query(
-          `UPDATE bookings SET staff_id=$1 WHERE staff_id=$2 AND date = $3::date`,
-          [reassignToStaffId, request.staff_id, request.date]
+          `UPDATE bookings SET staff_id=$1 WHERE staff_id=$2 AND date = $3::date AND business_id=$4`,
+          [reassignToStaffId, request.staff_id, request.date, bid]
         );
       }
 
@@ -1564,9 +1663,25 @@ app.post('/api/violations', auth, requireManager, async (req, res) => {
     const bid = needBusiness(req, res); if (!bid) return;
     const { staffId, sopId, note } = req.body;
     if (!staffId) return res.status(400).json({ error: 'staffId required' });
+    // Staff must belong to this business — FK alone allows any staff_id since
+    // the table holds rows across all tenants.
+    const { rows: sRows } = await pool.query(
+      'SELECT 1 FROM staff WHERE id=$1 AND business_id=$2',
+      [Number(staffId), bid]
+    );
+    if (!sRows.length) return res.status(400).json({ error: 'Invalid staffId' });
+    // Same for sopId if supplied.
+    if (sopId) {
+      const { rows: rRows } = await pool.query(
+        'SELECT 1 FROM sop WHERE id=$1 AND business_id=$2',
+        [Number(sopId), bid]
+      );
+      if (!rRows.length) return res.status(400).json({ error: 'Invalid sopId' });
+    }
+    const safeNote = String(note || '').slice(0, 2000);
     const { rows } = await pool.query(
       'INSERT INTO violations (business_id, staff_id, sop_id, note) VALUES ($1,$2,$3,$4) RETURNING *',
-      [bid, staffId, sopId || null, note || '']
+      [bid, Number(staffId), sopId ? Number(sopId) : null, safeNote]
     );
     res.status(201).json(formatViolation(rows[0]));
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
