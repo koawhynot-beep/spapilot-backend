@@ -175,7 +175,17 @@ const formatBusiness = (b) => ({
   code: b.code,
   staffCount: b.staff_count,
   createdAt: b.created_at,
+  currency: b.currency || 'USD',
 });
+
+const ALLOWED_CURRENCIES = new Set([
+  'USD', 'EUR', 'GBP', 'AUD', 'CAD', 'IDR', 'SGD', 'MYR', 'PHP', 'THB',
+  'JPY', 'KRW', 'INR', 'MXN', 'BRL', 'ZAR', 'NZD', 'CHF', 'HKD', 'AED',
+]);
+function clampCurrency(c) {
+  const up = String(c || '').toUpperCase();
+  return ALLOWED_CURRENCIES.has(up) ? up : 'USD';
+}
 
 const formatStaff = (s) => ({
   id: s.id,
@@ -589,6 +599,7 @@ async function initDB() {
     `ALTER TABLE businesses    ADD COLUMN IF NOT EXISTS staff_count INTEGER DEFAULT 0`,
     `ALTER TABLE businesses    ADD COLUMN IF NOT EXISTS owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE`,
     `ALTER TABLE businesses    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`,
+    `ALTER TABLE businesses    ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'USD'`,
     // Defensive ALTERs for every column in every table — covers prod drift comprehensively
     `ALTER TABLE staff ADD COLUMN IF NOT EXISTS avatar TEXT`,
     `ALTER TABLE staff ADD COLUMN IF NOT EXISTS color TEXT`,
@@ -1053,13 +1064,14 @@ app.post('/api/billing/mock-activate', auth, async (req, res) => {
 // ── Businesses ────────────────────────────────────────────
 app.post('/api/businesses', auth, async (req, res) => {
   try {
-    const { name, type, staffCount } = req.body;
+    const { name, type, staffCount, currency } = req.body;
     if (!name || !type) return res.status(400).json({ error: 'name and type required' });
     if (!ALLOWED_BUSINESS_TYPES.has(String(type))) {
       return res.status(400).json({ error: 'Invalid business type' });
     }
     const trimmedName = String(name).trim().slice(0, 120);
     if (!trimmedName) return res.status(400).json({ error: 'name required' });
+    const cur = clampCurrency(currency);
     // Retry-on-unique-violation pattern: SELECT-then-INSERT is racy under load.
     // Try up to 12 random codes; if a duplicate slips past the SELECT, catch the
     // 23505 unique_violation and try again with a fresh code.
@@ -1069,9 +1081,9 @@ app.post('/api/businesses', auth, async (req, res) => {
       const candidate = genBusinessCode();
       try {
         const { rows } = await pool.query(
-          `INSERT INTO businesses (name, type, owner_id, code, staff_count)
-           VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-          [trimmedName, type, req.user.id, candidate, staffCount || 0]
+          `INSERT INTO businesses (name, type, owner_id, code, staff_count, currency)
+           VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+          [trimmedName, type, req.user.id, candidate, staffCount || 0, cur]
         );
         business = rows[0];
         break;
@@ -1129,6 +1141,33 @@ app.get('/api/businesses/me', auth, async (req, res) => {
     const { rows: urows } = await pool.query('SELECT business_id FROM users WHERE id=$1', [req.user.id]);
     if (!urows.length || !urows[0].business_id) return res.json(null);
     const { rows } = await pool.query('SELECT * FROM businesses WHERE id=$1', [urows[0].business_id]);
+    res.json(rows.length ? formatBusiness(rows[0]) : null);
+  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Owner can update business name / currency. Manager+ only — staff can't change
+// settings. Keep type immutable (changing it would invalidate stored labels).
+app.put('/api/businesses/me', auth, requireManager, async (req, res) => {
+  try {
+    const { rows: urows } = await pool.query('SELECT business_id FROM users WHERE id=$1', [req.user.id]);
+    if (!urows.length || !urows[0].business_id) return res.status(404).json({ error: 'No business to update' });
+    const bid = urows[0].business_id;
+    const updates = [];
+    const params = [];
+    if (typeof req.body.name === 'string') {
+      const n = req.body.name.trim().slice(0, 120);
+      if (n) { params.push(n); updates.push(`name=$${params.length}`); }
+    }
+    if (typeof req.body.currency === 'string') {
+      params.push(clampCurrency(req.body.currency));
+      updates.push(`currency=$${params.length}`);
+    }
+    if (!updates.length) return res.status(400).json({ error: 'Nothing to update' });
+    params.push(bid);
+    const { rows } = await pool.query(
+      `UPDATE businesses SET ${updates.join(', ')} WHERE id=$${params.length} RETURNING *`,
+      params
+    );
     res.json(rows.length ? formatBusiness(rows[0]) : null);
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
