@@ -141,6 +141,26 @@ async function sendResetEmail(to, token) {
   return {};
 }
 
+async function sendVerificationEmail(to, token) {
+  const link = `${FRONTEND_URL}?verify_token=${token}`;
+  if (!mailer) {
+    if (process.env.NODE_ENV === 'production') {
+      console.error('Email verification requested but no SMTP configured. Email not sent.');
+      return {};
+    }
+    console.log(`[DEV] Verification link generated for ${to} (token redacted)`);
+    return { devLink: link };
+  }
+  await mailer.sendMail({
+    from: process.env.SMTP_FROM || 'Spapilot <noreply@spapilot.app>',
+    to,
+    subject: 'Verify your Spapilot email',
+    html: `<p>Welcome to Spapilot! Click the link below to verify your email and finish setting up your account (expires in 24 hours):</p><p><a href="${link}">${link}</a></p><p>If you did not sign up for Spapilot, you can ignore this email.</p>`,
+    text: `Verify your Spapilot email: ${link}\n\nIf you did not sign up, ignore this message.`,
+  });
+  return {};
+}
+
 // ── Format rows (snake → camelCase) ──────────────────────
 const DEFAULT_PERMISSIONS = {
   canViewSchedule: true,
@@ -580,6 +600,9 @@ async function initDB() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS tutorial_completed BOOLEAN DEFAULT FALSE`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER DEFAULT 0`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_token TEXT`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_token_expires_at TIMESTAMPTZ`,
     // Multi-tenancy: scope all data to a business
     `ALTER TABLE staff         ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
     `ALTER TABLE bookings      ADD COLUMN IF NOT EXISTS business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE`,
@@ -749,6 +772,19 @@ app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime
 app.get('/api/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
 
 // ── Auth ──────────────────────────────────────────────────
+// Whether email verification is required. Falls back to true in production so a
+// misconfigured deploy doesn't silently skip it. SMTP must also be configured
+// (otherwise we'd lock everyone out of brand-new signups). If SMTP isn't set
+// and we're in production, log a fatal warning at boot.
+const VERIFY_EMAIL_REQUIRED = process.env.VERIFY_EMAIL_REQUIRED !== 'false';
+if (VERIFY_EMAIL_REQUIRED && !mailer && process.env.NODE_ENV === 'production') {
+  console.warn(
+    'WARNING: VERIFY_EMAIL_REQUIRED=true but SMTP_HOST not configured. ' +
+    'Set SMTP_* envs or set VERIFY_EMAIL_REQUIRED=false. New signups will be ' +
+    'unable to verify.'
+  );
+}
+
 app.post('/api/auth/signup', authLimiter, validate(signupSchema), async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -756,14 +792,80 @@ app.post('/api/auth/signup', authLimiter, validate(signupSchema), async (req, re
     if (exists.rowCount) return res.status(400).json({ error: 'Email already registered' });
     const hash = await bcrypt.hash(password, 10);
     const trialEnd = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    const verificationToken = crypto.randomBytes(32).toString('hex');
+    const verificationExpires = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
+    const verifiedNow = !VERIFY_EMAIL_REQUIRED;
     const { rows } = await pool.query(
-      `INSERT INTO users (email, password_hash, trial_started_at, trial_ends_at, subscription_status)
-       VALUES ($1, $2, NOW(), $3, 'trial') RETURNING *`,
-      [email, hash, trialEnd]
+      `INSERT INTO users (email, password_hash, trial_started_at, trial_ends_at, subscription_status, email_verified, verification_token, verification_token_expires_at)
+       VALUES ($1, $2, NOW(), $3, 'trial', $4, $5, $6) RETURNING *`,
+      [email, hash, trialEnd, verifiedNow, verifiedNow ? null : verificationToken, verifiedNow ? null : verificationExpires]
     );
-    logger.info('user.signup', { userId: rows[0].id, email });
+    logger.info('user.signup', { userId: rows[0].id, email, verifyRequired: !verifiedNow });
+
+    if (!verifiedNow) {
+      // Fire-and-forget email send. Capture errors but don't fail signup — the
+      // user can request a resend.
+      sendVerificationEmail(email, verificationToken).catch(err =>
+        logger.error('verify.email.send.error', { userId: rows[0].id, err: err.message })
+      );
+      return res.status(201).json({
+        needsVerification: true,
+        email,
+        message: 'Account created. Check your email to verify and finish signing in.',
+      });
+    }
+
+    // SMTP disabled / verification skipped — log straight in (legacy behavior).
     res.status(201).json({ token: makeToken(rows[0]), user: formatUser(rows[0]), trial: trialInfo(rows[0]) });
   } catch (err) { logger.error('signup.error', { err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Verify email — takes the token from the link, marks the user verified,
+// returns a real auth token so they're signed in.
+app.post('/api/auth/verify-email', authLimiter, async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token || typeof token !== 'string' || token.length < 16) {
+      return res.status(400).json({ error: 'Invalid verification link' });
+    }
+    const { rows } = await pool.query(
+      `SELECT * FROM users
+       WHERE verification_token = $1 AND verification_token_expires_at > NOW()`,
+      [token]
+    );
+    if (!rows.length) {
+      return res.status(400).json({ error: 'This verification link has expired or already been used. Request a new one.' });
+    }
+    const user = rows[0];
+    const { rows: updated } = await pool.query(
+      `UPDATE users SET email_verified = TRUE, verification_token = NULL, verification_token_expires_at = NULL
+       WHERE id = $1 RETURNING *`,
+      [user.id]
+    );
+    logger.info('email.verified', { userId: user.id });
+    res.json({ token: makeToken(updated[0]), user: formatUser(updated[0]), trial: trialInfo(updated[0]) });
+  } catch (err) { logger.error('verify.error', { err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Resend verification email. Always responds 200 (don't leak which emails exist).
+app.post('/api/auth/resend-verification', passwordResetLimiter, async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    if (!email) return res.json({ message: 'If that email exists, we sent a new link.' });
+    const { rows } = await pool.query('SELECT id, email_verified FROM users WHERE email=$1', [email]);
+    if (rows.length && !rows[0].email_verified) {
+      const token = crypto.randomBytes(32).toString('hex');
+      const expires = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      await pool.query(
+        'UPDATE users SET verification_token=$1, verification_token_expires_at=$2 WHERE id=$3',
+        [token, expires, rows[0].id]
+      );
+      sendVerificationEmail(email, token).catch(err =>
+        logger.error('verify.email.resend.error', { userId: rows[0].id, err: err.message })
+      );
+    }
+    res.json({ message: 'If that email exists, we sent a new link.' });
+  } catch (err) { logger.error('resend.error', { err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 const MAX_FAILED_LOGINS = 5;
@@ -799,6 +901,17 @@ app.post('/api/auth/login', authLimiter, validate(loginSchema), async (req, res)
         return res.status(423).json({ error: 'Account locked due to too many failed attempts. Try again in 15 minutes.' });
       }
       return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    // Block login until the email has been verified — only if verification is
+    // turned on. Return 403 with a marker the frontend can use to show a
+    // "Resend verification email" link.
+    if (VERIFY_EMAIL_REQUIRED && !user.email_verified) {
+      logger.warn('login.unverified', { userId: user.id, email });
+      return res.status(403).json({
+        error: 'Please verify your email before signing in. Check your inbox for the link.',
+        code: 'email_not_verified',
+        email,
+      });
     }
     if (user.failed_login_attempts > 0 || user.locked_until) {
       await pool.query(
