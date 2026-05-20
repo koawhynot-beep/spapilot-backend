@@ -743,6 +743,25 @@ async function initDB() {
     }
   } catch (e) { logger.warn('constraint.drop.skipped', { err: e.message }); }
 
+  // One-shot data wipe via env var — no shell needed. Set WIPE_ON_BOOT to the
+  // exact string "WIPE-EVERYTHING-NOW" in the Render dashboard, redeploy/restart,
+  // and the server truncates every table once at startup. IMPORTANT: remove the
+  // env var afterward, or every future restart wipes again. A loud warning is
+  // logged so it's obvious in the deploy logs.
+  if (process.env.WIPE_ON_BOOT === 'WIPE-EVERYTHING-NOW') {
+    const wipeTables = [
+      'token_blacklist', 'password_resets', 'violations', 'announcements',
+      'sop', 'services', 'requests', 'inventory', 'bookings', 'staff',
+      'businesses', 'users',
+    ];
+    try {
+      await pool.query(`TRUNCATE TABLE ${wipeTables.join(', ')} RESTART IDENTITY CASCADE`);
+      logger.warn('DATA WIPED via WIPE_ON_BOOT. ⚠ REMOVE the WIPE_ON_BOOT env var NOW or the next restart wipes again.');
+    } catch (e) {
+      logger.error('wipe.on.boot.failed', { err: e.message });
+    }
+  }
+
   // Demo account only created in non-production environments.
   if (process.env.NODE_ENV !== 'production') {
     const { rowCount: hasDemo } = await pool.query(
