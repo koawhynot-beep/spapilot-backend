@@ -811,13 +811,46 @@ if (VERIFY_EMAIL_REQUIRED && !mailer && process.env.NODE_ENV === 'production') {
 app.post('/api/auth/signup', authLimiter, validate(signupSchema), async (req, res) => {
   try {
     const { email, password } = req.body;
-    const exists = await pool.query('SELECT id FROM users WHERE email=$1', [email]);
-    if (exists.rowCount) return res.status(400).json({ error: 'Email already registered' });
     const hash = await bcrypt.hash(password, 10);
-    const trialEnd = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     const code = genVerificationCode();
     const verificationExpires = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
     const verifiedNow = !VERIFY_EMAIL_REQUIRED;
+
+    const existing = await pool.query(
+      'SELECT id, email_verified FROM users WHERE email=$1',
+      [email]
+    );
+    if (existing.rowCount) {
+      const row = existing.rows[0];
+      // A VERIFIED account already owns this email — block.
+      if (row.email_verified) {
+        return res.status(400).json({ error: 'Email already registered' });
+      }
+      // UNVERIFIED pending account — nobody has proven ownership yet, so allow
+      // "re-signup": reset the password to the new one and issue a fresh code.
+      // This unsticks users who never received / used their first code.
+      await pool.query(
+        `UPDATE users SET password_hash=$1, verification_token=$2, verification_token_expires_at=$3,
+           email_verified=$4, failed_login_attempts=0, locked_until=NULL
+         WHERE id=$5`,
+        [hash, verifiedNow ? null : code, verifiedNow ? null : verificationExpires, verifiedNow, row.id]
+      );
+      const { rows: refreshed } = await pool.query('SELECT * FROM users WHERE id=$1', [row.id]);
+      logger.info('user.signup.reclaim_unverified', { userId: row.id, email });
+      if (!verifiedNow) {
+        sendVerificationEmail(email, code).catch(err =>
+          logger.error('verify.email.send.error', { userId: row.id, err: err.message })
+        );
+        return res.status(201).json({
+          needsVerification: true,
+          email,
+          message: 'Enter the 6-digit code we emailed you to finish signing in.',
+        });
+      }
+      return res.status(201).json({ token: makeToken(refreshed[0]), user: formatUser(refreshed[0]), trial: trialInfo(refreshed[0]) });
+    }
+
+    const trialEnd = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     const { rows } = await pool.query(
       `INSERT INTO users (email, password_hash, trial_started_at, trial_ends_at, subscription_status, email_verified, verification_token, verification_token_expires_at)
        VALUES ($1, $2, NOW(), $3, 'trial', $4, $5, $6) RETURNING *`,
