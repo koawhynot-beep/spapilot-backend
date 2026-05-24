@@ -1348,16 +1348,47 @@ app.put('/api/businesses/me', auth, requireManager, async (req, res) => {
   } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-// User can switch between owner/staff later. Resets business association.
+// User can switch between owner/staff later. Resets business association so the
+// onboarding flow restarts. Also clears staff_id (was left dangling, which could
+// point at a now-unrelated staff row) and revokes the old token.
 app.post('/api/auth/switch-onboarding', auth, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `UPDATE users SET business_id=NULL, business_type=NULL, role=NULL, onboarding_role=NULL
+      `UPDATE users SET business_id=NULL, business_type=NULL, role=NULL, onboarding_role=NULL, staff_id=NULL
        WHERE id=$1 RETURNING *`,
       [req.user.id]
     );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    // Revoke the old token so the stale businessId/role claims can't be reused.
+    if (req.user.jti && req.user.exp) {
+      try {
+        await pool.query(
+          'INSERT INTO token_blacklist (jti, user_id, expires_at) VALUES ($1,$2,$3) ON CONFLICT (jti) DO NOTHING',
+          [req.user.jti, req.user.id, new Date(req.user.exp * 1000)]
+        );
+      } catch (e) { logger.warn('switch.blacklist.skip', { err: e.message }); }
+    }
     res.json({ token: makeToken(rows[0]), user: formatUser(rows[0]) });
-  } catch (err) { logger.error('handler.error', { path: req.path, method: req.method, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { logger.error('switch.onboarding.error', { userId: req.user && req.user.id, err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── Change password (logged in) ──────────────────────────
+app.post('/api/auth/change-password', auth, async (req, res) => {
+  try {
+    const currentPassword = String(req.body?.currentPassword || '');
+    const newPassword = String(req.body?.newPassword || '');
+    if (newPassword.length < 8 || newPassword.length > 128) {
+      return res.status(400).json({ error: 'New password must be 8–128 characters.' });
+    }
+    const { rows } = await pool.query('SELECT password_hash FROM users WHERE id=$1', [req.user.id]);
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    const valid = await bcrypt.compare(currentPassword, rows[0].password_hash);
+    if (!valid) return res.status(401).json({ error: 'Current password is incorrect.' });
+    const hash = await bcrypt.hash(newPassword, 10);
+    await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, req.user.id]);
+    logger.info('password.changed', { userId: req.user.id });
+    res.json({ ok: true, message: 'Password updated.' });
+  } catch (err) { logger.error('change.password.error', { err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Multi-tenancy helper ──────────────────────────────────
