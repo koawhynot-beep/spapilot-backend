@@ -1149,12 +1149,14 @@ app.post('/api/auth/role', auth, async (req, res) => {
     if (!ALLOWED_ROLES.has(String(role))) {
       return res.status(400).json({ error: 'Invalid role' });
     }
-    // This endpoint is for onboarding only. Once the user has a business + role,
-    // role changes go through /api/auth/switch-onboarding which restarts the flow.
-    const { rows: meRows } = await pool.query('SELECT business_id, role FROM users WHERE id=$1', [req.user.id]);
+    const { rows: meRows } = await pool.query('SELECT business_id, role, onboarding_role FROM users WHERE id=$1', [req.user.id]);
     const me = meRows[0];
-    if (me && me.business_id && me.role) {
-      return res.status(403).json({ error: 'Role already set. Use switch-onboarding to change it.' });
+    // A staff-onboarded account must never become a manager — that's the only
+    // promotion we block. Owners/managers may freely toggle their active role
+    // (e.g. a manager previewing the staff view), and brand-new accounts pick
+    // their role for the first time here.
+    if (me && me.onboarding_role === 'staff' && role === 'manager') {
+      return res.status(403).json({ error: 'Staff accounts cannot switch to manager.' });
     }
     // If a staff_id is supplied, the user must have already joined a business and
     // that staff row must belong to that business — otherwise a mid-onboarding
