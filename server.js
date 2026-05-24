@@ -200,7 +200,19 @@ const formatBusiness = (b) => ({
   staffCount: b.staff_count,
   createdAt: b.created_at,
   currency: b.currency || 'USD',
+  accent: b.accent || 'emerald',
+  accentCustom: b.accent_custom || null,
 });
+
+const ALLOWED_ACCENTS = new Set(['emerald', 'blue', 'purple', 'gold', 'red', 'orange', 'pink', 'custom']);
+function clampAccent(a) {
+  const v = String(a || '').toLowerCase();
+  return ALLOWED_ACCENTS.has(v) ? v : 'emerald';
+}
+// Validate a #RRGGBB hex for custom accent.
+function safeHex(h) {
+  return /^#[0-9a-fA-F]{6}$/.test(String(h || '')) ? String(h) : null;
+}
 
 const ALLOWED_CURRENCIES = new Set([
   'USD', 'EUR', 'GBP', 'AUD', 'CAD', 'IDR', 'SGD', 'MYR', 'PHP', 'THB',
@@ -627,6 +639,8 @@ async function initDB() {
     `ALTER TABLE businesses    ADD COLUMN IF NOT EXISTS owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE`,
     `ALTER TABLE businesses    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`,
     `ALTER TABLE businesses    ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'USD'`,
+    `ALTER TABLE businesses    ADD COLUMN IF NOT EXISTS accent TEXT DEFAULT 'emerald'`,
+    `ALTER TABLE businesses    ADD COLUMN IF NOT EXISTS accent_custom TEXT`,
     // Defensive ALTERs for every column in every table — covers prod drift comprehensively
     `ALTER TABLE staff ADD COLUMN IF NOT EXISTS avatar TEXT`,
     `ALTER TABLE staff ADD COLUMN IF NOT EXISTS color TEXT`,
@@ -1339,6 +1353,14 @@ app.put('/api/businesses/me', auth, requireManager, async (req, res) => {
     if (typeof req.body.currency === 'string') {
       params.push(clampCurrency(req.body.currency));
       updates.push(`currency=$${params.length}`);
+    }
+    if (typeof req.body.accent === 'string') {
+      params.push(clampAccent(req.body.accent));
+      updates.push(`accent=$${params.length}`);
+    }
+    if ('accentCustom' in req.body) {
+      params.push(safeHex(req.body.accentCustom));
+      updates.push(`accent_custom=$${params.length}`);
     }
     if (!updates.length) return res.status(400).json({ error: 'Nothing to update' });
     params.push(bid);
