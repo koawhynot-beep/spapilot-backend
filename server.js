@@ -141,22 +141,26 @@ async function sendResetEmail(to, token) {
   return {};
 }
 
-async function sendVerificationEmail(to, token) {
-  const link = `${FRONTEND_URL}?verify_token=${token}`;
+// 6-digit verification code (100000-999999). crypto.randomInt is uniform.
+function genVerificationCode() {
+  return String(crypto.randomInt(100000, 1000000));
+}
+
+async function sendVerificationEmail(to, code) {
   if (!mailer) {
     if (process.env.NODE_ENV === 'production') {
       console.error('Email verification requested but no SMTP configured. Email not sent.');
       return {};
     }
-    console.log(`[DEV] Verification link generated for ${to} (token redacted)`);
-    return { devLink: link };
+    console.log(`[DEV] Verification code for ${to}: ${code}`);
+    return { devCode: code };
   }
   await mailer.sendMail({
     from: process.env.SMTP_FROM || 'Spapilot <noreply@spapilot.app>',
     to,
-    subject: 'Verify your Spapilot email',
-    html: `<p>Welcome to Spapilot! Click the link below to verify your email and finish setting up your account (expires in 24 hours):</p><p><a href="${link}">${link}</a></p><p>If you did not sign up for Spapilot, you can ignore this email.</p>`,
-    text: `Verify your Spapilot email: ${link}\n\nIf you did not sign up, ignore this message.`,
+    subject: `Your Spapilot verification code: ${code}`,
+    html: `<p>Welcome to Spapilot!</p><p>Your verification code is:</p><p style="font-size:28px;font-weight:bold;letter-spacing:4px;">${code}</p><p>Enter it in the app to finish signing up. The code expires in 24 hours.</p><p>If you did not sign up for Spapilot, you can ignore this email.</p>`,
+    text: `Your Spapilot verification code is: ${code}\n\nEnter it in the app to finish signing up. Expires in 24 hours.\n\nIf you did not sign up, ignore this message.`,
   });
   return {};
 }
@@ -811,26 +815,26 @@ app.post('/api/auth/signup', authLimiter, validate(signupSchema), async (req, re
     if (exists.rowCount) return res.status(400).json({ error: 'Email already registered' });
     const hash = await bcrypt.hash(password, 10);
     const trialEnd = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-    const verificationToken = crypto.randomBytes(32).toString('hex');
+    const code = genVerificationCode();
     const verificationExpires = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
     const verifiedNow = !VERIFY_EMAIL_REQUIRED;
     const { rows } = await pool.query(
       `INSERT INTO users (email, password_hash, trial_started_at, trial_ends_at, subscription_status, email_verified, verification_token, verification_token_expires_at)
        VALUES ($1, $2, NOW(), $3, 'trial', $4, $5, $6) RETURNING *`,
-      [email, hash, trialEnd, verifiedNow, verifiedNow ? null : verificationToken, verifiedNow ? null : verificationExpires]
+      [email, hash, trialEnd, verifiedNow, verifiedNow ? null : code, verifiedNow ? null : verificationExpires]
     );
     logger.info('user.signup', { userId: rows[0].id, email, verifyRequired: !verifiedNow });
 
     if (!verifiedNow) {
       // Fire-and-forget email send. Capture errors but don't fail signup — the
       // user can request a resend.
-      sendVerificationEmail(email, verificationToken).catch(err =>
+      sendVerificationEmail(email, code).catch(err =>
         logger.error('verify.email.send.error', { userId: rows[0].id, err: err.message })
       );
       return res.status(201).json({
         needsVerification: true,
         email,
-        message: 'Account created. Check your email to verify and finish signing in.',
+        message: 'Account created. Enter the 6-digit code we emailed you to finish signing in.',
       });
     }
 
@@ -839,21 +843,28 @@ app.post('/api/auth/signup', authLimiter, validate(signupSchema), async (req, re
   } catch (err) { logger.error('signup.error', { err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-// Verify email — takes the token from the link, marks the user verified,
-// returns a real auth token so they're signed in.
+// Verify email by 6-digit code — matched against the supplied email so the code
+// space is scoped per-account (not brute-forceable across all users). Marks the
+// user verified and returns a real auth token so they're signed in.
 app.post('/api/auth/verify-email', authLimiter, async (req, res) => {
   try {
-    const { token } = req.body;
-    if (!token || typeof token !== 'string' || token.length < 16) {
-      return res.status(400).json({ error: 'Invalid verification link' });
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const code = String(req.body?.code || '').trim();
+    if (!email || !/^\d{6}$/.test(code)) {
+      return res.status(400).json({ error: 'Enter the 6-digit code from your email.' });
     }
     const { rows } = await pool.query(
       `SELECT * FROM users
-       WHERE verification_token = $1 AND verification_token_expires_at > NOW()`,
-      [token]
+       WHERE email = $1 AND verification_token = $2 AND verification_token_expires_at > NOW()`,
+      [email, code]
     );
     if (!rows.length) {
-      return res.status(400).json({ error: 'This verification link has expired or already been used. Request a new one.' });
+      // Distinguish already-verified from wrong/expired code for a clearer message.
+      const { rows: u } = await pool.query('SELECT email_verified FROM users WHERE email=$1', [email]);
+      if (u.length && u[0].email_verified) {
+        return res.status(400).json({ error: 'This email is already verified. Please sign in.' });
+      }
+      return res.status(400).json({ error: 'That code is wrong or expired. Request a new one.' });
     }
     const user = rows[0];
     const { rows: updated } = await pool.query(
@@ -866,24 +877,24 @@ app.post('/api/auth/verify-email', authLimiter, async (req, res) => {
   } catch (err) { logger.error('verify.error', { err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-// Resend verification email. Always responds 200 (don't leak which emails exist).
+// Resend verification code. Always responds 200 (don't leak which emails exist).
 app.post('/api/auth/resend-verification', passwordResetLimiter, async (req, res) => {
   try {
     const email = String(req.body?.email || '').trim().toLowerCase();
-    if (!email) return res.json({ message: 'If that email exists, we sent a new link.' });
+    if (!email) return res.json({ message: 'If that email exists, we sent a new code.' });
     const { rows } = await pool.query('SELECT id, email_verified FROM users WHERE email=$1', [email]);
     if (rows.length && !rows[0].email_verified) {
-      const token = crypto.randomBytes(32).toString('hex');
+      const code = genVerificationCode();
       const expires = new Date(Date.now() + 24 * 60 * 60 * 1000);
       await pool.query(
         'UPDATE users SET verification_token=$1, verification_token_expires_at=$2 WHERE id=$3',
-        [token, expires, rows[0].id]
+        [code, expires, rows[0].id]
       );
-      sendVerificationEmail(email, token).catch(err =>
+      sendVerificationEmail(email, code).catch(err =>
         logger.error('verify.email.resend.error', { userId: rows[0].id, err: err.message })
       );
     }
-    res.json({ message: 'If that email exists, we sent a new link.' });
+    res.json({ message: 'If that email exists, we sent a new code.' });
   } catch (err) { logger.error('resend.error', { err: err.message, stack: err.stack }); res.status(500).json({ error: 'Internal server error' }); }
 });
 
