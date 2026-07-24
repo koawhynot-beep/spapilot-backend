@@ -36,10 +36,10 @@ if (!process.env.ALLOWED_ORIGINS && process.env.NODE_ENV === 'production') {
   process.exit(1);
 }
 
-const JWT_SECRET = process.env.JWT_SECRET || 'stockpilot-dev-secret-change-me';
+const JWT_SECRET = process.env.JWT_SECRET || 'mitrasamadi-dev-secret-change-me';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://spapilot-app.onrender.com';
 const APP_URL = process.env.APP_URL || FRONTEND_URL;
-const EMAIL_FROM = process.env.EMAIL_FROM || 'StockPilot <onboarding@resend.dev>';
+const EMAIL_FROM = process.env.EMAIL_FROM || 'Mitra Samadi <onboarding@resend.dev>';
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 if (!resend) {
   logger.warn('email.disabled', { reason: 'RESEND_API_KEY not set; emails will be logged only' });
@@ -114,6 +114,15 @@ const shopSchema = z.object({
 const movementSchema = z.object({
   type: z.enum(['in', 'out', 'adjust']),
   qty: z.coerce.number().int().min(0),
+  occurredAt: z.string().datetime().optional(),
+  note: z.string().trim().max(500).optional().default(''),
+});
+
+const transferSchema = z.object({
+  sku: z.string().trim().min(1).max(100),
+  fromShopId: z.coerce.number().int().positive(),
+  toShopId: z.coerce.number().int().positive(),
+  qty: z.coerce.number().int().positive(),
   occurredAt: z.string().datetime().optional(),
   note: z.string().trim().max(500).optional().default(''),
 });
@@ -332,9 +341,9 @@ async function initDB() {
   }
 
   // ── One-time migration: wipe old SpaPilot schema ─────────
-  // If stock_items doesn't exist yet → first StockPilot deploy → nuke everything.
+  // If stock_items doesn't exist yet → first Mitra Samadi deploy → nuke everything.
   // After first successful run, stock_items exists and this is skipped forever.
-  // Detect old SpaPilot schema by presence of businesses.type column (StockPilot has no such column)
+  // Detect old SpaPilot schema by presence of businesses.type column (Mitra Samadi has no such column)
   const { rows: schemaCheck } = await pool.query(`
     SELECT 1 FROM information_schema.columns
     WHERE table_schema='public' AND table_name='businesses' AND column_name='type'
@@ -541,7 +550,7 @@ async function initDB() {
 }
 
 // ── Health ────────────────────────────────────────────────
-app.get('/health', (req, res) => res.json({ status: 'ok', app: 'stockpilot' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', app: 'mitrasamadi' }));
 
 // ── Auth: Signup as owner (creates business) ──────────────
 app.post('/api/auth/signup', authLimiter, validate(signupSchema), async (req, res) => {
@@ -761,14 +770,14 @@ async function issueVerificationEmail(userId, email) {
   );
   await sendEmail({
     to: email,
-    subject: `${code} is your StockPilot verification code`,
+    subject: `${code} is your Mitra Samadi verification code`,
     html: codeEmailHtml({
       heading: 'Verify your email',
-      intro: 'Welcome to StockPilot! Enter this code in the app to confirm your email address.',
+      intro: 'Welcome to Mitra Samadi! Enter this code in the app to confirm your email address.',
       code,
       ttlMinutes: 15,
     }),
-    text: `Your StockPilot verification code: ${code}\n\nExpires in 15 minutes.`,
+    text: `Your Mitra Samadi verification code: ${code}\n\nExpires in 15 minutes.`,
   });
   return code;
 }
@@ -851,14 +860,14 @@ app.post('/api/auth/forgot-password', authLimiter, validate(forgotSchema), async
       try {
         await sendEmail({
           to: user.email,
-          subject: `${code} is your StockPilot reset code`,
+          subject: `${code} is your Mitra Samadi reset code`,
           html: codeEmailHtml({
             heading: 'Reset your password',
             intro: 'Enter this code in the app to set a new password.',
             code,
             ttlMinutes: 15,
           }),
-          text: `Your StockPilot password reset code: ${code}\n\nExpires in 15 minutes. If you didn't request this, ignore this email.`,
+          text: `Your Mitra Samadi password reset code: ${code}\n\nExpires in 15 minutes. If you didn't request this, ignore this email.`,
         });
       } catch (err) {
         logger.error('forgot.send.error', { err: err.message, userId: user.id });
@@ -975,7 +984,7 @@ app.get('/api/auth/export-data', auth, async (req, res) => {
       businessId ? pool.query('SELECT s.* FROM stock_items s JOIN shops sh ON sh.id=s.shop_id WHERE sh.business_id=$1', [businessId]) : { rows: [] },
       businessId ? pool.query('SELECT * FROM invite_codes WHERE business_id=$1', [businessId]) : { rows: [] },
     ]);
-    res.setHeader('Content-Disposition', `attachment; filename="stockpilot-data-${userId}-${Date.now()}.json"`);
+    res.setHeader('Content-Disposition', `attachment; filename="mitra-samadi-data-${userId}-${Date.now()}.json"`);
     res.json({
       exportedAt: new Date().toISOString(),
       user: user.rows[0] || null,
@@ -1075,11 +1084,139 @@ app.get('/api/shops/:shopId/stock', auth, async (req, res) => {
       params.push(Number(groupParam));
       sql += ` AND group_id=$${params.length}`;
     }
-    sql += ' ORDER BY position ASC, name ASC LIMIT 1000';
+    if (req.query.fabric) {
+      params.push(req.query.fabric);
+      sql += ` AND fabric = $${params.length}`;
+    }
+    if (req.query.color) {
+      params.push(req.query.color);
+      sql += ` AND color = $${params.length}`;
+    }
+    if (req.query.size) {
+      params.push(req.query.size);
+      sql += ` AND size = $${params.length}`;
+    }
+    sql += ' ORDER BY position ASC, name ASC LIMIT 5000';
     const { rows } = await pool.query(sql, params);
     res.json(rows.map(formatStock));
   } catch (err) {
     logger.error('stock.list.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Aggregated stock across all shops in the business — one row per SKU with
+// per-shop qty and a grand total. Powers the master overview page.
+app.get('/api/business/stock-overview', auth, async (req, res) => {
+  try {
+    const businessId = req.user.businessId;
+    if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
+
+    const params = [businessId];
+    let where = "WHERE s.business_id = $1 AND COALESCE(si.sku, '') <> ''";
+
+    const search = (req.query.search || '').trim().toLowerCase();
+    if (search) {
+      params.push(`%${search}%`);
+      const p = `$${params.length}`;
+      where += ` AND (LOWER(si.name) LIKE ${p} OR LOWER(si.sku) LIKE ${p} OR LOWER(si.fabric) LIKE ${p} OR LOWER(si.color) LIKE ${p} OR LOWER(si.category) LIKE ${p} OR LOWER(si.size) LIKE ${p})`;
+    }
+    if (req.query.fabric) { params.push(req.query.fabric); where += ` AND si.fabric = $${params.length}`; }
+    if (req.query.color)  { params.push(req.query.color);  where += ` AND si.color  = $${params.length}`; }
+    if (req.query.size)   { params.push(req.query.size);   where += ` AND si.size   = $${params.length}`; }
+
+    const sql = `
+      SELECT
+        si.sku,
+        MIN(si.name)     AS name,
+        MIN(si.category) AS style,
+        MIN(si.fabric)   AS fabric,
+        MIN(si.color)    AS color,
+        MIN(si.size)     AS size,
+        MIN(si.price)::float8 AS price,
+        json_object_agg(s.name, si.qty) AS by_shop,
+        SUM(si.qty)::int AS total
+      FROM stock_items si
+      JOIN shops s ON s.id = si.shop_id
+      ${where}
+      GROUP BY si.sku
+      ORDER BY MIN(si.name) ASC
+      LIMIT 5000
+    `;
+    const { rows } = await pool.query(sql, params);
+
+    const { rows: shopRows } = await pool.query(
+      'SELECT name FROM shops WHERE business_id=$1 ORDER BY id',
+      [businessId]
+    );
+
+    res.json({
+      shops: shopRows.map(r => r.name),
+      items: rows.map(r => ({
+        sku: r.sku,
+        name: r.name,
+        style: r.style,
+        fabric: r.fabric,
+        color: r.color,
+        size: r.size,
+        price: Number(r.price) || 0,
+        byShop: r.by_shop || {},
+        total: r.total,
+      })),
+    });
+  } catch (err) {
+    logger.error('stock.overview.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Business-wide facet values — union of distinct fabric/color/size across all shops.
+app.get('/api/business/facets', auth, async (req, res) => {
+  try {
+    const businessId = req.user.businessId;
+    if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
+    const { rows } = await pool.query(
+      `SELECT
+         COALESCE(ARRAY(
+           SELECT DISTINCT fabric FROM stock_items si JOIN shops s ON s.id=si.shop_id
+           WHERE s.business_id=$1 AND fabric <> '' ORDER BY fabric
+         ), '{}') AS fabrics,
+         COALESCE(ARRAY(
+           SELECT DISTINCT color  FROM stock_items si JOIN shops s ON s.id=si.shop_id
+           WHERE s.business_id=$1 AND color  <> '' ORDER BY color
+         ), '{}') AS colors,
+         COALESCE(ARRAY(
+           SELECT DISTINCT size   FROM stock_items si JOIN shops s ON s.id=si.shop_id
+           WHERE s.business_id=$1 AND size   <> '' ORDER BY size
+         ), '{}') AS sizes`,
+      [businessId]
+    );
+    const r = rows[0] || { fabrics: [], colors: [], sizes: [] };
+    res.json({ fabrics: r.fabrics, colors: r.colors, sizes: r.sizes });
+  } catch (err) {
+    logger.error('business.facets.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Distinct fabric/color/size for filter dropdowns.
+// Returns arrays sorted alphabetically, filtering out empty strings.
+app.get('/api/shops/:shopId/facets', auth, async (req, res) => {
+  try {
+    if (!await shopGuard(req.params.shopId, req.user.businessId)) {
+      return res.status(404).json({ error: 'Shop not found' });
+    }
+    const { rows } = await pool.query(
+      `SELECT
+         COALESCE(ARRAY(SELECT DISTINCT fabric FROM stock_items WHERE shop_id=$1 AND fabric <> '' ORDER BY fabric), '{}') AS fabrics,
+         COALESCE(ARRAY(SELECT DISTINCT color  FROM stock_items WHERE shop_id=$1 AND color  <> '' ORDER BY color),  '{}') AS colors,
+         COALESCE(ARRAY(SELECT DISTINCT size   FROM stock_items WHERE shop_id=$1 AND size   <> '' ORDER BY size),   '{}') AS sizes`,
+      [req.params.shopId]
+    );
+    const r = rows[0] || { fabrics: [], colors: [], sizes: [] };
+    res.json({ fabrics: r.fabrics, colors: r.colors, sizes: r.sizes });
+  } catch (err) {
+    logger.error('stock.facets.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1249,6 +1386,111 @@ app.post('/api/stock/:id/movements', auth, validate(movementSchema), async (req,
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     logger.error('movement.create.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Transfer stock from one shop to another (typically Office → shop).
+// Decrements source item, increments destination item, logs both movements.
+// If the destination shop doesn't have that SKU yet, creates it.
+app.post('/api/transfers', auth, validate(transferSchema), async (req, res) => {
+  const { sku, fromShopId, toShopId, qty, occurredAt, note } = req.body;
+  if (fromShopId === toShopId) return res.status(400).json({ error: 'Source and destination must differ' });
+
+  const client = await pool.connect();
+  try {
+    // Both shops must belong to the caller's business
+    const { rows: shopRows } = await client.query(
+      'SELECT id, name FROM shops WHERE business_id=$1 AND id = ANY($2)',
+      [req.user.businessId, [fromShopId, toShopId]]
+    );
+    if (shopRows.length < 2) return res.status(404).json({ error: 'One or both shops not found' });
+    if (!await ensureStaffStockPerm(req, 'edit')) {
+      return res.status(403).json({ error: 'You do not have permission to record transfers' });
+    }
+    const fromShop = shopRows.find(s => s.id === Number(fromShopId));
+    const toShop   = shopRows.find(s => s.id === Number(toShopId));
+
+    await client.query('BEGIN');
+
+    // Lock the source row for update
+    const { rows: fromRows } = await client.query(
+      'SELECT * FROM stock_items WHERE shop_id=$1 AND sku=$2 FOR UPDATE',
+      [fromShopId, sku]
+    );
+    if (!fromRows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: `SKU ${sku} not found in ${fromShop.name}` });
+    }
+    const srcItem = fromRows[0];
+    if (srcItem.qty < qty) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Not enough stock in ${fromShop.name} (have ${srcItem.qty}, need ${qty})` });
+    }
+
+    // Find or create destination row
+    const { rows: toRows } = await client.query(
+      'SELECT * FROM stock_items WHERE shop_id=$1 AND sku=$2 FOR UPDATE',
+      [toShopId, sku]
+    );
+    let dstItem;
+    if (toRows.length) {
+      dstItem = toRows[0];
+    } else {
+      const { rows: posRows } = await client.query(
+        'SELECT COALESCE(MAX(position), -1) + 1 AS p FROM stock_items WHERE shop_id=$1',
+        [toShopId]
+      );
+      const { rows: created } = await client.query(
+        `INSERT INTO stock_items (shop_id, name, category, fabric, print, size, color, sku, brand, qty, threshold, supplier, notes, position, image_url, price)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,$11,$12,$13,$14,$15) RETURNING *`,
+        [toShopId, srcItem.name, srcItem.category, srcItem.fabric, srcItem.print, srcItem.size, srcItem.color, srcItem.sku, srcItem.brand, srcItem.threshold, srcItem.supplier, '', posRows[0].p, srcItem.image_url, srcItem.price]
+      );
+      dstItem = created[0];
+    }
+
+    const occurred = occurredAt ? new Date(occurredAt) : new Date();
+    const newSrcQty = srcItem.qty - qty;
+    const newDstQty = dstItem.qty + qty;
+    const noteFrom = note || `Transfer to ${toShop.name}`;
+    const noteTo   = note || `Transfer from ${fromShop.name}`;
+
+    // Update quantities
+    await client.query(
+      'UPDATE stock_items SET qty=$1, updated_at=NOW() WHERE id=$2',
+      [newSrcQty, srcItem.id]
+    );
+    await client.query(
+      'UPDATE stock_items SET qty=$1, updated_at=NOW() WHERE id=$2',
+      [newDstQty, dstItem.id]
+    );
+
+    // Log movements
+    await client.query(
+      `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note)
+       VALUES ($1,$2,$3,'out',$4,$5,$6,$7)`,
+      [srcItem.id, fromShopId, req.user.id, -qty, newSrcQty, occurred, noteFrom]
+    );
+    await client.query(
+      `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note)
+       VALUES ($1,$2,$3,'in',$4,$5,$6,$7)`,
+      [dstItem.id, toShopId, req.user.id, qty, newDstQty, occurred, noteTo]
+    );
+
+    await client.query('COMMIT');
+
+    res.status(201).json({
+      from: { shopId: fromShopId, shopName: fromShop.name, sku, newQty: newSrcQty },
+      to:   { shopId: toShopId,   shopName: toShop.name,   sku, newQty: newDstQty },
+      qty,
+      occurredAt: occurred.toISOString(),
+      note,
+    });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    logger.error('transfer.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
   } finally {
     client.release();
@@ -1631,5 +1873,5 @@ app.use((err, req, res, next) => {
 // ── Start ─────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 initDB()
-  .then(() => app.listen(PORT, () => logger.info('server.started', { port: PORT, app: 'stockpilot' })))
+  .then(() => app.listen(PORT, () => logger.info('server.started', { port: PORT, app: 'mitrasamadi' })))
   .catch(err => { logger.error('db.init.failed', { err: err.message, stack: err.stack }); process.exit(1); });
