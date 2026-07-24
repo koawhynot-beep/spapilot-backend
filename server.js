@@ -92,6 +92,10 @@ const signupSchema = z.object({
   email: emailSchema,
   password: passwordSchema,
   businessName: z.string().trim().min(1).max(120),
+  accessCode: z.string().max(128).optional().default(''),
+});
+const accessSchema = z.object({
+  code: z.string().max(128),
 });
 const signupWithCodeSchema = z.object({
   email: emailSchema,
@@ -243,20 +247,20 @@ const formatInvite = (i) => ({
   createdAt: i.created_at,
 });
 
-const trialInfo = (u) => {
-  const now = new Date();
-  const ends = u.trial_ends_at ? new Date(u.trial_ends_at) : null;
-  const daysRemaining = ends ? Math.max(0, Math.ceil((ends - now) / (24 * 60 * 60 * 1000))) : 0;
-  const expired = ends ? now > ends : true;
-  const status = u.subscription_status || 'trial';
-  return {
-    subscriptionStatus: status,
-    trialEndsAt: u.trial_ends_at,
-    daysRemaining,
-    expired: expired && status !== 'active',
-    isPaid: status === 'active',
-  };
-};
+// Private tool — everyone is treated as an active, never-expiring account.
+const trialInfo = () => ({
+  subscriptionStatus: 'active',
+  trialEndsAt: null,
+  daysRemaining: null,
+  expired: false,
+  isPaid: true,
+});
+
+// Shared site access code. When ACCESS_CODE env var is set, the front door
+// requires it. If unset (e.g. before it's configured), the gate is disabled
+// so we never lock ourselves out.
+const ACCESS_CODE = process.env.ACCESS_CODE || '';
+const accessOk = (code) => !ACCESS_CODE || (typeof code === 'string' && code === ACCESS_CODE);
 
 // ── Auth middleware ───────────────────────────────────────
 const TRIAL_EXPIRED_ALLOWED = ['/api/auth/', '/api/billing/', '/health'];
@@ -274,23 +278,8 @@ const auth = async (req, res, next) => {
       if (rowCount) return res.status(401).json({ error: 'Token revoked' });
     }
     req.user = decoded;
-
-    // Trial enforcement on mutations
-    const isMutating = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method);
-    const allowed = TRIAL_EXPIRED_ALLOWED.some(p => req.path.startsWith(p));
-    if (isMutating && !allowed) {
-      const { rows } = await pool.query(
-        'SELECT subscription_status, trial_ends_at FROM users WHERE id=$1',
-        [decoded.id]
-      );
-      if (rows.length) {
-        const status = rows[0].subscription_status;
-        const expired = rows[0].trial_ends_at && new Date(rows[0].trial_ends_at) < new Date();
-        if (status !== 'active' && expired) {
-          return res.status(402).json({ error: 'Your trial has ended. Subscribe to continue.', code: 'TRIAL_EXPIRED' });
-        }
-      }
-    }
+    // Trial/subscription enforcement removed — this is a private tool for one
+    // family business, not a commercial SaaS. All authenticated users have full access.
     next();
   } catch (err) {
     res.status(401).json({ error: 'Invalid token' });
@@ -552,11 +541,19 @@ async function initDB() {
 // ── Health ────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', app: 'mitrasamadi' }));
 
+// ── Auth: check the shared site access code (front-door gate) ──
+app.post('/api/auth/verify-access', authLimiter, validate(accessSchema), (req, res) => {
+  res.json({ ok: accessOk(req.body.code) });
+});
+
 // ── Auth: Signup as owner (creates business) ──────────────
 app.post('/api/auth/signup', authLimiter, validate(signupSchema), async (req, res) => {
   const client = await pool.connect();
   try {
-    const { email, password, businessName } = req.body;
+    const { email, password, businessName, accessCode } = req.body;
+    if (!accessOk(accessCode)) {
+      return res.status(403).json({ error: 'Invalid access code' });
+    }
     await client.query('BEGIN');
     const existing = await client.query('SELECT id FROM users WHERE email=$1', [email]);
     if (existing.rowCount) {
@@ -564,11 +561,10 @@ app.post('/api/auth/signup', authLimiter, validate(signupSchema), async (req, re
       return res.status(400).json({ error: 'Email already registered' });
     }
     const hash = await bcrypt.hash(password, 10);
-    const trialEnd = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     const userResult = await client.query(
       `INSERT INTO users (email, password_hash, role, trial_started_at, trial_ends_at, subscription_status)
-       VALUES ($1,$2,'owner',NOW(),$3,'trial') RETURNING *`,
-      [email, hash, trialEnd]
+       VALUES ($1,$2,'owner',NOW(),NULL,'active') RETURNING *`,
+      [email, hash]
     );
     const user = userResult.rows[0];
     const bizResult = await client.query(
