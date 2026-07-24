@@ -546,6 +546,61 @@ app.post('/api/auth/verify-access', authLimiter, validate(accessSchema), (req, r
   res.json({ ok: accessOk(req.body.code) });
 });
 
+// Single shared "master" account model. There is ONE dataset. Entering the
+// correct code logs you into it — no email, no signup, no separate accounts.
+// Everyone with the code controls the same business.
+async function ensureMasterAccount(client) {
+  let masterUser = (await client.query(
+    `SELECT * FROM users WHERE role='owner' ORDER BY id ASC LIMIT 1`
+  )).rows[0];
+  if (!masterUser) {
+    const randomPw = crypto.randomBytes(24).toString('hex');
+    const hash = await bcrypt.hash(randomPw, 10);
+    masterUser = (await client.query(
+      `INSERT INTO users (email, password_hash, role, email_verified, subscription_status, trial_ends_at)
+       VALUES ($1,$2,'owner',TRUE,'active',NULL) RETURNING *`,
+      ['master@mitrasamadi.local', hash]
+    )).rows[0];
+  }
+  let biz = (await client.query(
+    `SELECT * FROM businesses ORDER BY id ASC LIMIT 1`
+  )).rows[0];
+  if (!biz) {
+    biz = (await client.query(
+      `INSERT INTO businesses (name, owner_id) VALUES ($1,$2) RETURNING *`,
+      ['Mitra Samadi', masterUser.id]
+    )).rows[0];
+  }
+  if (masterUser.business_id !== biz.id) {
+    masterUser = (await client.query(
+      `UPDATE users SET business_id=$1 WHERE id=$2 RETURNING *`,
+      [biz.id, masterUser.id]
+    )).rows[0];
+  }
+  return { masterUser, biz };
+}
+
+// ── Auth: code-only login → the shared master account ──
+app.post('/api/auth/access-login', authLimiter, validate(accessSchema), async (req, res) => {
+  if (!accessOk(req.body.code)) {
+    return res.status(403).json({ error: 'Invalid access code' });
+  }
+  const client = await pool.connect();
+  try {
+    const { masterUser, biz } = await ensureMasterAccount(client);
+    res.json({
+      token: makeToken(masterUser),
+      user: formatUser(masterUser),
+      business: { id: biz.id, name: biz.name },
+    });
+  } catch (err) {
+    logger.error('access-login.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
 // ── Auth: Signup as owner (creates business) ──────────────
 app.post('/api/auth/signup', authLimiter, validate(signupSchema), async (req, res) => {
   const client = await pool.connect();
