@@ -1384,6 +1384,59 @@ app.patch('/api/stock/:id/qty', auth, async (req, res) => {
   }
 });
 
+// ── Barcode / scan-to-sell ────────────────────────────────
+// A scanner types the code and presses Enter. Given a shop + code, find the
+// matching item, drop its quantity by 1, and record it as a SALE (so it feeds
+// the "sold" figures — distinct from transfers/adjustments).
+app.post('/api/shops/:shopId/sell', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!await shopGuard(req.params.shopId, req.user.businessId)) {
+      return res.status(404).json({ error: 'Shop not found' });
+    }
+    const code = String(req.body.code || '').trim();
+    const qtySold = Math.max(1, Math.min(999, parseInt(req.body.qty, 10) || 1));
+    if (!code) return res.status(400).json({ error: 'No barcode/code provided' });
+
+    // Match on SKU first (that's what the barcode encodes); fall back to name.
+    const { rows: found } = await client.query(
+      `SELECT * FROM stock_items
+       WHERE shop_id=$1 AND (LOWER(sku)=LOWER($2) OR LOWER(name)=LOWER($2))
+       ORDER BY (LOWER(sku)=LOWER($2)) DESC
+       LIMIT 1`,
+      [req.params.shopId, code]
+    );
+    if (!found.length) {
+      return res.status(404).json({ error: `No item with code "${code}" in this shop` });
+    }
+    const item = found[0];
+    if (item.qty <= 0) {
+      return res.status(409).json({ error: `"${item.name}" is already out of stock`, item: formatStock(item) });
+    }
+    const newQty = Math.max(0, item.qty - qtySold);
+    const change = newQty - item.qty; // negative
+
+    await client.query('BEGIN');
+    const { rows: upd } = await client.query(
+      `UPDATE stock_items SET qty=$1, last_sold_at=NOW(), updated_at=NOW() WHERE id=$2 RETURNING *`,
+      [newQty, item.id]
+    );
+    await client.query(
+      `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note)
+       VALUES ($1,$2,$3,'sale',$4,$5,NOW(),'barcode sale')`,
+      [item.id, item.shop_id, req.user.id, change, newQty]
+    );
+    await client.query('COMMIT');
+    res.json({ ok: true, item: formatStock(upd[0]), soldQty: qtySold });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    logger.error('stock.sell.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
 app.delete('/api/stock/:id', auth, async (req, res) => {
   try {
     const { rows: own } = await pool.query(
