@@ -259,8 +259,8 @@ const trialInfo = () => ({
 // Shared site access code. When ACCESS_CODE env var is set, the front door
 // requires it. If unset (e.g. before it's configured), the gate is disabled
 // so we never lock ourselves out.
-const ACCESS_CODE = process.env.ACCESS_CODE || '';
-const accessOk = (code) => !ACCESS_CODE || (typeof code === 'string' && code === ACCESS_CODE);
+const ACCESS_CODE = (process.env.ACCESS_CODE || '').trim();
+const accessOk = (code) => !ACCESS_CODE || (typeof code === 'string' && code.trim() === ACCESS_CODE);
 
 // ── Auth middleware ───────────────────────────────────────
 const TRIAL_EXPIRED_ALLOWED = ['/api/auth/', '/api/billing/', '/health'];
