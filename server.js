@@ -1147,7 +1147,23 @@ app.get('/api/shops/:shopId/stock', auth, async (req, res) => {
       params.push(req.query.size);
       sql += ` AND size = $${params.length}`;
     }
-    sql += ' ORDER BY position ASC, name ASC LIMIT 5000';
+    if (req.query.style) {
+      params.push(req.query.style);
+      sql += ` AND category = $${params.length}`;
+    }
+    // Default browse order is fabric → colour → style (how the owner reads her
+    // stock). 'custom' preserves the manual drag-to-reorder positions.
+    const ORDERS = {
+      'fabric-color': "fabric ASC, color ASC, category ASC, size ASC",
+      'color':        "color ASC, category ASC, fabric ASC, size ASC",
+      'style':        "category ASC, color ASC, size ASC",
+      'name':         "name ASC",
+      'custom':       "position ASC, name ASC",
+      'qty-asc':      "qty ASC, name ASC",
+      'qty-desc':     "qty DESC, name ASC",
+    };
+    const orderBy = ORDERS[req.query.sort] || ORDERS['fabric-color'];
+    sql += ` ORDER BY ${orderBy} LIMIT 5000`;
     const { rows } = await pool.query(sql, params);
     res.json(rows.map(formatStock));
   } catch (err) {
@@ -1175,6 +1191,19 @@ app.get('/api/business/stock-overview', auth, async (req, res) => {
     if (req.query.fabric) { params.push(req.query.fabric); where += ` AND si.fabric = $${params.length}`; }
     if (req.query.color)  { params.push(req.query.color);  where += ` AND si.color  = $${params.length}`; }
     if (req.query.size)   { params.push(req.query.size);   where += ` AND si.size   = $${params.length}`; }
+    if (req.query.style)  { params.push(req.query.style);  where += ` AND si.category = $${params.length}`; }
+
+    // Default browse order is fabric → colour → style, which is how the shop
+    // owner reads her stock. Other orders are opt-in.
+    const ORDERS = {
+      'fabric-color': 'MIN(si.fabric) ASC, MIN(si.color) ASC, MIN(si.category) ASC, MIN(si.size) ASC',
+      'color':        'MIN(si.color) ASC, MIN(si.category) ASC, MIN(si.fabric) ASC, MIN(si.size) ASC',
+      'style':        'MIN(si.category) ASC, MIN(si.color) ASC, MIN(si.size) ASC',
+      'name':         'MIN(si.name) ASC',
+      'total-desc':   'SUM(si.qty) DESC, MIN(si.name) ASC',
+      'total-asc':    'SUM(si.qty) ASC, MIN(si.name) ASC',
+    };
+    const orderBy = ORDERS[req.query.sort] || ORDERS['fabric-color'];
 
     const sql = `
       SELECT
@@ -1191,7 +1220,7 @@ app.get('/api/business/stock-overview', auth, async (req, res) => {
       JOIN shops s ON s.id = si.shop_id
       ${where}
       GROUP BY si.sku
-      ORDER BY MIN(si.name) ASC
+      ORDER BY ${orderBy}
       LIMIT 5000
     `;
     const { rows } = await pool.query(sql, params);
@@ -1239,11 +1268,15 @@ app.get('/api/business/facets', auth, async (req, res) => {
          COALESCE(ARRAY(
            SELECT DISTINCT size   FROM stock_items si JOIN shops s ON s.id=si.shop_id
            WHERE s.business_id=$1 AND size   <> '' ORDER BY size
-         ), '{}') AS sizes`,
+         ), '{}') AS sizes,
+         COALESCE(ARRAY(
+           SELECT DISTINCT category FROM stock_items si JOIN shops s ON s.id=si.shop_id
+           WHERE s.business_id=$1 AND category <> '' ORDER BY category
+         ), '{}') AS styles`,
       [businessId]
     );
-    const r = rows[0] || { fabrics: [], colors: [], sizes: [] };
-    res.json({ fabrics: r.fabrics, colors: r.colors, sizes: r.sizes });
+    const r = rows[0] || { fabrics: [], colors: [], sizes: [], styles: [] };
+    res.json({ fabrics: r.fabrics, colors: r.colors, sizes: r.sizes, styles: r.styles });
   } catch (err) {
     logger.error('business.facets.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
@@ -1261,11 +1294,12 @@ app.get('/api/shops/:shopId/facets', auth, async (req, res) => {
       `SELECT
          COALESCE(ARRAY(SELECT DISTINCT fabric FROM stock_items WHERE shop_id=$1 AND fabric <> '' ORDER BY fabric), '{}') AS fabrics,
          COALESCE(ARRAY(SELECT DISTINCT color  FROM stock_items WHERE shop_id=$1 AND color  <> '' ORDER BY color),  '{}') AS colors,
-         COALESCE(ARRAY(SELECT DISTINCT size   FROM stock_items WHERE shop_id=$1 AND size   <> '' ORDER BY size),   '{}') AS sizes`,
+         COALESCE(ARRAY(SELECT DISTINCT size   FROM stock_items WHERE shop_id=$1 AND size   <> '' ORDER BY size),   '{}') AS sizes,
+         COALESCE(ARRAY(SELECT DISTINCT category FROM stock_items WHERE shop_id=$1 AND category <> '' ORDER BY category), '{}') AS styles`,
       [req.params.shopId]
     );
-    const r = rows[0] || { fabrics: [], colors: [], sizes: [] };
-    res.json({ fabrics: r.fabrics, colors: r.colors, sizes: r.sizes });
+    const r = rows[0] || { fabrics: [], colors: [], sizes: [], styles: [] };
+    res.json({ fabrics: r.fabrics, colors: r.colors, sizes: r.sizes, styles: r.styles });
   } catch (err) {
     logger.error('stock.facets.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
