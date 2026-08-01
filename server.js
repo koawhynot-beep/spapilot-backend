@@ -1217,6 +1217,7 @@ app.get('/api/business/stock-overview', auth, async (req, res) => {
         MIN(si.color)    AS color,
         MIN(si.size)     AS size,
         MIN(si.price)::float8 AS price,
+        MIN(si.threshold)::int AS threshold,
         json_object_agg(s.name, si.qty) AS by_shop,
         SUM(si.qty)::int AS total
       FROM stock_items si
@@ -1243,12 +1244,129 @@ app.get('/api/business/stock-overview', auth, async (req, res) => {
         color: r.color,
         size: r.size,
         price: Number(r.price) || 0,
+        threshold: Number(r.threshold) || 0,
         byShop: r.by_shop || {},
         total: r.total,
       })),
     });
   } catch (err) {
     logger.error('stock.overview.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Best sellers across the whole business.
+// A "sale" is a barcode scan (type 'sale') or a manually logged sell-out (type 'out').
+// Trend compares the chosen window against the window immediately before it.
+app.get('/api/business/best-sellers', auth, async (req, res) => {
+  try {
+    const businessId = req.user.businessId;
+    if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
+
+    const days = Math.min(3650, Math.max(1, parseInt(req.query.days, 10) || 365));
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 10));
+    const now = new Date();
+    const start = new Date(now.getTime() - days * 86400000);
+    const prevStart = new Date(now.getTime() - days * 2 * 86400000);
+
+    const sql = `
+      WITH sales AS (
+        SELECT m.item_id, m.occurred_at, -m.qty_change AS units
+        FROM stock_movements m
+        JOIN stock_items si ON si.id = m.item_id
+        JOIN shops s ON s.id = si.shop_id
+        WHERE s.business_id = $1
+          AND m.type IN ('sale', 'out')
+          AND m.qty_change < 0
+          AND m.occurred_at >= $3
+      ),
+      current AS (
+        SELECT si.sku,
+               MIN(si.name)     AS name,
+               MIN(si.category) AS style,
+               MIN(si.fabric)   AS fabric,
+               MIN(si.color)    AS color,
+               MIN(si.size)     AS size,
+               SUM(sa.units)::int AS units,
+               SUM(sa.units * COALESCE(si.price, 0))::float8 AS revenue
+        FROM sales sa
+        JOIN stock_items si ON si.id = sa.item_id
+        WHERE sa.occurred_at >= $2 AND COALESCE(si.sku, '') <> ''
+        GROUP BY si.sku
+      ),
+      previous AS (
+        SELECT si.sku, SUM(sa.units)::int AS units
+        FROM sales sa
+        JOIN stock_items si ON si.id = sa.item_id
+        WHERE sa.occurred_at < $2 AND COALESCE(si.sku, '') <> ''
+        GROUP BY si.sku
+      )
+      SELECT c.*, COALESCE(p.units, 0) AS prev_units
+      FROM current c
+      LEFT JOIN previous p ON p.sku = c.sku
+      ORDER BY c.units DESC, c.revenue DESC
+      LIMIT $4
+    `;
+    const { rows } = await pool.query(sql, [businessId, start, prevStart, limit]);
+
+    res.json({
+      days,
+      items: rows.map(r => {
+        const units = Number(r.units) || 0;
+        const prev = Number(r.prev_units) || 0;
+        return {
+          sku: r.sku,
+          name: r.name,
+          style: r.style || '',
+          fabric: r.fabric || '',
+          color: r.color || '',
+          size: r.size || '',
+          units,
+          revenue: Number(r.revenue) || 0,
+          prevUnits: prev,
+          // null when there is nothing to compare against yet.
+          trend: prev === 0 ? (units > 0 ? null : 0) : (units - prev) / prev,
+        };
+      }),
+    });
+  } catch (err) {
+    logger.error('business.bestsellers.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Recent stock activity across every shop — powers the Overview activity feed.
+app.get('/api/business/activity', auth, async (req, res) => {
+  try {
+    const businessId = req.user.businessId;
+    if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 15));
+
+    const { rows } = await pool.query(
+      `SELECT m.id, m.type, m.qty_change, m.qty_after, m.occurred_at, m.note,
+              si.name AS item_name, si.sku, s.name AS shop_name
+       FROM stock_movements m
+       JOIN stock_items si ON si.id = m.item_id
+       JOIN shops s ON s.id = si.shop_id
+       WHERE s.business_id = $1
+       ORDER BY m.occurred_at DESC
+       LIMIT $2`,
+      [businessId, limit]
+    );
+
+    res.json(rows.map(r => ({
+      id: r.id,
+      type: r.type,
+      qtyChange: r.qty_change,
+      qtyAfter: r.qty_after,
+      occurredAt: r.occurred_at,
+      note: r.note || '',
+      itemName: r.item_name,
+      sku: r.sku || '',
+      shopName: r.shop_name,
+    })));
+  } catch (err) {
+    logger.error('business.activity.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
