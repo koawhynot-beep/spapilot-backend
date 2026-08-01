@@ -1124,7 +1124,7 @@ app.get('/api/shops/:shopId/stock', auth, async (req, res) => {
     const search = (req.query.search || '').trim().toLowerCase();
     const groupParam = req.query.group; // 'all' | id | 'none'
     const params = [req.params.shopId];
-    let sql = 'SELECT * FROM stock_items WHERE shop_id=$1';
+    let sql = 'SELECT * FROM stock_items WHERE shop_id=$1 AND COALESCE(sku, \'\') <> \'\'';
     if (search) {
       params.push(`%${search}%`);
       sql += ` AND (LOWER(name) LIKE $${params.length} OR LOWER(category) LIKE $${params.length} OR LOWER(fabric) LIKE $${params.length} OR LOWER(print) LIKE $${params.length} OR LOWER(color) LIKE $${params.length} OR LOWER(size) LIKE $${params.length} OR LOWER(sku) LIKE $${params.length} OR LOWER(brand) LIKE $${params.length})`;
