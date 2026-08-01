@@ -1153,10 +1153,11 @@ app.get('/api/shops/:shopId/stock', auth, async (req, res) => {
     }
     // Default browse order is fabric → colour → style (how the owner reads her
     // stock). 'custom' preserves the manual drag-to-reorder positions.
+    // Blank fabrics/colours sort to the bottom (see the overview endpoint).
     const ORDERS = {
-      'fabric-color': "fabric ASC, color ASC, category ASC, size ASC",
-      'color':        "color ASC, category ASC, fabric ASC, size ASC",
-      'style':        "category ASC, color ASC, size ASC",
+      'fabric-color': "NULLIF(fabric,'') ASC NULLS LAST, NULLIF(color,'') ASC NULLS LAST, category ASC, size ASC",
+      'color':        "NULLIF(color,'') ASC NULLS LAST, category ASC, NULLIF(fabric,'') ASC NULLS LAST, size ASC",
+      'style':        "category ASC, NULLIF(color,'') ASC NULLS LAST, size ASC",
       'name':         "name ASC",
       'custom':       "position ASC, name ASC",
       'qty-asc':      "qty ASC, name ASC",
@@ -1195,10 +1196,12 @@ app.get('/api/business/stock-overview', auth, async (req, res) => {
 
     // Default browse order is fabric → colour → style, which is how the shop
     // owner reads her stock. Other orders are opt-in.
+    // NULLIF(...,'') + NULLS LAST keeps blank fabrics/colours (bags, journals,
+    // jewellery) at the bottom instead of crowding the top of the list.
     const ORDERS = {
-      'fabric-color': 'MIN(si.fabric) ASC, MIN(si.color) ASC, MIN(si.category) ASC, MIN(si.size) ASC',
-      'color':        'MIN(si.color) ASC, MIN(si.category) ASC, MIN(si.fabric) ASC, MIN(si.size) ASC',
-      'style':        'MIN(si.category) ASC, MIN(si.color) ASC, MIN(si.size) ASC',
+      'fabric-color': "NULLIF(MIN(si.fabric),'') ASC NULLS LAST, NULLIF(MIN(si.color),'') ASC NULLS LAST, MIN(si.category) ASC, MIN(si.size) ASC",
+      'color':        "NULLIF(MIN(si.color),'') ASC NULLS LAST, MIN(si.category) ASC, NULLIF(MIN(si.fabric),'') ASC NULLS LAST, MIN(si.size) ASC",
+      'style':        "MIN(si.category) ASC, NULLIF(MIN(si.color),'') ASC NULLS LAST, MIN(si.size) ASC",
       'name':         'MIN(si.name) ASC',
       'total-desc':   'SUM(si.qty) DESC, MIN(si.name) ASC',
       'total-asc':    'SUM(si.qty) ASC, MIN(si.name) ASC',
