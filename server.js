@@ -129,6 +129,7 @@ const transferSchema = z.object({
   qty: z.coerce.number().int().positive(),
   occurredAt: z.string().datetime().optional(),
   note: z.string().trim().max(500).optional().default(''),
+  staffId: z.coerce.number().int().positive().optional(),
 });
 
 const stockItemSchema = z.object({
@@ -482,6 +483,45 @@ async function initDB() {
     EXCEPTION WHEN duplicate_object THEN NULL; END $$;
   `);
 
+  // Shop staff. Deliberately NOT users: there is one shared login, and asking
+  // shop floor staff to hold passwords would be a different product. This is
+  // "who is standing at the till right now", picked from a list, so every
+  // scan carries a name — which is what makes a missing garment traceable.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS staff (
+      id           SERIAL PRIMARY KEY,
+      business_id  INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+      shop_id      INTEGER REFERENCES shops(id) ON DELETE SET NULL,
+      name         TEXT NOT NULL,
+      active       BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at   TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  // staff_name is a snapshot, not just the join: if someone leaves and is
+  // removed from the list, the history of what they scanned must survive.
+  await pool.query(`
+    ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS staff_id   INTEGER REFERENCES staff(id) ON DELETE SET NULL;
+    ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS staff_name TEXT DEFAULT '';
+    ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS reason     TEXT DEFAULT '';
+  `);
+
+  // Reclassify transfers logged before the type split. They were written as
+  // 'out'/'in', and 'out' counts as a sale, so any office → shop transfer was
+  // inflating that shop's sales. Matched on the note the transfer endpoint
+  // writes, which is the only marker those rows carry.
+  const { rowCount: fixedOut } = await pool.query(
+    `UPDATE stock_movements SET type='transfer-out'
+     WHERE type='out' AND qty_change < 0 AND note LIKE 'Transfer to %'`
+  );
+  const { rowCount: fixedIn } = await pool.query(
+    `UPDATE stock_movements SET type='transfer-in'
+     WHERE type='in' AND qty_change > 0 AND note LIKE 'Transfer from %'`
+  );
+  if (fixedOut || fixedIn) {
+    logger.info('migration.transfer_types.reclassified', { out: fixedOut, in: fixedIn });
+  }
+
   // Idempotent column adds for stock_items (so deploys before fabric/print/last_sold_at upgrade cleanly)
   await pool.query(`
     ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS fabric       TEXT DEFAULT '';
@@ -513,6 +553,9 @@ async function initDB() {
     `CREATE INDEX IF NOT EXISTS idx_movements_item_id ON stock_movements(item_id)`,
     `CREATE INDEX IF NOT EXISTS idx_movements_shop_id ON stock_movements(shop_id)`,
     `CREATE INDEX IF NOT EXISTS idx_movements_occurred ON stock_movements(occurred_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_movements_staff ON stock_movements(staff_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_movements_type ON stock_movements(type)`,
+    `CREATE INDEX IF NOT EXISTS idx_staff_business ON staff(business_id)`,
     `CREATE INDEX IF NOT EXISTS idx_groups_shop_id ON item_groups(shop_id)`,
     `CREATE INDEX IF NOT EXISTS idx_stock_group_id ON stock_items(group_id)`,
     `CREATE INDEX IF NOT EXISTS idx_stock_position ON stock_items(shop_id, position)`,
@@ -1111,6 +1154,90 @@ app.delete('/api/shops/:id', auth, requireOwner, async (req, res) => {
 
 // ── Stock items (per shop) ────────────────────────────────
 // Verify shop belongs to user's business
+// ── Staff ─────────────────────────────────────────────────
+// Not user accounts: one shared login stays, and this is simply "who is
+// standing at the till". Everything a person scans carries their name, which
+// is what turns the movement log into an answer to "who handled this?".
+const staffSchema = z.object({
+  name: z.string().trim().min(1).max(80),
+  shopId: z.number().int().positive().nullable().optional(),
+});
+
+const formatStaff = (s) => ({
+  id: s.id,
+  name: s.name,
+  shopId: s.shop_id,
+  active: s.active,
+});
+
+// Turns whatever the client sent into a { id, name } pair to stamp on a
+// movement. An unknown or missing staff id records nothing rather than
+// guessing — a blank name is honest, a wrong one is not.
+async function resolveStaff(staffId, businessId) {
+  const id = parseInt(staffId, 10);
+  if (!Number.isInteger(id)) return { id: null, name: '' };
+  const { rows } = await pool.query(
+    'SELECT id, name FROM staff WHERE id=$1 AND business_id=$2',
+    [id, businessId]
+  );
+  return rows.length ? { id: rows[0].id, name: rows[0].name } : { id: null, name: '' };
+}
+
+app.get('/api/staff', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM staff WHERE business_id=$1 AND active=TRUE ORDER BY name',
+      [req.user.businessId]
+    );
+    res.json(rows.map(formatStaff));
+  } catch (err) {
+    logger.error('staff.list.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/staff', auth, validate(staffSchema), async (req, res) => {
+  try {
+    const { name, shopId } = req.body;
+    // Reactivate rather than duplicate when a name comes back.
+    const { rows: existing } = await pool.query(
+      'SELECT * FROM staff WHERE business_id=$1 AND LOWER(name)=LOWER($2)',
+      [req.user.businessId, name]
+    );
+    if (existing.length) {
+      const { rows } = await pool.query(
+        'UPDATE staff SET active=TRUE, shop_id=$1 WHERE id=$2 RETURNING *',
+        [shopId || null, existing[0].id]
+      );
+      return res.status(200).json(formatStaff(rows[0]));
+    }
+    const { rows } = await pool.query(
+      'INSERT INTO staff (business_id, shop_id, name) VALUES ($1,$2,$3) RETURNING *',
+      [req.user.businessId, shopId || null, name]
+    );
+    res.status(201).json(formatStaff(rows[0]));
+  } catch (err) {
+    logger.error('staff.create.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Soft delete: the movements this person scanned keep their name, so removing
+// someone from the list never erases the history of what they handled.
+app.delete('/api/staff/:id', auth, async (req, res) => {
+  try {
+    const { rowCount } = await pool.query(
+      'UPDATE staff SET active=FALSE WHERE id=$1 AND business_id=$2',
+      [req.params.id, req.user.businessId]
+    );
+    if (!rowCount) return res.status(404).json({ error: 'Staff member not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error('staff.delete.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 async function shopGuard(shopId, businessId) {
   const r = await pool.query('SELECT 1 FROM shops WHERE id=$1 AND business_id=$2', [shopId, businessId]);
   return r.rowCount > 0;
@@ -1140,7 +1267,20 @@ const yearRange = (v) => {
   return { start: new Date(Date.UTC(y, 0, 1)), end: new Date(Date.UTC(y + 1, 0, 1)), year: y };
 };
 
-// A "sale" is a barcode/manual sell (type 'sale') or a logged sell-out ('out').
+// Movement types, and what each one means for the sales figures:
+//
+//   sale          sold to a customer (scanned or entered by hand)  → a sale
+//   out           legacy manual "Sold" log entry                   → a sale
+//   in            stock arriving (from the factory or by hand)     → not a sale
+//   transfer-out  left this shop, bound for another shop           → not a sale
+//   transfer-in   arrived here from another shop                   → not a sale
+//   removal       left the shop but was NOT sold — damaged,
+//                 returned, reject, lost                           → not a sale
+//   adjust        a stock count correction                         → not a sale
+//
+// Only the first two may ever be counted as sales. Everything else moves
+// garments around without money changing hands, and folding those into the
+// sales figures would quietly wreck every report on this page.
 const SALE_TYPES_SQL = "m.type IN ('sale', 'out') AND m.qty_change < 0";
 
 app.get('/api/shops/:shopId/stock', auth, async (req, res) => {
@@ -1302,6 +1442,7 @@ const BEST_SELLER_KEYS = {
   color:  { key: "NULLIF(sa.color,'')",    label: "MIN(NULLIF(sa.color,''))" },
   style:  { key: "NULLIF(sa.category,'')", label: "MIN(NULLIF(sa.category,''))" },
   shop:   { key: 'sa.shop_name', label: 'MIN(sa.shop_name)' },
+  staff:  { key: "NULLIF(sa.staff_name,'')", label: "MIN(NULLIF(sa.staff_name,''))" },
 };
 
 // Best sellers across the business, for a calendar year or a rolling window.
@@ -1351,6 +1492,7 @@ app.get('/api/business/best-sellers', auth, async (req, res) => {
         SELECT si.sku, si.name, si.category, si.fabric, si.color, si.size,
                COALESCE(si.price, 0) AS price,
                s.name AS shop_name,
+               COALESCE(m.staff_name, '') AS staff_name,
                m.occurred_at, -m.qty_change AS units
         FROM stock_movements m
         JOIN stock_items si ON si.id = m.item_id
@@ -1579,6 +1721,152 @@ app.get('/api/business/activity', auth, async (req, res) => {
     })));
   } catch (err) {
     logger.error('business.activity.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Everything that happened to one product in one year: every date it came in,
+// every date it went out, who handled it, and a month-by-month roll-up.
+// This is the "click the item and see August: 6 in, 4 sold" view.
+app.get('/api/business/sku-history', auth, async (req, res) => {
+  try {
+    const businessId = req.user.businessId;
+    if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
+    const sku = String(req.query.sku || '').trim();
+    if (!sku) return res.status(400).json({ error: 'No sku provided' });
+
+    const { start, end, year } = yearRange(req.query.year || String(new Date().getFullYear()));
+    const shopIds = parseShopIds(req.query.shops);
+
+    const params = [businessId, sku];
+    let where = 'WHERE s.business_id = $1 AND si.sku = $2';
+    if (start) {
+      params.push(start, end);
+      where += ` AND m.occurred_at >= $${params.length - 1} AND m.occurred_at < $${params.length}`;
+    }
+    if (shopIds) {
+      params.push(shopIds);
+      where += ` AND s.id = ANY($${params.length}::int[])`;
+    }
+
+    const { rows } = await pool.query(
+      `SELECT m.id, m.type, m.qty_change, m.qty_after, m.occurred_at, m.note,
+              COALESCE(m.reason, '') AS reason, COALESCE(m.staff_name, '') AS staff_name,
+              s.name AS shop_name, si.name AS item_name
+       FROM stock_movements m
+       JOIN stock_items si ON si.id = m.item_id
+       JOIN shops s ON s.id = si.shop_id
+       ${where}
+       ORDER BY m.occurred_at DESC, m.id DESC
+       LIMIT 2000`,
+      params
+    );
+
+    // Roll up by month so a year reads at a glance before the detail.
+    const months = {};
+    for (const r of rows) {
+      const key = new Date(r.occurred_at).toISOString().slice(0, 7); // YYYY-MM
+      if (!months[key]) months[key] = { month: key, in: 0, sold: 0, removed: 0, transferred: 0 };
+      const units = Math.abs(r.qty_change);
+      if (r.type === 'in') months[key].in += units;
+      else if (r.type === 'sale' || r.type === 'out') months[key].sold += units;
+      else if (r.type === 'removal') months[key].removed += units;
+      else if (r.type === 'transfer-in' || r.type === 'transfer-out') months[key].transferred += units;
+    }
+
+    // Which years have anything at all, so the year picker only offers real ones.
+    const { rows: yearRows } = await pool.query(
+      `SELECT DISTINCT EXTRACT(YEAR FROM m.occurred_at)::int AS year
+       FROM stock_movements m
+       JOIN stock_items si ON si.id = m.item_id
+       JOIN shops s ON s.id = si.shop_id
+       WHERE s.business_id = $1 AND si.sku = $2
+       ORDER BY year DESC`,
+      [businessId, sku]
+    );
+
+    res.json({
+      sku,
+      year,
+      years: yearRows.map(r => r.year),
+      months: Object.values(months).sort((a, b) => b.month.localeCompare(a.month)),
+      movements: rows.map(r => ({
+        id: r.id,
+        type: r.type,
+        qtyChange: r.qty_change,
+        qtyAfter: r.qty_after,
+        occurredAt: r.occurred_at,
+        note: r.note || '',
+        reason: r.reason,
+        staffName: r.staff_name,
+        shopName: r.shop_name,
+        itemName: r.item_name,
+      })),
+    });
+  } catch (err) {
+    logger.error('business.skuhistory.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// One shop's full movement ledger — every date stock arrived and left.
+// This is the back-office view, deliberately away from the scanning screens.
+app.get('/api/shops/:shopId/ledger', auth, async (req, res) => {
+  try {
+    if (!await shopGuard(req.params.shopId, req.user.businessId)) {
+      return res.status(404).json({ error: 'Shop not found' });
+    }
+    const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit, 10) || 300));
+    const { start, end } = yearRange(req.query.year || 'all');
+    const direction = req.query.direction; // 'in' | 'out' | undefined
+
+    const params = [req.params.shopId];
+    let where = 'WHERE m.shop_id = $1';
+    if (start) {
+      params.push(start, end);
+      where += ` AND m.occurred_at >= $${params.length - 1} AND m.occurred_at < $${params.length}`;
+    }
+    if (direction === 'in') where += ' AND m.qty_change > 0';
+    if (direction === 'out') where += ' AND m.qty_change < 0';
+    if (req.query.type) {
+      params.push(req.query.type);
+      where += ` AND m.type = $${params.length}`;
+    }
+    if (req.query.staffId) {
+      params.push(parseInt(req.query.staffId, 10) || 0);
+      where += ` AND m.staff_id = $${params.length}`;
+    }
+    params.push(limit);
+
+    const { rows } = await pool.query(
+      `SELECT m.id, m.type, m.qty_change, m.qty_after, m.occurred_at, m.note,
+              COALESCE(m.reason,'') AS reason, COALESCE(m.staff_name,'') AS staff_name,
+              si.name AS item_name, si.sku, si.fabric, si.color, si.size
+       FROM stock_movements m
+       JOIN stock_items si ON si.id = m.item_id
+       ${where}
+       ORDER BY m.occurred_at DESC, m.id DESC
+       LIMIT $${params.length}`,
+      params
+    );
+
+    res.json(rows.map(r => ({
+      id: r.id,
+      type: r.type,
+      qtyChange: r.qty_change,
+      qtyAfter: r.qty_after,
+      occurredAt: r.occurred_at,
+      note: r.note || '',
+      reason: r.reason,
+      staffName: r.staff_name,
+      itemName: r.item_name,
+      sku: r.sku || '',
+      fabric: r.fabric || '',
+      color: r.color || '',
+      size: r.size || '',
+    })));
+  } catch (err) {
+    logger.error('shop.ledger.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1817,6 +2105,95 @@ app.post('/api/shops/:shopId/sell', auth, async (req, res) => {
   }
 });
 
+// ── Scan: one endpoint, four things a garment can do ──────
+// Sell, arrive from the factory, leave without being sold, or move to another
+// shop. Staff scan the same box every time and only the mode changes, so
+// there is one thing to learn instead of four.
+const SCAN_MODES = {
+  sell: { type: 'sale',         dir: -1, label: 'Sold' },
+  in:   { type: 'in',           dir: +1, label: 'Stocked in' },
+  out:  { type: 'removal',      dir: -1, label: 'Removed' },
+};
+
+app.post('/api/shops/:shopId/scan', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!await shopGuard(req.params.shopId, req.user.businessId)) {
+      return res.status(404).json({ error: 'Shop not found' });
+    }
+    const mode = SCAN_MODES[req.body.mode] ? req.body.mode : 'sell';
+    const { type, dir, label } = SCAN_MODES[mode];
+    const code = String(req.body.code || '').trim();
+    const itemId = parseInt(req.body.itemId, 10);
+    const qty = Math.max(1, Math.min(999, parseInt(req.body.qty, 10) || 1));
+    const reason = String(req.body.reason || '').trim().slice(0, 80);
+    const note = String(req.body.note || '').trim().slice(0, 500);
+    if (!code && !Number.isInteger(itemId)) {
+      return res.status(400).json({ error: 'No item or barcode provided' });
+    }
+
+    const staff = await resolveStaff(req.body.staffId, req.user.businessId);
+
+    const { rows: found } = Number.isInteger(itemId)
+      ? await client.query('SELECT * FROM stock_items WHERE id=$1 AND shop_id=$2', [itemId, req.params.shopId])
+      : await client.query(
+          `SELECT * FROM stock_items
+           WHERE shop_id=$1 AND (LOWER(sku)=LOWER($2) OR LOWER(name)=LOWER($2))
+           ORDER BY (LOWER(sku)=LOWER($2)) DESC
+           LIMIT 1`,
+          [req.params.shopId, code]
+        );
+    if (!found.length) {
+      return res.status(404).json({
+        error: Number.isInteger(itemId)
+          ? 'That item is not in this shop'
+          : `No item with code "${code}" in this shop`,
+      });
+    }
+    const item = found[0];
+
+    // Only outward movements can run out of stock; stocking in cannot.
+    if (dir < 0 && item.qty <= 0) {
+      return res.status(409).json({ error: `"${item.name}" is already at zero`, item: formatStock(item) });
+    }
+    const newQty = dir > 0 ? item.qty + qty : Math.max(0, item.qty - qty);
+    const change = newQty - item.qty;
+
+    await client.query('BEGIN');
+    // last_sold_at tracks actual selling only — a reject leaving the shop is
+    // not the last time this garment sold.
+    const sql = type === 'sale'
+      ? `UPDATE stock_items SET qty=$1, last_sold_at=NOW(), updated_at=NOW() WHERE id=$2 RETURNING *`
+      : `UPDATE stock_items SET qty=$1, updated_at=NOW() WHERE id=$2 RETURNING *`;
+    const { rows: upd } = await client.query(sql, [newQty, item.id]);
+    await client.query(
+      `INSERT INTO stock_movements
+         (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note, reason, staff_id, staff_name)
+       VALUES ($1,$2,$3,$4,$5,$6,NOW(),$7,$8,$9,$10)`,
+      [
+        item.id, item.shop_id, req.user.id, type, change, newQty,
+        note || (Number.isInteger(itemId) ? 'manual' : 'barcode'),
+        reason, staff.id, staff.name,
+      ]
+    );
+    await client.query('COMMIT');
+    res.json({
+      ok: true,
+      mode,
+      label,
+      item: formatStock(upd[0]),
+      qtyChanged: Math.abs(change),
+      staffName: staff.name,
+    });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    logger.error('stock.scan.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
 app.delete('/api/stock/:id', auth, async (req, res) => {
   try {
     const { rows: own } = await pool.query(
@@ -1880,7 +2257,8 @@ app.post('/api/stock/:id/movements', auth, validate(movementSchema), async (req,
 // Decrements source item, increments destination item, logs both movements.
 // If the destination shop doesn't have that SKU yet, creates it.
 app.post('/api/transfers', auth, validate(transferSchema), async (req, res) => {
-  const { sku, fromShopId, toShopId, qty, occurredAt, note } = req.body;
+  const { sku, fromShopId, toShopId, qty, occurredAt, note, staffId } = req.body;
+  const staff = await resolveStaff(staffId, req.user.businessId);
   if (fromShopId === toShopId) return res.status(400).json({ error: 'Source and destination must differ' });
 
   const client = await pool.connect();
@@ -1951,16 +2329,17 @@ app.post('/api/transfers', auth, validate(transferSchema), async (req, res) => {
       [newDstQty, dstItem.id]
     );
 
-    // Log movements
+    // Log movements. These MUST NOT be 'out'/'in': 'out' is counted as a sale,
+    // so office → shop transfers were showing up as the office selling stock.
     await client.query(
-      `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note)
-       VALUES ($1,$2,$3,'out',$4,$5,$6,$7)`,
-      [srcItem.id, fromShopId, req.user.id, -qty, newSrcQty, occurred, noteFrom]
+      `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note, staff_id, staff_name)
+       VALUES ($1,$2,$3,'transfer-out',$4,$5,$6,$7,$8,$9)`,
+      [srcItem.id, fromShopId, req.user.id, -qty, newSrcQty, occurred, noteFrom, staff.id, staff.name]
     );
     await client.query(
-      `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note)
-       VALUES ($1,$2,$3,'in',$4,$5,$6,$7)`,
-      [dstItem.id, toShopId, req.user.id, qty, newDstQty, occurred, noteTo]
+      `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note, staff_id, staff_name)
+       VALUES ($1,$2,$3,'transfer-in',$4,$5,$6,$7,$8,$9)`,
+      [dstItem.id, toShopId, req.user.id, qty, newDstQty, occurred, noteTo, staff.id, staff.name]
     );
 
     await client.query('COMMIT');
