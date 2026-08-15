@@ -1116,6 +1116,33 @@ async function shopGuard(shopId, businessId) {
   return r.rowCount > 0;
 }
 
+// "shops=1,3" → [1,3]. Absent or unparseable → null, meaning "every shop".
+// Used by the overview and sales endpoints so the owner can look at one shop,
+// a couple of shops, or the whole business.
+const parseShopIds = (v) => {
+  if (v == null || v === '' || v === 'all') return null;
+  const ids = String(v)
+    .split(',')
+    .map(s => parseInt(s.trim(), 10))
+    .filter(n => Number.isInteger(n));
+  return ids.length ? ids : null;
+};
+
+// Sales are counted for one calendar year, or for everything ever.
+// Returns [start, end) as Dates, or nulls when the whole history is wanted.
+const yearRange = (v) => {
+  if (!v || v === 'all') return { start: null, end: null, year: 'all' };
+  const y = parseInt(v, 10);
+  if (!Number.isInteger(y) || y < 2000 || y > 2100) {
+    const now = new Date().getFullYear();
+    return { start: new Date(Date.UTC(now, 0, 1)), end: new Date(Date.UTC(now + 1, 0, 1)), year: now };
+  }
+  return { start: new Date(Date.UTC(y, 0, 1)), end: new Date(Date.UTC(y + 1, 0, 1)), year: y };
+};
+
+// A "sale" is a barcode/manual sell (type 'sale') or a logged sell-out ('out').
+const SALE_TYPES_SQL = "m.type IN ('sale', 'out') AND m.qty_change < 0";
+
 app.get('/api/shops/:shopId/stock', auth, async (req, res) => {
   try {
     if (!await shopGuard(req.params.shopId, req.user.businessId)) {
@@ -1183,6 +1210,13 @@ app.get('/api/business/stock-overview', auth, async (req, res) => {
     const params = [businessId];
     let where = "WHERE s.business_id = $1 AND COALESCE(si.sku, '') <> ''";
 
+    // Optional scope: one shop, a few shops, or (default) all of them.
+    const shopIds = parseShopIds(req.query.shops);
+    if (shopIds) {
+      params.push(shopIds);
+      where += ` AND s.id = ANY($${params.length}::int[])`;
+    }
+
     const search = (req.query.search || '').trim().toLowerCase();
     if (search) {
       params.push(`%${search}%`);
@@ -1229,13 +1263,17 @@ app.get('/api/business/stock-overview', auth, async (req, res) => {
     `;
     const { rows } = await pool.query(sql, params);
 
-    const { rows: shopRows } = await pool.query(
-      'SELECT name FROM shops WHERE business_id=$1 ORDER BY id',
-      [businessId]
-    );
+    // Columns follow the chosen scope, so the totals and the table agree.
+    const { rows: shopRows } = shopIds
+      ? await pool.query(
+          'SELECT id, name FROM shops WHERE business_id=$1 AND id = ANY($2::int[]) ORDER BY id',
+          [businessId, shopIds]
+        )
+      : await pool.query('SELECT id, name FROM shops WHERE business_id=$1 ORDER BY id', [businessId]);
 
     res.json({
       shops: shopRows.map(r => r.name),
+      shopList: shopRows.map(r => ({ id: r.id, name: r.name })),
       items: rows.map(r => ({
         sku: r.sku,
         name: r.name,
@@ -1255,68 +1293,114 @@ app.get('/api/business/stock-overview', auth, async (req, res) => {
   }
 });
 
-// Best sellers across the whole business.
-// A "sale" is a barcode scan (type 'sale') or a manually logged sell-out (type 'out').
-// Trend compares the chosen window against the window immediately before it.
+// What sells best — grouped by whichever dimension the owner asks for.
+// She wants to slice the same sales data by product, fabric, colour, style
+// and shop, so the only thing that varies is the GROUP BY key.
+const BEST_SELLER_KEYS = {
+  sku:    { key: "NULLIF(sa.sku,'')", label: 'MIN(sa.name)' },
+  fabric: { key: "NULLIF(sa.fabric,'')",   label: "MIN(NULLIF(sa.fabric,''))" },
+  color:  { key: "NULLIF(sa.color,'')",    label: "MIN(NULLIF(sa.color,''))" },
+  style:  { key: "NULLIF(sa.category,'')", label: "MIN(NULLIF(sa.category,''))" },
+  shop:   { key: 'sa.shop_name', label: 'MIN(sa.shop_name)' },
+};
+
+// Best sellers across the business, for a calendar year or a rolling window.
+// A "sale" is a barcode/manual sell (type 'sale') or a logged sell-out ('out').
+// Trend compares the chosen window against the one immediately before it.
 app.get('/api/business/best-sellers', auth, async (req, res) => {
   try {
     const businessId = req.user.businessId;
     if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
 
-    const days = Math.min(3650, Math.max(1, parseInt(req.query.days, 10) || 365));
-    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 10));
-    const now = new Date();
-    const start = new Date(now.getTime() - days * 86400000);
-    const prevStart = new Date(now.getTime() - days * 2 * 86400000);
+    const groupBy = BEST_SELLER_KEYS[req.query.groupBy] ? req.query.groupBy : 'sku';
+    const { key: keyExpr, label: labelExpr } = BEST_SELLER_KEYS[groupBy];
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 10));
+    const shopIds = parseShopIds(req.query.shops);
+
+    // Either a calendar year ("what sold in 2025") or a rolling window of days.
+    let start, end, prevStart, windowLabel;
+    if (req.query.year) {
+      const yr = yearRange(req.query.year);
+      if (yr.year === 'all') {
+        start = new Date(Date.UTC(2000, 0, 1));
+        end = new Date(Date.UTC(2100, 0, 1));
+        prevStart = start;               // nothing earlier to compare against
+      } else {
+        start = yr.start;
+        end = yr.end;
+        prevStart = new Date(Date.UTC(yr.year - 1, 0, 1));
+      }
+      windowLabel = { year: yr.year };
+    } else {
+      const days = Math.min(3650, Math.max(1, parseInt(req.query.days, 10) || 365));
+      end = new Date();
+      start = new Date(end.getTime() - days * 86400000);
+      prevStart = new Date(end.getTime() - days * 2 * 86400000);
+      windowLabel = { days };
+    }
+
+    const params = [businessId, start, prevStart, limit, end];
+    let scope = '';
+    if (shopIds) {
+      params.push(shopIds);
+      scope = ` AND s.id = ANY($${params.length}::int[])`;
+    }
 
     const sql = `
       WITH sales AS (
-        SELECT m.item_id, m.occurred_at, -m.qty_change AS units
+        SELECT si.sku, si.name, si.category, si.fabric, si.color, si.size,
+               COALESCE(si.price, 0) AS price,
+               s.name AS shop_name,
+               m.occurred_at, -m.qty_change AS units
         FROM stock_movements m
         JOIN stock_items si ON si.id = m.item_id
         JOIN shops s ON s.id = si.shop_id
         WHERE s.business_id = $1
-          AND m.type IN ('sale', 'out')
-          AND m.qty_change < 0
+          AND ${SALE_TYPES_SQL}
           AND m.occurred_at >= $3
+          AND m.occurred_at <  $5
+          ${scope}
       ),
       current AS (
-        SELECT si.sku,
-               MIN(si.name)     AS name,
-               MIN(si.category) AS style,
-               MIN(si.fabric)   AS fabric,
-               MIN(si.color)    AS color,
-               MIN(si.size)     AS size,
+        SELECT ${keyExpr} AS group_key,
+               ${labelExpr}     AS label,
+               MIN(sa.name)     AS name,
+               MIN(sa.sku)      AS sku,
+               MIN(sa.category) AS style,
+               MIN(sa.fabric)   AS fabric,
+               MIN(sa.color)    AS color,
+               MIN(sa.size)     AS size,
                SUM(sa.units)::int AS units,
-               SUM(sa.units * COALESCE(si.price, 0))::float8 AS revenue
+               SUM(sa.units * sa.price)::float8 AS revenue
         FROM sales sa
-        JOIN stock_items si ON si.id = sa.item_id
-        WHERE sa.occurred_at >= $2 AND COALESCE(si.sku, '') <> ''
-        GROUP BY si.sku
+        WHERE sa.occurred_at >= $2 AND ${keyExpr} IS NOT NULL
+        GROUP BY ${keyExpr}
       ),
       previous AS (
-        SELECT si.sku, SUM(sa.units)::int AS units
+        SELECT ${keyExpr} AS group_key, SUM(sa.units)::int AS units
         FROM sales sa
-        JOIN stock_items si ON si.id = sa.item_id
-        WHERE sa.occurred_at < $2 AND COALESCE(si.sku, '') <> ''
-        GROUP BY si.sku
+        WHERE sa.occurred_at < $2 AND ${keyExpr} IS NOT NULL
+        GROUP BY ${keyExpr}
       )
       SELECT c.*, COALESCE(p.units, 0) AS prev_units
       FROM current c
-      LEFT JOIN previous p ON p.sku = c.sku
+      LEFT JOIN previous p ON p.group_key = c.group_key
       ORDER BY c.units DESC, c.revenue DESC
       LIMIT $4
     `;
-    const { rows } = await pool.query(sql, [businessId, start, prevStart, limit]);
+    const { rows } = await pool.query(sql, params);
 
     res.json({
-      days,
+      ...windowLabel,
+      groupBy,
       items: rows.map(r => {
         const units = Number(r.units) || 0;
         const prev = Number(r.prev_units) || 0;
         return {
-          sku: r.sku,
-          name: r.name,
+          key: r.group_key,
+          label: r.label || '—',
+          sku: r.sku || '',
+          name: r.name || '',
           style: r.style || '',
           fabric: r.fabric || '',
           color: r.color || '',
@@ -1331,6 +1415,134 @@ app.get('/api/business/best-sellers', auth, async (req, res) => {
     });
   } catch (err) {
     logger.error('business.bestsellers.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// How many of each SKU sold, per shop, in one year. Keyed by SKU so the
+// overview can hang a "sold" line under the matching stock row.
+app.get('/api/business/sold-overview', auth, async (req, res) => {
+  try {
+    const businessId = req.user.businessId;
+    if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
+
+    const { start, end, year } = yearRange(req.query.year || String(new Date().getFullYear()));
+    const shopIds = parseShopIds(req.query.shops);
+
+    const params = [businessId];
+    let where = `WHERE s.business_id = $1 AND ${SALE_TYPES_SQL} AND COALESCE(si.sku, '') <> ''`;
+    if (start) {
+      params.push(start, end);
+      where += ` AND m.occurred_at >= $${params.length - 1} AND m.occurred_at < $${params.length}`;
+    }
+    if (shopIds) {
+      params.push(shopIds);
+      where += ` AND s.id = ANY($${params.length}::int[])`;
+    }
+
+    const { rows } = await pool.query(
+      `SELECT si.sku, s.name AS shop_name, SUM(-m.qty_change)::int AS units
+       FROM stock_movements m
+       JOIN stock_items si ON si.id = m.item_id
+       JOIN shops s ON s.id = si.shop_id
+       ${where}
+       GROUP BY si.sku, s.name`,
+      params
+    );
+
+    const items = {};
+    let grand = 0;
+    for (const r of rows) {
+      const units = Number(r.units) || 0;
+      if (!items[r.sku]) items[r.sku] = { byShop: {}, total: 0 };
+      items[r.sku].byShop[r.shop_name] = (items[r.sku].byShop[r.shop_name] || 0) + units;
+      items[r.sku].total += units;
+      grand += units;
+    }
+    res.json({ year, total: grand, items });
+  } catch (err) {
+    logger.error('business.soldoverview.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Which years actually have sales in them — populates the year dropdown.
+app.get('/api/business/sales-years', auth, async (req, res) => {
+  try {
+    const businessId = req.user.businessId;
+    if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
+    const { rows } = await pool.query(
+      `SELECT DISTINCT EXTRACT(YEAR FROM m.occurred_at)::int AS year
+       FROM stock_movements m
+       JOIN stock_items si ON si.id = m.item_id
+       JOIN shops s ON s.id = si.shop_id
+       WHERE s.business_id = $1 AND ${SALE_TYPES_SQL}
+       ORDER BY year DESC`,
+      [businessId]
+    );
+    const years = rows.map(r => r.year);
+    // The current year always appears, even before the first sale of it.
+    const thisYear = new Date().getFullYear();
+    if (!years.includes(thisYear)) years.unshift(thisYear);
+    res.json({ years });
+  } catch (err) {
+    logger.error('business.salesyears.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// The most recent sales, newest first — "what sold, when, and where".
+app.get('/api/business/recent-sales', auth, async (req, res) => {
+  try {
+    const businessId = req.user.businessId;
+    if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
+
+    const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 100));
+    const { start, end } = yearRange(req.query.year || 'all');
+    const shopIds = parseShopIds(req.query.shops);
+
+    const params = [businessId];
+    let where = `WHERE s.business_id = $1 AND ${SALE_TYPES_SQL}`;
+    if (start) {
+      params.push(start, end);
+      where += ` AND m.occurred_at >= $${params.length - 1} AND m.occurred_at < $${params.length}`;
+    }
+    if (shopIds) {
+      params.push(shopIds);
+      where += ` AND s.id = ANY($${params.length}::int[])`;
+    }
+    params.push(limit);
+
+    const { rows } = await pool.query(
+      `SELECT m.id, m.occurred_at, m.note, -m.qty_change AS units,
+              si.name, si.sku, si.category, si.fabric, si.color, si.size,
+              COALESCE(si.price, 0)::float8 AS price,
+              s.name AS shop_name
+       FROM stock_movements m
+       JOIN stock_items si ON si.id = m.item_id
+       JOIN shops s ON s.id = si.shop_id
+       ${where}
+       ORDER BY m.occurred_at DESC, m.id DESC
+       LIMIT $${params.length}`,
+      params
+    );
+
+    res.json(rows.map(r => ({
+      id: r.id,
+      occurredAt: r.occurred_at,
+      units: Number(r.units) || 0,
+      name: r.name,
+      sku: r.sku || '',
+      style: r.category || '',
+      fabric: r.fabric || '',
+      color: r.color || '',
+      size: r.size || '',
+      price: Number(r.price) || 0,
+      shopName: r.shop_name,
+      note: r.note || '',
+    })));
+  } catch (err) {
+    logger.error('business.recentsales.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1550,19 +1762,31 @@ app.post('/api/shops/:shopId/sell', auth, async (req, res) => {
       return res.status(404).json({ error: 'Shop not found' });
     }
     const code = String(req.body.code || '').trim();
+    const itemId = parseInt(req.body.itemId, 10);
     const qtySold = Math.max(1, Math.min(999, parseInt(req.body.qty, 10) || 1));
-    if (!code) return res.status(400).json({ error: 'No barcode/code provided' });
+    const manual = !!req.body.manual;
+    if (!code && !Number.isInteger(itemId)) {
+      return res.status(400).json({ error: 'No item or barcode provided' });
+    }
 
-    // Match on SKU first (that's what the barcode encodes); fall back to name.
-    const { rows: found } = await client.query(
-      `SELECT * FROM stock_items
-       WHERE shop_id=$1 AND (LOWER(sku)=LOWER($2) OR LOWER(name)=LOWER($2))
-       ORDER BY (LOWER(sku)=LOWER($2)) DESC
-       LIMIT 1`,
-      [req.params.shopId, code]
-    );
+    // A scan sends the code; the manual "type it in" flow sends the id of the
+    // item the user picked out of the search results.
+    const { rows: found } = Number.isInteger(itemId)
+      ? await client.query('SELECT * FROM stock_items WHERE id=$1 AND shop_id=$2', [itemId, req.params.shopId])
+      // Match on SKU first (that's what the barcode encodes); fall back to name.
+      : await client.query(
+          `SELECT * FROM stock_items
+           WHERE shop_id=$1 AND (LOWER(sku)=LOWER($2) OR LOWER(name)=LOWER($2))
+           ORDER BY (LOWER(sku)=LOWER($2)) DESC
+           LIMIT 1`,
+          [req.params.shopId, code]
+        );
     if (!found.length) {
-      return res.status(404).json({ error: `No item with code "${code}" in this shop` });
+      return res.status(404).json({
+        error: Number.isInteger(itemId)
+          ? 'That item is not in this shop'
+          : `No item with code "${code}" in this shop`,
+      });
     }
     const item = found[0];
     if (item.qty <= 0) {
@@ -1578,11 +1802,12 @@ app.post('/api/shops/:shopId/sell', auth, async (req, res) => {
     );
     await client.query(
       `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note)
-       VALUES ($1,$2,$3,'sale',$4,$5,NOW(),'barcode sale')`,
-      [item.id, item.shop_id, req.user.id, change, newQty]
+       VALUES ($1,$2,$3,'sale',$4,$5,NOW(),$6)`,
+      [item.id, item.shop_id, req.user.id, change, newQty, manual ? 'manual sale' : 'barcode sale']
     );
     await client.query('COMMIT');
-    res.json({ ok: true, item: formatStock(upd[0]), soldQty: qtySold });
+    // -change, not qtySold: asking for 5 when 3 are left sells the 3 there are.
+    res.json({ ok: true, item: formatStock(upd[0]), soldQty: -change });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     logger.error('stock.sell.error', { err: err.message });
