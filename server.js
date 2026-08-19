@@ -2134,16 +2134,23 @@ app.post('/api/shops/:shopId/scan', auth, async (req, res) => {
 
     const staff = await resolveStaff(req.body.staffId, req.user.businessId);
 
+    // Read the row inside the transaction and lock it. Scanning is bursty —
+    // several pieces of the same style go across the counter in seconds — and
+    // reading the quantity outside a lock lets two scans both see "5 left" and
+    // both write 4, quietly losing a sale.
+    await client.query('BEGIN');
     const { rows: found } = Number.isInteger(itemId)
-      ? await client.query('SELECT * FROM stock_items WHERE id=$1 AND shop_id=$2', [itemId, req.params.shopId])
+      ? await client.query('SELECT * FROM stock_items WHERE id=$1 AND shop_id=$2 FOR UPDATE', [itemId, req.params.shopId])
       : await client.query(
           `SELECT * FROM stock_items
            WHERE shop_id=$1 AND (LOWER(sku)=LOWER($2) OR LOWER(name)=LOWER($2))
            ORDER BY (LOWER(sku)=LOWER($2)) DESC
-           LIMIT 1`,
+           LIMIT 1
+           FOR UPDATE`,
           [req.params.shopId, code]
         );
     if (!found.length) {
+      await client.query('ROLLBACK');
       return res.status(404).json({
         error: Number.isInteger(itemId)
           ? 'That item is not in this shop'
@@ -2154,12 +2161,12 @@ app.post('/api/shops/:shopId/scan', auth, async (req, res) => {
 
     // Only outward movements can run out of stock; stocking in cannot.
     if (dir < 0 && item.qty <= 0) {
+      await client.query('ROLLBACK');
       return res.status(409).json({ error: `"${item.name}" is already at zero`, item: formatStock(item) });
     }
     const newQty = dir > 0 ? item.qty + qty : Math.max(0, item.qty - qty);
     const change = newQty - item.qty;
 
-    await client.query('BEGIN');
     // last_sold_at tracks actual selling only — a reject leaving the shop is
     // not the last time this garment sold.
     const sql = type === 'sale'
