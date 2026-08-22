@@ -114,6 +114,10 @@ const deleteAccountSchema = z.object({
 const shopSchema = z.object({
   name: z.string().trim().min(1).max(120),
   address: z.string().trim().max(500).optional().default(''),
+  // Which shop key opens this location. Empty means none — the office.
+  code: z.string().trim().toUpperCase().regex(/^[A-Z]{2}$/, 'Use two letters, e.g. GD')
+    .nullable().optional()
+    .or(z.literal('').transform(() => null)),
 });
 const movementSchema = z.object({
   type: z.enum(['in', 'out', 'adjust']),
@@ -175,7 +179,7 @@ const DEFAULT_STAFF_PERMS = {
   canSendAnnouncements: false,
 };
 
-const formatUser = (u) => ({
+const formatUser = (u, access = null) => ({
   id: u.id,
   email: u.email,
   role: u.role,
@@ -185,6 +189,9 @@ const formatUser = (u) => ({
   trialEndsAt: u.trial_ends_at,
   subscriptionStatus: u.subscription_status || 'trial',
   createdAt: u.created_at,
+  // What this session may reach. The browser uses it to decide which tabs to
+  // draw; the server never trusts it, and enforces the same rule again.
+  accessRole: access ? access.role : 'admin',
 });
 
 const formatShop = (s) => ({
@@ -192,6 +199,7 @@ const formatShop = (s) => ({
   businessId: s.business_id,
   name: s.name,
   address: s.address || '',
+  code: s.code || null,
   createdAt: s.created_at,
 });
 
@@ -263,6 +271,41 @@ const trialInfo = () => ({
 const ACCESS_CODE = (process.env.ACCESS_CODE || '').trim();
 const accessOk = (code) => !ACCESS_CODE || (typeof code === 'string' && code.trim() === ACCESS_CODE);
 
+// ── Shop keys ─────────────────────────────────────────────
+// The master code above opens everything. Each shop also gets a key of its
+// own, which opens that shop and nothing else. Codes live only in env vars —
+// they are never stored in the database and never sent to the browser.
+const SHOP_CODES = Object.entries({
+  AT: (process.env.SHOP_CODE_AT || '').trim(),
+  GD: (process.env.SHOP_CODE_GD || '').trim(),
+  RG: (process.env.SHOP_CODE_RG || '').trim(),
+}).reduce((acc, [shopCode, secret]) => {
+  if (secret) acc[shopCode] = secret;
+  return acc;
+}, {});
+
+// Which door does this code open? Returns the access level, never the code.
+// Compared with timingSafeEqual so a wrong code cannot be narrowed down by
+// measuring how long the answer takes.
+const safeEqual = (a, b) => {
+  const ba = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+};
+
+const resolveAccess = (raw) => {
+  const code = typeof raw === 'string' ? raw.trim() : '';
+  if (!code) return ACCESS_CODE ? null : { role: 'admin', shopCode: null };
+  // The master code wins: if someone reuses it as a shop key, they still get
+  // the full account rather than being silently downgraded.
+  if (accessOk(code)) return { role: 'admin', shopCode: null };
+  for (const [shopCode, secret] of Object.entries(SHOP_CODES)) {
+    if (safeEqual(code, secret)) return { role: 'shop', shopCode };
+  }
+  return null;
+};
+
 // ── Auth middleware ───────────────────────────────────────
 const TRIAL_EXPIRED_ALLOWED = ['/api/auth/', '/api/billing/', '/health'];
 
@@ -279,8 +322,27 @@ const auth = async (req, res, next) => {
       if (rowCount) return res.status(401).json({ error: 'Token revoked' });
     }
     req.user = decoded;
-    // Trial/subscription enforcement removed — this is a private tool for one
-    // family business, not a commercial SaaS. All authenticated users have full access.
+
+    // A shop key is pinned to exactly one shop for the life of the token.
+    // Resolved here, from the two-letter code in the token, so that no route
+    // has to trust a shop id supplied by the caller.
+    req.accessRole = decoded.accessRole === 'shop' ? 'shop' : 'admin';
+    req.scopeShopId = null;
+    if (req.accessRole === 'shop') {
+      // The key must still name a live shop. If the shop was renamed away or
+      // deleted, the key opens nothing rather than opening everything.
+      if (!decoded.shopCode || !SHOP_CODES[decoded.shopCode]) {
+        return res.status(401).json({ error: 'This shop key is no longer valid' });
+      }
+      const { rows } = await pool.query(
+        'SELECT id FROM shops WHERE business_id=$1 AND code=$2',
+        [decoded.businessId, decoded.shopCode]
+      );
+      if (!rows.length) {
+        return res.status(403).json({ error: 'This shop key is not linked to a shop yet' });
+      }
+      req.scopeShopId = rows[0].id;
+    }
     next();
   } catch (err) {
     res.status(401).json({ error: 'Invalid token' });
@@ -294,12 +356,31 @@ const requireOwner = (req, res, next) => {
   next();
 };
 
-const makeToken = (user) => jwt.sign(
+// Everything a shop key must not see: business-wide figures, other shops'
+// stock, reports, and anything that changes who can get in.
+const requireAdmin = (req, res, next) => {
+  if (req.accessRole !== 'admin') {
+    return res.status(403).json({ error: 'Only the master code can do that' });
+  }
+  next();
+};
+
+// Guard for routes that act on one named shop. A shop key may only ever name
+// its own shop; the master code may name any of them.
+const shopAllowed = (req, shopId) =>
+  req.accessRole === 'admin' || Number(shopId) === Number(req.scopeShopId);
+
+const denyShop = (res) =>
+  res.status(403).json({ error: 'This code only works for its own shop' });
+
+const makeToken = (user, access = { role: 'admin', shopCode: null }) => jwt.sign(
   {
     id: user.id,
     email: user.email,
     role: user.role,
     businessId: user.business_id,
+    accessRole: access.role,
+    shopCode: access.shopCode,
     jti: crypto.randomBytes(16).toString('hex'),
   },
   JWT_SECRET,
@@ -501,6 +582,40 @@ async function initDB() {
   // than on each sale, because the rate is a standing arrangement.
   await pool.query(`ALTER TABLE staff ADD COLUMN IF NOT EXISTS commission_rate NUMERIC(6,3) NOT NULL DEFAULT 0`);
 
+  // Two-letter key that ties a shop to its own access code (AT / GD / RG).
+  // Null means the location has no shop key of its own — the office, which
+  // only the master code can reach.
+  await pool.query(`ALTER TABLE shops ADD COLUMN IF NOT EXISTS code TEXT`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_shops_code ON shops(business_id, code) WHERE code IS NOT NULL`);
+
+  // Stock in transit. A transfer leaves the sending shop immediately — the
+  // pieces are physically in a bag — but does NOT land on the receiving
+  // shop's shelf until someone there counts them and approves. Until then it
+  // belongs to neither shelf, which is why it needs a row of its own rather
+  // than a pair of movements.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS transfers (
+      id                  SERIAL PRIMARY KEY,
+      business_id         INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+      from_shop_id        INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+      to_shop_id          INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+      sku                 TEXT NOT NULL,
+      item_name           TEXT DEFAULT '',
+      qty                 INTEGER NOT NULL,
+      status              TEXT NOT NULL DEFAULT 'pending',
+      note                TEXT DEFAULT '',
+      sent_by_staff_id    INTEGER REFERENCES staff(id) ON DELETE SET NULL,
+      sent_by_staff_name  TEXT DEFAULT '',
+      decided_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL,
+      decided_by_staff_name TEXT DEFAULT '',
+      decided_at          TIMESTAMPTZ,
+      decision_note       TEXT DEFAULT '',
+      received_qty        INTEGER,
+      occurred_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
   // staff_name is a snapshot, not just the join: if someone leaves and is
   // removed from the list, the history of what they scanned must survive.
   await pool.query(`
@@ -626,18 +741,35 @@ async function ensureMasterAccount(client) {
   return { masterUser, biz };
 }
 
-// ── Auth: code-only login → the shared master account ──
+// ── Auth: code-only login → master account, or one shop ──
+// One field, one code. Which code you type decides what you can reach: the
+// master code opens the whole business, a shop key opens only that shop.
 app.post('/api/auth/access-login', authLimiter, validate(accessSchema), async (req, res) => {
-  if (!accessOk(req.body.code)) {
+  const access = resolveAccess(req.body.code);
+  if (!access) {
     return res.status(403).json({ error: 'Invalid access code' });
   }
   const client = await pool.connect();
   try {
     const { masterUser, biz } = await ensureMasterAccount(client);
+
+    let scopeShop = null;
+    if (access.role === 'shop') {
+      const { rows } = await client.query(
+        'SELECT id, name, code FROM shops WHERE business_id=$1 AND code=$2',
+        [biz.id, access.shopCode]
+      );
+      if (!rows.length) {
+        return res.status(403).json({ error: 'This shop key is not linked to a shop yet' });
+      }
+      scopeShop = rows[0];
+    }
+
     res.json({
-      token: makeToken(masterUser),
-      user: formatUser(masterUser),
+      token: makeToken(masterUser, access),
+      user: formatUser(masterUser, access),
       business: { id: biz.id, name: biz.name },
+      scope: scopeShop ? { shopId: scopeShop.id, shopName: scopeShop.name, shopCode: scopeShop.code } : null,
     });
   } catch (err) {
     logger.error('access-login.error', { err: err.message });
@@ -815,7 +947,15 @@ app.get('/api/auth/me', auth, async (req, res) => {
       const b = await pool.query('SELECT * FROM businesses WHERE id=$1', [rows[0].business_id]);
       if (b.rows[0]) business = { id: b.rows[0].id, name: b.rows[0].name };
     }
-    res.json({ user: formatUser(rows[0]), business, trial: trialInfo(rows[0]) });
+    // Carry the session's access level through a page reload, so a shop key
+    // does not come back as the master account.
+    const access = { role: req.accessRole, shopCode: req.user.shopCode || null };
+    let scope = null;
+    if (req.accessRole === 'shop' && req.scopeShopId) {
+      const s = await pool.query('SELECT id, name, code FROM shops WHERE id=$1', [req.scopeShopId]);
+      if (s.rows[0]) scope = { shopId: s.rows[0].id, shopName: s.rows[0].name, shopCode: s.rows[0].code };
+    }
+    res.json({ user: formatUser(rows[0], access), business, scope, trial: trialInfo(rows[0]) });
   } catch (err) {
     logger.error('me.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
@@ -1046,7 +1186,7 @@ app.post('/api/auth/logout', auth, async (req, res) => {
 });
 
 // ── Auth: Delete account (GDPR) ───────────────────────────
-app.delete('/api/auth/account', auth, validate(deleteAccountSchema), async (req, res) => {
+app.delete('/api/auth/account', auth, requireAdmin, validate(deleteAccountSchema), async (req, res) => {
   try {
     const { password } = req.body;
     const { rows } = await pool.query('SELECT id, password_hash, role, business_id FROM users WHERE id=$1', [req.user.id]);
@@ -1070,7 +1210,7 @@ app.delete('/api/auth/account', auth, validate(deleteAccountSchema), async (req,
 });
 
 // ── Auth: Export data (GDPR) ──────────────────────────────
-app.get('/api/auth/export-data', auth, async (req, res) => {
+app.get('/api/auth/export-data', auth, requireAdmin, async (req, res) => {
   try {
     const userId = req.user.id;
     const businessId = req.user.businessId;
@@ -1096,6 +1236,28 @@ app.get('/api/auth/export-data', auth, async (req, res) => {
   }
 });
 
+
+// Routes addressed as /api/shops/:shopId/... — a shop key may only name its own.
+const scopedShop = (req, res, next) => {
+  if (!shopAllowed(req, req.params.shopId)) return denyShop(res);
+  next();
+};
+
+// Routes addressed by stock item id. The shop is not in the URL, so it has to
+// be read from the row before we can tell whether this key may touch it.
+const scopedItem = async (req, res, next) => {
+  if (req.accessRole === 'admin') return next();
+  try {
+    const { rows } = await pool.query('SELECT shop_id FROM stock_items WHERE id=$1', [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Item not found' });
+    if (Number(rows[0].shop_id) !== Number(req.scopeShopId)) return denyShop(res);
+    next();
+  } catch (err) {
+    logger.error('scopedItem.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
 // ── Shops ─────────────────────────────────────────────────
 app.get('/api/shops', auth, async (req, res) => {
   try {
@@ -1111,37 +1273,39 @@ app.get('/api/shops', auth, async (req, res) => {
   }
 });
 
-app.post('/api/shops', auth, requireOwner, validate(shopSchema), async (req, res) => {
+app.post('/api/shops', auth, requireAdmin, requireOwner, validate(shopSchema), async (req, res) => {
   try {
     if (!req.user.businessId) return res.status(400).json({ error: 'No business' });
-    const { name, address } = req.body;
+    const { name, address, code } = req.body;
     const { rows } = await pool.query(
-      `INSERT INTO shops (business_id, name, address) VALUES ($1, $2, $3) RETURNING *`,
-      [req.user.businessId, name, address || '']
+      `INSERT INTO shops (business_id, name, address, code) VALUES ($1, $2, $3, $4) RETURNING *`,
+      [req.user.businessId, name, address || '', code || null]
     );
     res.status(201).json(formatShop(rows[0]));
   } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'Another shop already uses that key' });
     logger.error('shops.create.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.put('/api/shops/:id', auth, requireOwner, validate(shopSchema), async (req, res) => {
+app.put('/api/shops/:id', auth, requireAdmin, requireOwner, validate(shopSchema), async (req, res) => {
   try {
-    const { name, address } = req.body;
+    const { name, address, code } = req.body;
     const { rows } = await pool.query(
-      `UPDATE shops SET name=$1, address=$2 WHERE id=$3 AND business_id=$4 RETURNING *`,
-      [name, address || '', req.params.id, req.user.businessId]
+      `UPDATE shops SET name=$1, address=$2, code=$3 WHERE id=$4 AND business_id=$5 RETURNING *`,
+      [name, address || '', code || null, req.params.id, req.user.businessId]
     );
     if (!rows.length) return res.status(404).json({ error: 'Shop not found' });
     res.json(formatShop(rows[0]));
   } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'Another shop already uses that key' });
     logger.error('shops.update.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.delete('/api/shops/:id', auth, requireOwner, async (req, res) => {
+app.delete('/api/shops/:id', auth, requireAdmin, requireOwner, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `DELETE FROM shops WHERE id=$1 AND business_id=$2 RETURNING id`,
@@ -1201,7 +1365,7 @@ app.get('/api/staff', auth, async (req, res) => {
   }
 });
 
-app.post('/api/staff', auth, validate(staffSchema), async (req, res) => {
+app.post('/api/staff', auth, requireAdmin, validate(staffSchema), async (req, res) => {
   try {
     const { name, shopId, commissionRate } = req.body;
     const rate = commissionRate === undefined ? null : Number(commissionRate);
@@ -1232,7 +1396,7 @@ app.post('/api/staff', auth, validate(staffSchema), async (req, res) => {
 
 // Soft delete: the movements this person scanned keep their name, so removing
 // someone from the list never erases the history of what they handled.
-app.delete('/api/staff/:id', auth, async (req, res) => {
+app.delete('/api/staff/:id', auth, requireAdmin, async (req, res) => {
   try {
     const { rowCount } = await pool.query(
       'UPDATE staff SET active=FALSE WHERE id=$1 AND business_id=$2',
@@ -1291,7 +1455,7 @@ const yearRange = (v) => {
 // sales figures would quietly wreck every report on this page.
 const SALE_TYPES_SQL = "m.type IN ('sale', 'out') AND m.qty_change < 0";
 
-app.get('/api/shops/:shopId/stock', auth, async (req, res) => {
+app.get('/api/shops/:shopId/stock', auth, scopedShop, async (req, res) => {
   try {
     if (!await shopGuard(req.params.shopId, req.user.businessId)) {
       return res.status(404).json({ error: 'Shop not found' });
@@ -1350,7 +1514,7 @@ app.get('/api/shops/:shopId/stock', auth, async (req, res) => {
 
 // Aggregated stock across all shops in the business — one row per SKU with
 // per-shop qty and a grand total. Powers the master overview page.
-app.get('/api/business/stock-overview', auth, async (req, res) => {
+app.get('/api/business/stock-overview', auth, requireAdmin, async (req, res) => {
   try {
     const businessId = req.user.businessId;
     if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
@@ -1456,7 +1620,7 @@ const BEST_SELLER_KEYS = {
 // Best sellers across the business, for a calendar year or a rolling window.
 // A "sale" is a barcode/manual sell (type 'sale') or a logged sell-out ('out').
 // Trend compares the chosen window against the one immediately before it.
-app.get('/api/business/best-sellers', auth, async (req, res) => {
+app.get('/api/business/best-sellers', auth, requireAdmin, async (req, res) => {
   try {
     const businessId = req.user.businessId;
     if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
@@ -1571,7 +1735,7 @@ app.get('/api/business/best-sellers', auth, async (req, res) => {
 
 // How many of each SKU sold, per shop, in one year. Keyed by SKU so the
 // overview can hang a "sold" line under the matching stock row.
-app.get('/api/business/sold-overview', auth, async (req, res) => {
+app.get('/api/business/sold-overview', auth, requireAdmin, async (req, res) => {
   try {
     const businessId = req.user.businessId;
     if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
@@ -1617,7 +1781,7 @@ app.get('/api/business/sold-overview', auth, async (req, res) => {
 });
 
 // Which years actually have sales in them — populates the year dropdown.
-app.get('/api/business/sales-years', auth, async (req, res) => {
+app.get('/api/business/sales-years', auth, requireAdmin, async (req, res) => {
   try {
     const businessId = req.user.businessId;
     if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
@@ -1642,7 +1806,7 @@ app.get('/api/business/sales-years', auth, async (req, res) => {
 });
 
 // The most recent sales, newest first — "what sold, when, and where".
-app.get('/api/business/recent-sales', auth, async (req, res) => {
+app.get('/api/business/recent-sales', auth, requireAdmin, async (req, res) => {
   try {
     const businessId = req.user.businessId;
     if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
@@ -1698,7 +1862,7 @@ app.get('/api/business/recent-sales', auth, async (req, res) => {
 });
 
 // Recent stock activity across every shop — powers the Overview activity feed.
-app.get('/api/business/activity', auth, async (req, res) => {
+app.get('/api/business/activity', auth, requireAdmin, async (req, res) => {
   try {
     const businessId = req.user.businessId;
     if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
@@ -1736,7 +1900,7 @@ app.get('/api/business/activity', auth, async (req, res) => {
 // Everything that happened to one product in one year: every date it came in,
 // every date it went out, who handled it, and a month-by-month roll-up.
 // This is the "click the item and see August: 6 in, 4 sold" view.
-app.get('/api/business/sku-history', auth, async (req, res) => {
+app.get('/api/business/sku-history', auth, requireAdmin, async (req, res) => {
   try {
     const businessId = req.user.businessId;
     if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
@@ -1821,7 +1985,7 @@ app.get('/api/business/sku-history', auth, async (req, res) => {
 // Commission is computed from the rate on the staff row at report time rather
 // than stored per sale — if a rate changes, the whole report moves with it,
 // which is what "what do I owe Belina this month" actually means.
-app.get('/api/business/staff-performance', auth, async (req, res) => {
+app.get('/api/business/staff-performance', auth, requireAdmin, async (req, res) => {
   try {
     const businessId = req.user.businessId;
     if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
@@ -1897,9 +2061,116 @@ app.get('/api/business/staff-performance', auth, async (req, res) => {
   }
 });
 
+// Everything that happened, across every shop, for the last three years.
+// One row per movement — sales, stock in, stock out, both legs of a transfer —
+// each carrying who did it, how many pieces, and what they were worth.
+const HISTORY_TYPES = ['sale', 'out', 'in', 'adjust', 'transfer-in', 'transfer-out'];
+const HISTORY_YEARS = 3;
+
+app.get('/api/business/history', auth, requireAdmin, async (req, res) => {
+  try {
+    const businessId = req.user.businessId;
+    if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
+
+    // Three years back from the start of the current year, so "3 years" means
+    // three whole calendar years and not a rolling window that drops January.
+    const floor = new Date(Date.UTC(new Date().getUTCFullYear() - (HISTORY_YEARS - 1), 0, 1));
+
+    const params = [businessId, floor];
+    let where = 'WHERE sh.business_id = $1 AND m.occurred_at >= $2';
+
+    const shopIds = parseShopIds(req.query.shops);
+    if (shopIds) {
+      params.push(shopIds);
+      where += ` AND m.shop_id = ANY($${params.length}::int[])`;
+    }
+    const type = String(req.query.type || '').trim();
+    if (HISTORY_TYPES.includes(type)) {
+      params.push(type);
+      where += ` AND m.type = $${params.length}`;
+    }
+    const staffId = parseInt(req.query.staffId, 10);
+    if (Number.isInteger(staffId)) {
+      params.push(staffId);
+      where += ` AND m.staff_id = $${params.length}`;
+    }
+    const year = parseInt(req.query.year, 10);
+    if (Number.isInteger(year)) {
+      params.push(year);
+      where += ` AND EXTRACT(YEAR FROM m.occurred_at) = $${params.length}`;
+    }
+    const month = parseInt(req.query.month, 10);
+    if (month >= 1 && month <= 12) {
+      params.push(month);
+      where += ` AND EXTRACT(MONTH FROM m.occurred_at) = $${params.length}`;
+    }
+    const q = String(req.query.q || '').trim();
+    if (q) {
+      params.push(`%${q}%`);
+      where += ` AND (si.sku ILIKE $${params.length} OR si.name ILIKE $${params.length} OR m.staff_name ILIKE $${params.length})`;
+    }
+
+    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+    const base = `
+      FROM stock_movements m
+      JOIN stock_items si ON si.id = m.item_id
+      JOIN shops sh ON sh.id = m.shop_id
+      ${where}
+    `;
+
+    const { rows } = await pool.query(
+      `SELECT m.id, m.type, m.qty_change, m.qty_after, m.occurred_at, m.note, m.reason,
+              COALESCE(NULLIF(m.staff_name,''), '(not recorded)') AS staff_name,
+              m.staff_id, si.sku, si.name AS item_name, si.color, si.size,
+              COALESCE(si.price,0) AS price, sh.id AS shop_id, sh.name AS shop_name
+       ${base}
+       ORDER BY m.occurred_at DESC, m.id DESC
+       LIMIT ${limit} OFFSET ${offset}`,
+      params
+    );
+
+    const { rows: countRows } = await pool.query(`SELECT COUNT(*)::int AS n ${base}`, params);
+
+    res.json({
+      total: countRows[0].n,
+      limit,
+      offset,
+      sinceYear: floor.getUTCFullYear(),
+      items: rows.map(r => ({
+        id: r.id,
+        type: r.type,
+        qtyChange: r.qty_change,
+        qtyAfter: r.qty_after,
+        // Only pieces leaving as a sale carry a value; a transfer moves the
+        // same garment between shelves and is not money changing hands.
+        value: (r.type === 'sale' || r.type === 'out')
+          ? Math.abs(r.qty_change) * Number(r.price)
+          : 0,
+        occurredAt: r.occurred_at,
+        note: r.note || '',
+        reason: r.reason || '',
+        staffId: r.staff_id,
+        staffName: r.staff_name,
+        sku: r.sku,
+        itemName: r.item_name,
+        color: r.color || '',
+        size: r.size || '',
+        price: Number(r.price),
+        shopId: r.shop_id,
+        shopName: r.shop_name,
+      })),
+    });
+  } catch (err) {
+    logger.error('business.history.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // One shop's full movement ledger — every date stock arrived and left.
 // This is the back-office view, deliberately away from the scanning screens.
-app.get('/api/shops/:shopId/ledger', auth, async (req, res) => {
+app.get('/api/shops/:shopId/ledger', auth, requireAdmin, async (req, res) => {
   try {
     if (!await shopGuard(req.params.shopId, req.user.businessId)) {
       return res.status(404).json({ error: 'Shop not found' });
@@ -1960,7 +2231,7 @@ app.get('/api/shops/:shopId/ledger', auth, async (req, res) => {
 });
 
 // Business-wide facet values — union of distinct fabric/color/size across all shops.
-app.get('/api/business/facets', auth, async (req, res) => {
+app.get('/api/business/facets', auth, requireAdmin, async (req, res) => {
   try {
     const businessId = req.user.businessId;
     if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
@@ -1994,7 +2265,7 @@ app.get('/api/business/facets', auth, async (req, res) => {
 
 // Distinct fabric/color/size for filter dropdowns.
 // Returns arrays sorted alphabetically, filtering out empty strings.
-app.get('/api/shops/:shopId/facets', auth, async (req, res) => {
+app.get('/api/shops/:shopId/facets', auth, scopedShop, async (req, res) => {
   try {
     if (!await shopGuard(req.params.shopId, req.user.businessId)) {
       return res.status(404).json({ error: 'Shop not found' });
@@ -2033,7 +2304,7 @@ async function ensureStaffStockPerm(req, action) {
   return false;
 }
 
-app.post('/api/shops/:shopId/stock', auth, validate(stockItemSchema), async (req, res) => {
+app.post('/api/shops/:shopId/stock', auth, scopedShop, validate(stockItemSchema), async (req, res) => {
   try {
     if (!await shopGuard(req.params.shopId, req.user.businessId)) {
       return res.status(404).json({ error: 'Shop not found' });
@@ -2059,7 +2330,7 @@ app.post('/api/shops/:shopId/stock', auth, validate(stockItemSchema), async (req
   }
 });
 
-app.put('/api/stock/:id', auth, validate(stockItemSchema), async (req, res) => {
+app.put('/api/stock/:id', auth, scopedItem, validate(stockItemSchema), async (req, res) => {
   try {
     // Verify item belongs to a shop in user's business
     const { rows: own } = await pool.query(
@@ -2085,7 +2356,7 @@ app.put('/api/stock/:id', auth, validate(stockItemSchema), async (req, res) => {
 });
 
 // Quick qty update (also auto-logs movement)
-app.patch('/api/stock/:id/qty', auth, async (req, res) => {
+app.patch('/api/stock/:id/qty', auth, scopedItem, async (req, res) => {
   const client = await pool.connect();
   try {
     const { qty } = req.body;
@@ -2131,7 +2402,7 @@ app.patch('/api/stock/:id/qty', auth, async (req, res) => {
 // A scanner types the code and presses Enter. Given a shop + code, find the
 // matching item, drop its quantity by 1, and record it as a SALE (so it feeds
 // the "sold" figures — distinct from transfers/adjustments).
-app.post('/api/shops/:shopId/sell', auth, async (req, res) => {
+app.post('/api/shops/:shopId/sell', auth, scopedShop, async (req, res) => {
   const client = await pool.connect();
   try {
     if (!await shopGuard(req.params.shopId, req.user.businessId)) {
@@ -2203,7 +2474,7 @@ const SCAN_MODES = {
   out:  { type: 'removal',      dir: -1, label: 'Removed' },
 };
 
-app.post('/api/shops/:shopId/scan', auth, async (req, res) => {
+app.post('/api/shops/:shopId/scan', auth, scopedShop, async (req, res) => {
   const client = await pool.connect();
   try {
     if (!await shopGuard(req.params.shopId, req.user.businessId)) {
@@ -2289,7 +2560,7 @@ app.post('/api/shops/:shopId/scan', auth, async (req, res) => {
   }
 });
 
-app.delete('/api/stock/:id', auth, async (req, res) => {
+app.delete('/api/stock/:id', auth, scopedItem, async (req, res) => {
   try {
     const { rows: own } = await pool.query(
       `SELECT s.id FROM stock_items s JOIN shops sh ON sh.id=s.shop_id WHERE s.id=$1 AND sh.business_id=$2`,
@@ -2308,7 +2579,7 @@ app.delete('/api/stock/:id', auth, async (req, res) => {
 });
 
 // ── Stock movements (history of in/out events) ────────────
-app.post('/api/stock/:id/movements', auth, validate(movementSchema), async (req, res) => {
+app.post('/api/stock/:id/movements', auth, scopedItem, validate(movementSchema), async (req, res) => {
   const client = await pool.connect();
   try {
     const { type, qty, occurredAt, note } = req.body;
@@ -2348,13 +2619,243 @@ app.post('/api/stock/:id/movements', auth, validate(movementSchema), async (req,
   }
 });
 
-// Transfer stock from one shop to another (typically Office → shop).
-// Decrements source item, increments destination item, logs both movements.
-// If the destination shop doesn't have that SKU yet, creates it.
+const formatTransfer = (t) => ({
+  id: t.id,
+  fromShopId: t.from_shop_id,
+  fromShopName: t.from_shop_name || '',
+  toShopId: t.to_shop_id,
+  toShopName: t.to_shop_name || '',
+  sku: t.sku,
+  itemName: t.item_name || '',
+  qty: t.qty,
+  status: t.status,
+  note: t.note || '',
+  sentBy: t.sent_by_staff_name || '',
+  decidedBy: t.decided_by_staff_name || '',
+  decidedAt: t.decided_at,
+  decisionNote: t.decision_note || '',
+  receivedQty: t.received_qty,
+  occurredAt: t.occurred_at,
+  createdAt: t.created_at,
+});
+
+const TRANSFER_SELECT = `
+  SELECT t.*, fs.name AS from_shop_name, ts.name AS to_shop_name
+  FROM transfers t
+  JOIN shops fs ON fs.id = t.from_shop_id
+  JOIN shops ts ON ts.id = t.to_shop_id
+`;
+
+// Transfers this session is allowed to see. A shop key sees only what it sent
+// and what is coming to it; the master code sees all of them.
+app.get('/api/transfers', auth, async (req, res) => {
+  try {
+    const params = [req.user.businessId];
+    let where = 'WHERE t.business_id = $1';
+
+    if (req.accessRole === 'shop') {
+      params.push(req.scopeShopId);
+      where += ` AND (t.from_shop_id = $${params.length} OR t.to_shop_id = $${params.length})`;
+    }
+    const status = String(req.query.status || '').trim();
+    if (['pending', 'approved', 'rejected'].includes(status)) {
+      params.push(status);
+      where += ` AND t.status = $${params.length}`;
+    }
+    // 'in' = waiting on us to count it, 'out' = we sent it.
+    const direction = String(req.query.direction || '').trim();
+    if (direction === 'in' || direction === 'out') {
+      const col = direction === 'in' ? 't.to_shop_id' : 't.from_shop_id';
+      const shopId = req.accessRole === 'shop'
+        ? req.scopeShopId
+        : parseInt(req.query.shopId, 10);
+      if (Number.isInteger(shopId)) {
+        params.push(shopId);
+        where += ` AND ${col} = $${params.length}`;
+      }
+    }
+
+    const limit = Math.min(parseInt(req.query.limit, 10) || 200, 500);
+    const { rows } = await pool.query(
+      `${TRANSFER_SELECT} ${where}
+       ORDER BY CASE WHEN t.status='pending' THEN 0 ELSE 1 END, t.occurred_at DESC, t.id DESC
+       LIMIT ${limit}`,
+      params
+    );
+    res.json(rows.map(formatTransfer));
+  } catch (err) {
+    logger.error('transfers.list.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Count it in. Only now does the receiving shop's stock move — and only by
+// the quantity actually counted, which may be short of what was sent.
+app.post('/api/transfers/:id/approve', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const staff = await resolveStaff(req.body.staffId, req.user.businessId);
+    await client.query('BEGIN');
+
+    const { rows } = await client.query(
+      'SELECT * FROM transfers WHERE id=$1 AND business_id=$2 FOR UPDATE',
+      [req.params.id, req.user.businessId]
+    );
+    if (!rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Transfer not found' });
+    }
+    const t = rows[0];
+    // Only the shop the stock is going TO may accept it. The office cannot
+    // sign for its own delivery.
+    if (!shopAllowed(req, t.to_shop_id)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Only the receiving shop can approve this transfer' });
+    }
+    if (t.status !== 'pending') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: `This transfer was already ${t.status}` });
+    }
+
+    // Short deliveries are the normal case worth recording: five sent, four
+    // arrived. Whatever is missing stays missing rather than being invented.
+    const askedQty = req.body.receivedQty;
+    const receivedQty = askedQty === undefined || askedQty === null || askedQty === ''
+      ? t.qty
+      : parseInt(askedQty, 10);
+    if (!Number.isInteger(receivedQty) || receivedQty < 0 || receivedQty > t.qty) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Received quantity must be between 0 and ${t.qty}` });
+    }
+
+    // Find or create the destination row.
+    const { rows: toRows } = await client.query(
+      'SELECT * FROM stock_items WHERE shop_id=$1 AND sku=$2 FOR UPDATE',
+      [t.to_shop_id, t.sku]
+    );
+    let dstItem = toRows[0];
+    if (!dstItem) {
+      const { rows: src } = await client.query(
+        'SELECT * FROM stock_items WHERE shop_id=$1 AND sku=$2 LIMIT 1',
+        [t.from_shop_id, t.sku]
+      );
+      const proto = src[0] || {};
+      const { rows: posRows } = await client.query(
+        'SELECT COALESCE(MAX(position), -1) + 1 AS p FROM stock_items WHERE shop_id=$1',
+        [t.to_shop_id]
+      );
+      const { rows: created } = await client.query(
+        `INSERT INTO stock_items (shop_id, name, category, fabric, print, size, color, sku, brand, qty, threshold, supplier, notes, position, image_url, price)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,$11,$12,$13,$14,$15) RETURNING *`,
+        [t.to_shop_id, proto.name || t.item_name, proto.category || '', proto.fabric || '', proto.print || '',
+         proto.size || '', proto.color || '', t.sku, proto.brand || '', proto.threshold || 0,
+         proto.supplier || '', '', posRows[0].p, proto.image_url || '', proto.price || 0]
+      );
+      dstItem = created[0];
+    }
+
+    const newQty = dstItem.qty + receivedQty;
+    if (receivedQty > 0) {
+      await client.query(
+        'UPDATE stock_items SET qty=$1, updated_at=NOW() WHERE id=$2',
+        [newQty, dstItem.id]
+      );
+      await client.query(
+        `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note, staff_id, staff_name)
+         VALUES ($1,$2,$3,'transfer-in',$4,$5,NOW(),$6,$7,$8)`,
+        [dstItem.id, t.to_shop_id, req.user.id, receivedQty, newQty,
+         `Transfer received${receivedQty < t.qty ? ` (${receivedQty} of ${t.qty})` : ''}`,
+         staff.id, staff.name]
+      );
+    }
+
+    const { rows: updated } = await client.query(
+      `UPDATE transfers SET status='approved', received_qty=$1, decided_by_staff_id=$2,
+         decided_by_staff_name=$3, decided_at=NOW(), decision_note=$4
+       WHERE id=$5 RETURNING *`,
+      [receivedQty, staff.id, staff.name, String(req.body.note || '').slice(0, 500), t.id]
+    );
+
+    await client.query('COMMIT');
+    res.json({ transfer: formatTransfer(updated[0]), newQty });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    logger.error('transfer.approve.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Refuse the delivery. The stock goes back onto the sending shop's shelf,
+// because it never left the business — it just never arrived.
+app.post('/api/transfers/:id/reject', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const staff = await resolveStaff(req.body.staffId, req.user.businessId);
+    await client.query('BEGIN');
+
+    const { rows } = await client.query(
+      'SELECT * FROM transfers WHERE id=$1 AND business_id=$2 FOR UPDATE',
+      [req.params.id, req.user.businessId]
+    );
+    if (!rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Transfer not found' });
+    }
+    const t = rows[0];
+    if (!shopAllowed(req, t.to_shop_id)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Only the receiving shop can reject this transfer' });
+    }
+    if (t.status !== 'pending') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: `This transfer was already ${t.status}` });
+    }
+
+    const { rows: srcRows } = await client.query(
+      'SELECT * FROM stock_items WHERE shop_id=$1 AND sku=$2 FOR UPDATE',
+      [t.from_shop_id, t.sku]
+    );
+    if (srcRows.length) {
+      const src = srcRows[0];
+      const back = src.qty + t.qty;
+      await client.query('UPDATE stock_items SET qty=$1, updated_at=NOW() WHERE id=$2', [back, src.id]);
+      await client.query(
+        `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note, staff_id, staff_name)
+         VALUES ($1,$2,$3,'transfer-in',$4,$5,NOW(),$6,$7,$8)`,
+        [src.id, t.from_shop_id, req.user.id, t.qty, back, 'Transfer rejected — returned', staff.id, staff.name]
+      );
+    }
+
+    const { rows: updated } = await client.query(
+      `UPDATE transfers SET status='rejected', received_qty=0, decided_by_staff_id=$1,
+         decided_by_staff_name=$2, decided_at=NOW(), decision_note=$3
+       WHERE id=$4 RETURNING *`,
+      [staff.id, staff.name, String(req.body.note || '').slice(0, 500), t.id]
+    );
+
+    await client.query('COMMIT');
+    res.json({ transfer: formatTransfer(updated[0]) });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    logger.error('transfer.reject.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Send stock from one shop to another (typically Office → shop).
+// This only starts the transfer: the pieces leave the sending shelf, and wait
+// as "in transit" until someone at the receiving shop counts them and
+// approves. See POST /api/transfers/:id/approve.
 app.post('/api/transfers', auth, validate(transferSchema), async (req, res) => {
   const { sku, fromShopId, toShopId, qty, occurredAt, note, staffId } = req.body;
   const staff = await resolveStaff(staffId, req.user.businessId);
   if (fromShopId === toShopId) return res.status(400).json({ error: 'Source and destination must differ' });
+  // A shop key may send stock out of its own shop, nowhere else.
+  if (!shopAllowed(req, fromShopId)) return denyShop(res);
 
   const client = await pool.connect();
   try {
@@ -2387,61 +2888,42 @@ app.post('/api/transfers', auth, validate(transferSchema), async (req, res) => {
       return res.status(400).json({ error: `Not enough stock in ${fromShop.name} (have ${srcItem.qty}, need ${qty})` });
     }
 
-    // Find or create destination row
-    const { rows: toRows } = await client.query(
-      'SELECT * FROM stock_items WHERE shop_id=$1 AND sku=$2 FOR UPDATE',
-      [toShopId, sku]
-    );
-    let dstItem;
-    if (toRows.length) {
-      dstItem = toRows[0];
-    } else {
-      const { rows: posRows } = await client.query(
-        'SELECT COALESCE(MAX(position), -1) + 1 AS p FROM stock_items WHERE shop_id=$1',
-        [toShopId]
-      );
-      const { rows: created } = await client.query(
-        `INSERT INTO stock_items (shop_id, name, category, fabric, print, size, color, sku, brand, qty, threshold, supplier, notes, position, image_url, price)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,$11,$12,$13,$14,$15) RETURNING *`,
-        [toShopId, srcItem.name, srcItem.category, srcItem.fabric, srcItem.print, srcItem.size, srcItem.color, srcItem.sku, srcItem.brand, srcItem.threshold, srcItem.supplier, '', posRows[0].p, srcItem.image_url, srcItem.price]
-      );
-      dstItem = created[0];
-    }
-
     const occurred = occurredAt ? new Date(occurredAt) : new Date();
     const newSrcQty = srcItem.qty - qty;
-    const newDstQty = dstItem.qty + qty;
     const noteFrom = note || `Transfer to ${toShop.name}`;
-    const noteTo   = note || `Transfer from ${fromShop.name}`;
 
-    // Update quantities
+    // The pieces leave the sending shelf now — they are physically in a bag.
+    // They do NOT arrive on the receiving shelf yet: someone there has to
+    // count them first. Between the two, the stock is in transit and belongs
+    // to neither shop, which is what the pending transfer row represents.
     await client.query(
       'UPDATE stock_items SET qty=$1, updated_at=NOW() WHERE id=$2',
       [newSrcQty, srcItem.id]
     );
-    await client.query(
-      'UPDATE stock_items SET qty=$1, updated_at=NOW() WHERE id=$2',
-      [newDstQty, dstItem.id]
-    );
 
-    // Log movements. These MUST NOT be 'out'/'in': 'out' is counted as a sale,
-    // so office → shop transfers were showing up as the office selling stock.
+    // Log the outbound leg. This MUST NOT be 'out': 'out' is counted as a
+    // sale, so office → shop transfers would show up as the office selling.
     await client.query(
       `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note, staff_id, staff_name)
        VALUES ($1,$2,$3,'transfer-out',$4,$5,$6,$7,$8,$9)`,
       [srcItem.id, fromShopId, req.user.id, -qty, newSrcQty, occurred, noteFrom, staff.id, staff.name]
     );
-    await client.query(
-      `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note, staff_id, staff_name)
-       VALUES ($1,$2,$3,'transfer-in',$4,$5,$6,$7,$8,$9)`,
-      [dstItem.id, toShopId, req.user.id, qty, newDstQty, occurred, noteTo, staff.id, staff.name]
+
+    const { rows: tRows } = await client.query(
+      `INSERT INTO transfers
+         (business_id, from_shop_id, to_shop_id, sku, item_name, qty, status, note,
+          sent_by_staff_id, sent_by_staff_name, occurred_at)
+       VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,$8,$9,$10) RETURNING *`,
+      [req.user.businessId, fromShopId, toShopId, sku, srcItem.name, qty,
+       note || '', staff.id, staff.name, occurred]
     );
 
     await client.query('COMMIT');
 
     res.status(201).json({
+      transfer: formatTransfer({ ...tRows[0], from_shop_name: fromShop.name, to_shop_name: toShop.name }),
       from: { shopId: fromShopId, shopName: fromShop.name, sku, newQty: newSrcQty },
-      to:   { shopId: toShopId,   shopName: toShop.name,   sku, newQty: newDstQty },
+      to:   { shopId: toShopId,   shopName: toShop.name,   sku, pending: true },
       qty,
       occurredAt: occurred.toISOString(),
       note,
@@ -2455,7 +2937,7 @@ app.post('/api/transfers', auth, validate(transferSchema), async (req, res) => {
   }
 });
 
-app.get('/api/stock/:id/movements', auth, async (req, res) => {
+app.get('/api/stock/:id/movements', auth, scopedItem, async (req, res) => {
   try {
     const { rows: own } = await pool.query(
       `SELECT s.id FROM stock_items s JOIN shops sh ON sh.id=s.shop_id WHERE s.id=$1 AND sh.business_id=$2`,
@@ -2473,7 +2955,7 @@ app.get('/api/stock/:id/movements', auth, async (req, res) => {
   }
 });
 
-app.get('/api/shops/:shopId/movements', auth, async (req, res) => {
+app.get('/api/shops/:shopId/movements', auth, scopedShop, async (req, res) => {
   try {
     if (!await shopGuard(req.params.shopId, req.user.businessId)) {
       return res.status(404).json({ error: 'Shop not found' });
@@ -2496,7 +2978,7 @@ const groupSchema = z.object({
   name: z.string().trim().min(1).max(80),
 });
 
-app.get('/api/shops/:shopId/groups', auth, async (req, res) => {
+app.get('/api/shops/:shopId/groups', auth, scopedShop, async (req, res) => {
   try {
     if (!await shopGuard(req.params.shopId, req.user.businessId)) {
       return res.status(404).json({ error: 'Shop not found' });
@@ -2512,7 +2994,7 @@ app.get('/api/shops/:shopId/groups', auth, async (req, res) => {
   }
 });
 
-app.post('/api/shops/:shopId/groups', auth, validate(groupSchema), async (req, res) => {
+app.post('/api/shops/:shopId/groups', auth, scopedShop, validate(groupSchema), async (req, res) => {
   try {
     if (!await shopGuard(req.params.shopId, req.user.businessId)) {
       return res.status(404).json({ error: 'Shop not found' });
@@ -2535,7 +3017,7 @@ app.post('/api/shops/:shopId/groups', auth, validate(groupSchema), async (req, r
   }
 });
 
-app.delete('/api/groups/:id', auth, async (req, res) => {
+app.delete('/api/groups/:id', auth, requireAdmin, async (req, res) => {
   try {
     const { rows: own } = await pool.query(
       `SELECT g.id FROM item_groups g JOIN shops sh ON sh.id=g.shop_id WHERE g.id=$1 AND sh.business_id=$2`,
@@ -2554,7 +3036,7 @@ app.delete('/api/groups/:id', auth, async (req, res) => {
 });
 
 // Assign item to group (or remove with groupId=null)
-app.patch('/api/stock/:id/group', auth, async (req, res) => {
+app.patch('/api/stock/:id/group', auth, scopedItem, async (req, res) => {
   try {
     const groupId = req.body?.groupId;
     const validGroupId = groupId === null || groupId === undefined || (Number.isInteger(groupId) && groupId > 0);
@@ -2588,7 +3070,7 @@ app.patch('/api/stock/:id/group', auth, async (req, res) => {
 
 // Reorder items — body: { orderedIds: number[] }
 // Reassigns the positions among those items to match the new order, preserving the slot set.
-app.patch('/api/shops/:shopId/stock/reorder', auth, async (req, res) => {
+app.patch('/api/shops/:shopId/stock/reorder', auth, scopedShop, async (req, res) => {
   const client = await pool.connect();
   try {
     const orderedIds = Array.isArray(req.body?.orderedIds) ? req.body.orderedIds : null;
@@ -2625,7 +3107,7 @@ app.patch('/api/shops/:shopId/stock/reorder', auth, async (req, res) => {
 });
 
 // ── Invite codes (owner only) ─────────────────────────────
-app.post('/api/invites', auth, requireOwner, async (req, res) => {
+app.post('/api/invites', auth, requireAdmin, requireOwner, async (req, res) => {
   try {
     if (!req.user.businessId) return res.status(400).json({ error: 'No business' });
     // Generate unique code (retry up to 5 times)
@@ -2650,7 +3132,7 @@ app.post('/api/invites', auth, requireOwner, async (req, res) => {
   }
 });
 
-app.get('/api/invites', auth, requireOwner, async (req, res) => {
+app.get('/api/invites', auth, requireAdmin, requireOwner, async (req, res) => {
   try {
     if (!req.user.businessId) return res.json([]);
     const { rows } = await pool.query(
@@ -2664,7 +3146,7 @@ app.get('/api/invites', auth, requireOwner, async (req, res) => {
   }
 });
 
-app.delete('/api/invites/:id', auth, requireOwner, async (req, res) => {
+app.delete('/api/invites/:id', auth, requireAdmin, requireOwner, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `DELETE FROM invite_codes WHERE id=$1 AND business_id=$2 RETURNING id`,
@@ -2699,7 +3181,7 @@ app.get('/api/staff', auth, async (req, res) => {
   }
 });
 
-app.put('/api/staff/:userId/permissions', auth, requireOwner, async (req, res) => {
+app.put('/api/staff/:userId/permissions', auth, requireAdmin, requireOwner, async (req, res) => {
   try {
     const permsBody = req.body && typeof req.body === 'object' ? req.body : {};
     const allowedKeys = Object.keys(DEFAULT_STAFF_PERMS);
@@ -2722,7 +3204,7 @@ app.put('/api/staff/:userId/permissions', auth, requireOwner, async (req, res) =
   }
 });
 
-app.delete('/api/staff/:userId', auth, requireOwner, async (req, res) => {
+app.delete('/api/staff/:userId', auth, requireAdmin, requireOwner, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `DELETE FROM users WHERE id=$1 AND business_id=$2 AND role='staff' RETURNING id`,
@@ -2737,7 +3219,7 @@ app.delete('/api/staff/:userId', auth, requireOwner, async (req, res) => {
 });
 
 // ── Announcements ─────────────────────────────────────────
-app.get('/api/announcements', auth, async (req, res) => {
+app.get('/api/announcements', auth, requireAdmin, async (req, res) => {
   try {
     if (!req.user.businessId) return res.json([]);
     const { rows } = await pool.query(
@@ -2758,7 +3240,7 @@ app.get('/api/announcements', auth, async (req, res) => {
   }
 });
 
-app.post('/api/announcements', auth, async (req, res) => {
+app.post('/api/announcements', auth, requireAdmin, async (req, res) => {
   try {
     if (!req.user.businessId) return res.status(400).json({ error: 'No business' });
     const body = (req.body?.body || '').trim();
@@ -2798,7 +3280,7 @@ app.get('/api/billing/status', auth, async (req, res) => {
   }
 });
 
-app.post('/api/billing/subscribe', auth, async (req, res) => {
+app.post('/api/billing/subscribe', auth, requireAdmin, async (req, res) => {
   // TODO: integrate Stripe checkout
   res.json({
     checkoutUrl: null,
@@ -2807,7 +3289,7 @@ app.post('/api/billing/subscribe', auth, async (req, res) => {
 });
 
 // Dev-only: mock-activate subscription (only available outside production)
-app.post('/api/billing/mock-activate', auth, async (req, res) => {
+app.post('/api/billing/mock-activate', auth, requireAdmin, async (req, res) => {
   if (process.env.NODE_ENV === 'production') {
     return res.status(404).json({ error: 'Not found' });
   }
