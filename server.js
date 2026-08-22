@@ -497,6 +497,9 @@ async function initDB() {
       created_at   TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+  // Percent of the sale value this person earns. Kept on the staff row rather
+  // than on each sale, because the rate is a standing arrangement.
+  await pool.query(`ALTER TABLE staff ADD COLUMN IF NOT EXISTS commission_rate NUMERIC(6,3) NOT NULL DEFAULT 0`);
 
   // staff_name is a snapshot, not just the join: if someone leaves and is
   // removed from the list, the history of what they scanned must survive.
@@ -1161,6 +1164,7 @@ app.delete('/api/shops/:id', auth, requireOwner, async (req, res) => {
 const staffSchema = z.object({
   name: z.string().trim().min(1).max(80),
   shopId: z.number().int().positive().nullable().optional(),
+  commissionRate: z.coerce.number().min(0).max(100).optional(),
 });
 
 const formatStaff = (s) => ({
@@ -1168,6 +1172,7 @@ const formatStaff = (s) => ({
   name: s.name,
   shopId: s.shop_id,
   active: s.active,
+  commissionRate: s.commission_rate !== undefined && s.commission_rate !== null ? Number(s.commission_rate) : 0,
 });
 
 // Turns whatever the client sent into a { id, name } pair to stamp on a
@@ -1198,7 +1203,8 @@ app.get('/api/staff', auth, async (req, res) => {
 
 app.post('/api/staff', auth, validate(staffSchema), async (req, res) => {
   try {
-    const { name, shopId } = req.body;
+    const { name, shopId, commissionRate } = req.body;
+    const rate = commissionRate === undefined ? null : Number(commissionRate);
     // Reactivate rather than duplicate when a name comes back.
     const { rows: existing } = await pool.query(
       'SELECT * FROM staff WHERE business_id=$1 AND LOWER(name)=LOWER($2)',
@@ -1206,14 +1212,16 @@ app.post('/api/staff', auth, validate(staffSchema), async (req, res) => {
     );
     if (existing.length) {
       const { rows } = await pool.query(
-        'UPDATE staff SET active=TRUE, shop_id=$1 WHERE id=$2 RETURNING *',
-        [shopId || null, existing[0].id]
+        `UPDATE staff SET active=TRUE, shop_id=$1,
+           commission_rate = COALESCE($2, commission_rate)
+         WHERE id=$3 RETURNING *`,
+        [shopId || null, rate, existing[0].id]
       );
       return res.status(200).json(formatStaff(rows[0]));
     }
     const { rows } = await pool.query(
-      'INSERT INTO staff (business_id, shop_id, name) VALUES ($1,$2,$3) RETURNING *',
-      [req.user.businessId, shopId || null, name]
+      'INSERT INTO staff (business_id, shop_id, name, commission_rate) VALUES ($1,$2,$3,$4) RETURNING *',
+      [req.user.businessId, shopId || null, name, rate || 0]
     );
     res.status(201).json(formatStaff(rows[0]));
   } catch (err) {
@@ -1805,6 +1813,86 @@ app.get('/api/business/sku-history', auth, async (req, res) => {
     });
   } catch (err) {
     logger.error('business.skuhistory.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// What each person sold, and what they are owed for it.
+// Commission is computed from the rate on the staff row at report time rather
+// than stored per sale — if a rate changes, the whole report moves with it,
+// which is what "what do I owe Belina this month" actually means.
+app.get('/api/business/staff-performance', auth, async (req, res) => {
+  try {
+    const businessId = req.user.businessId;
+    if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
+
+    const { start, end, year } = yearRange(req.query.year || String(new Date().getFullYear()));
+    const month = parseInt(req.query.month, 10);   // 1-12, optional
+    const shopIds = parseShopIds(req.query.shops);
+
+    const params = [businessId];
+    let where = `WHERE s.business_id = $1 AND ${SALE_TYPES_SQL}`;
+    if (start) {
+      params.push(start, end);
+      where += ` AND m.occurred_at >= $${params.length - 1} AND m.occurred_at < $${params.length}`;
+    }
+    if (month >= 1 && month <= 12) {
+      params.push(month);
+      where += ` AND EXTRACT(MONTH FROM m.occurred_at) = $${params.length}`;
+    }
+    if (shopIds) {
+      params.push(shopIds);
+      where += ` AND s.id = ANY($${params.length}::int[])`;
+    }
+
+    const { rows } = await pool.query(
+      `SELECT COALESCE(NULLIF(m.staff_name,''), '(not recorded)') AS name,
+              MIN(m.staff_id) AS staff_id,
+              SUM(-m.qty_change)::int AS units,
+              SUM(-m.qty_change * COALESCE(si.price,0))::numeric AS revenue
+       FROM stock_movements m
+       JOIN stock_items si ON si.id = m.item_id
+       JOIN shops s ON s.id = si.shop_id
+       ${where}
+       GROUP BY 1
+       ORDER BY revenue DESC`,
+      params
+    );
+
+    const { rows: staffRows } = await pool.query(
+      'SELECT id, name, commission_rate FROM staff WHERE business_id=$1',
+      [businessId]
+    );
+    const rateById = new Map(staffRows.map(r => [r.id, Number(r.commission_rate) || 0]));
+    const rateByName = new Map(staffRows.map(r => [r.name.toLowerCase(), Number(r.commission_rate) || 0]));
+
+    const items = rows.map(r => {
+      const revenue = Number(r.revenue) || 0;
+      const rate = r.staff_id != null && rateById.has(r.staff_id)
+        ? rateById.get(r.staff_id)
+        : (rateByName.get(String(r.name).toLowerCase()) || 0);
+      return {
+        staffId: r.staff_id,
+        name: r.name,
+        units: r.units || 0,
+        revenue,
+        rate,
+        commission: Math.round(revenue * rate) / 100,
+      };
+    });
+
+    res.json({
+      year,
+      month: month >= 1 && month <= 12 ? month : null,
+      items,
+      totals: {
+        units: items.reduce((n, i) => n + i.units, 0),
+        revenue: items.reduce((n, i) => n + i.revenue, 0),
+        commission: items.reduce((n, i) => n + i.commission, 0),
+      },
+    });
+  } catch (err) {
+    logger.error('business.staffperf.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
