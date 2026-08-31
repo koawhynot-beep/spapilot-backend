@@ -1249,12 +1249,6 @@ app.get('/api/business/sku-history', auth, requireAdmin, async (req, res) => {
   }
 });
 
-// Everything that happened, across every shop, for the last three years.
-// One row per movement — sales, stock in, stock out, both legs of a transfer —
-// each carrying who did it, how many pieces, and what they were worth.
-const HISTORY_TYPES = ['sale', 'return', 'in', 'removal', 'adjust'];
-const HISTORY_YEARS = 3;
-
 // Business-wide facet values — union of distinct fabric/color/size across all shops.
 app.get('/api/business/facets', auth, requireAdmin, async (req, res) => {
   try {
