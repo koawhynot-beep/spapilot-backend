@@ -1851,8 +1851,8 @@ app.get('/api/audit', auth, requireAdmin, async (req, res) => {
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     const params = [req.user.businessId];
     let where = 'WHERE business_id = $1';
-    if (req.query.entity) { params.push(req.query.entity); where += ` AND entity = ${params.length}`; }
-    if (req.query.action) { params.push(req.query.action); where += ` AND action = ${params.length}`; }
+    if (req.query.entity) { params.push(req.query.entity); where += ` AND entity = $${params.length}`; }
+    if (req.query.action) { params.push(req.query.action); where += ` AND action = $${params.length}`; }
 
     const { rows } = await pool.query(
       `SELECT * FROM audit_log ${where} ORDER BY created_at DESC, id DESC LIMIT ${limit} OFFSET ${offset}`,
@@ -1951,21 +1951,21 @@ function salesFilter(req, startParamIndex) {
   let where = '';
   const push = (v) => { params.push(v); return startParamIndex + params.length - 1; };
 
-  if (req.query.from) where += ` AND m.occurred_at >= ${push(new Date(req.query.from))}`;
+  if (req.query.from) where += ` AND m.occurred_at >= $${push(new Date(req.query.from))}`;
   if (req.query.to) {
     // An end date means the end of that day, not midnight at its start.
     const to = new Date(req.query.to);
     to.setUTCHours(23, 59, 59, 999);
-    where += ` AND m.occurred_at <= ${push(to)}`;
+    where += ` AND m.occurred_at <= $${push(to)}`;
   }
   const staffId = parseInt(req.query.staffId, 10);
-  if (Number.isInteger(staffId)) where += ` AND m.staff_id = ${push(staffId)}`;
-  if (req.query.color) where += ` AND si.color ILIKE ${push(req.query.color)}`;
-  if (req.query.sku) where += ` AND si.sku ILIKE ${push(req.query.sku)}`;
+  if (Number.isInteger(staffId)) where += ` AND m.staff_id = $${push(staffId)}`;
+  if (req.query.color) where += ` AND si.color ILIKE $${push(req.query.color)}`;
+  if (req.query.sku) where += ` AND si.sku ILIKE $${push(req.query.sku)}`;
   const q = String(req.query.q || '').trim();
   if (q) {
     const i = push('%' + q + '%');
-    where += ` AND (si.sku ILIKE ${i} OR si.name ILIKE ${i} OR si.color ILIKE ${i} OR m.staff_name ILIKE ${i})`;
+    where += ` AND (si.sku ILIKE $${i} OR si.name ILIKE $${i} OR si.color ILIKE $${i} OR m.staff_name ILIKE $${i})`;
   }
   return { where, params };
 }

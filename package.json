@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "test": "node test/sales-filter.test.mjs"
   },
   "engines": {
     "node": ">=18"
@@ -25,5 +26,8 @@
     "pg": "^8.20.0",
     "winston": "^3.17.0",
     "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.2.17"
   }
 }
