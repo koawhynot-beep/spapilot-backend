@@ -221,14 +221,29 @@ const ACCESS_CODE = (process.env.ACCESS_CODE || '').trim();
 const accessOk = (code) => !ACCESS_CODE || (typeof code === 'string' && code.trim() === ACCESS_CODE);
 
 // ── Access codes ──────────────────────────────────────────
-// Two codes, two privilege levels. The admin code runs the business; the
-// staff code works the till. Codes live only in env vars — never stored in
-// the database, never returned to the browser, never rendered.
+// One manager code that opens the whole business, and one staff code per
+// shop that opens that shop and nothing else. Codes live only in env vars —
+// never stored in the database, never returned to the browser, never
+// rendered anywhere in the UI.
 //
-// ACCESS_CODE is still honoured as the admin code so the existing deployment
-// keeps working without an env change.
+//   ADMIN_CODE     (or ACCESS_CODE)  manager: every shop
+//   SHOP_CODE_GD                     staff at Gold Dust
+//   SHOP_CODE_AT                     staff at Atriq
+//
+// ACCESS_CODE and STAFF_CODE are still honoured so the running deployment
+// keeps working: STAFF_CODE means Gold Dust, which is what it meant when it
+// was the only shop.
 const ADMIN_CODE = (process.env.ADMIN_CODE || process.env.ACCESS_CODE || '').trim();
-const STAFF_CODE = (process.env.STAFF_CODE || '').trim();
+
+// Two-letter shop key → the secret that opens it. A shop with no configured
+// code simply has no staff door; the manager code still reaches it.
+const SHOP_CODES = Object.entries({
+  GD: (process.env.SHOP_CODE_GD || process.env.STAFF_CODE || '').trim(),
+  AT: (process.env.SHOP_CODE_AT || '').trim(),
+}).reduce((acc, [key, secret]) => {
+  if (secret) acc[key] = secret;
+  return acc;
+}, {});
 
 // Compared with timingSafeEqual so a wrong code cannot be narrowed down by
 // measuring how long the answer takes.
@@ -242,14 +257,16 @@ const safeEqual = (a, b) => {
 // Which door does this code open? Returns the level, never the code itself.
 const resolveAccess = (raw) => {
   const code = typeof raw === 'string' ? raw.trim() : '';
-  // No admin code configured yet: the gate is open, so we never lock
-  // ourselves out of a fresh deployment.
-  if (!ADMIN_CODE) return { role: 'admin' };
+  // No manager code configured yet: the gate is open, so a fresh deployment
+  // can never lock itself out.
+  if (!ADMIN_CODE) return { role: 'admin', shopCode: null };
   if (!code) return null;
-  // Admin wins. If the same string is set for both, it grants the higher
-  // level rather than silently downgrading whoever typed it.
-  if (safeEqual(code, ADMIN_CODE)) return { role: 'admin' };
-  if (STAFF_CODE && safeEqual(code, STAFF_CODE)) return { role: 'staff' };
+  // The manager code wins. If the same string were set for both, it grants
+  // the higher level rather than silently downgrading whoever typed it.
+  if (safeEqual(code, ADMIN_CODE)) return { role: 'admin', shopCode: null };
+  for (const [shopCode, secret] of Object.entries(SHOP_CODES)) {
+    if (safeEqual(code, secret)) return { role: 'staff', shopCode };
+  }
   return null;
 };
 
@@ -274,6 +291,24 @@ const auth = async (req, res, next) => {
     // Resolved here, from the two-letter code in the token, so that no route
     // has to trust a shop id supplied by the caller.
     req.accessRole = decoded.accessRole === 'staff' ? 'staff' : 'admin';
+
+    // A staff session is pinned to exactly one shop for the life of its
+    // token. Resolved here from the two-letter key rather than from anything
+    // the caller sends, so no route can be talked into another shop.
+    req.scopeShopId = null;
+    if (req.accessRole === 'staff') {
+      if (!decoded.shopCode || !SHOP_CODES[decoded.shopCode]) {
+        return res.status(401).json({ error: 'This staff code is no longer valid' });
+      }
+      const { rows } = await pool.query(
+        'SELECT id FROM shops WHERE business_id=$1 AND code=$2',
+        [decoded.businessId, decoded.shopCode]
+      );
+      if (!rows.length) {
+        return res.status(403).json({ error: 'This staff code is not linked to a shop yet' });
+      }
+      req.scopeShopId = rows[0].id;
+    }
     next();
   } catch (err) {
     res.status(401).json({ error: 'Invalid token' });
@@ -293,21 +328,35 @@ const requireAdmin = (req, res, next) => {
 // its own shop; the master code may name any of them.
 // There is exactly one shop. Its id is looked up once and cached, so the
 // per-shop routes can keep their URLs without a database round trip each time.
-let THE_SHOP_ID = null;
-async function theShopId() {
-  if (THE_SHOP_ID) return THE_SHOP_ID;
-  const { rows } = await pool.query('SELECT id FROM shops ORDER BY id ASC LIMIT 1');
-  THE_SHOP_ID = rows.length ? rows[0].id : null;
-  return THE_SHOP_ID;
+// Which shops may this session read? The manager may name any of them, or
+// none to mean all. Staff get their own shop whatever they ask for.
+async function scopeShopIds(req) {
+  if (req.accessRole === 'staff') return [req.scopeShopId];
+  const asked = parseShopIds(req.query.shops);
+  if (asked && asked.length) {
+    const { rows } = await pool.query(
+      'SELECT id FROM shops WHERE business_id=$1 AND id = ANY($2::int[])',
+      [req.user.businessId, asked]
+    );
+    return rows.map(r => r.id);
+  }
+  return null;   // null = every shop in the business
 }
 
-const makeToken = (user, access = { role: 'admin' }) => jwt.sign(
+const shopAllowed = (req, shopId) =>
+  req.accessRole === 'admin' || Number(shopId) === Number(req.scopeShopId);
+
+const denyShop = (res) =>
+  res.status(403).json({ error: 'That code only works for its own shop' });
+
+const makeToken = (user, access = { role: 'admin', shopCode: null }) => jwt.sign(
   {
     id: user.id,
     email: user.email,
     role: user.role,
     businessId: user.business_id,
     accessRole: access.role,
+    shopCode: access.shopCode || null,
     jti: crypto.randomBytes(16).toString('hex'),
   },
   JWT_SECRET,
@@ -533,43 +582,59 @@ async function initDB() {
     DROP TABLE IF EXISTS email_verification_tokens;
     DROP TABLE IF EXISTS password_reset_tokens;
   `);
-  await pool.query(`ALTER TABLE shops DROP COLUMN IF EXISTS code`);
 
-  // ── One shop ────────────────────────────────────────────
-  // The business runs from a single shop. Whatever else is in the table gets
-  // folded into it: stock is moved across, then the extra rows go. Doing this
-  // in the migration rather than by hand means no orphaned stock and no
-  // second location quietly reappearing in a report.
-  const { rows: allShops } = await pool.query('SELECT id, name FROM shops ORDER BY id ASC');
-  if (!allShops.length) {
-    await pool.query(
-      `INSERT INTO shops (business_id, name, address)
-       SELECT id, 'Gold Dust', '' FROM businesses ORDER BY id ASC LIMIT 1`
+  // ── Shops ───────────────────────────────────────────────
+  // The business runs two shops, each with its own staff code. The two-letter
+  // key is what ties a shop to its SHOP_CODE_* env var; a shop with no key
+  // has no staff door and is reachable only by the manager code.
+  //
+  // NOTE: an earlier version of this migration folded every shop into one.
+  // It has been removed rather than disabled — left in place it would delete
+  // Atriq and merge its stock into Gold Dust on the next deploy.
+  await pool.query(`ALTER TABLE shops ADD COLUMN IF NOT EXISTS code TEXT`);
+  await pool.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_shops_code
+     ON shops(business_id, code) WHERE code IS NOT NULL`
+  );
+
+  const { rows: bizRow } = await pool.query('SELECT id FROM businesses ORDER BY id ASC LIMIT 1');
+  if (bizRow.length) {
+    const businessId = bizRow[0].id;
+    const { rows: existing } = await pool.query(
+      'SELECT id, name, code FROM shops WHERE business_id=$1 ORDER BY id ASC', [businessId]
     );
-  } else if (allShops.length > 1) {
-    const keep = allShops.find(x => /gold\s*dust/i.test(x.name)) || allShops[0];
-    const drop = allShops.filter(x => x.id !== keep.id).map(x => x.id);
-    // Merge duplicate SKUs into the surviving row, then move the rest.
-    await pool.query(
-      `UPDATE stock_items k SET qty = k.qty + agg.qty
-         FROM (SELECT sku, SUM(qty) AS qty FROM stock_items
-               WHERE shop_id = ANY($1::int[]) GROUP BY sku) agg
-        WHERE k.shop_id = $2 AND k.sku = agg.sku`,
-      [drop, keep.id]
-    );
-    await pool.query(
-      `DELETE FROM stock_items WHERE shop_id = ANY($1::int[])
-         AND sku IN (SELECT sku FROM stock_items WHERE shop_id = $2)`,
-      [drop, keep.id]
-    );
-    await pool.query('UPDATE stock_items SET shop_id=$1 WHERE shop_id = ANY($2::int[])', [keep.id, drop]);
-    await pool.query('UPDATE stock_movements SET shop_id=$1 WHERE shop_id = ANY($2::int[])', [keep.id, drop]);
-    await pool.query('UPDATE staff SET shop_id=$1 WHERE shop_id = ANY($2::int[])', [keep.id, drop]);
-    await pool.query('DELETE FROM shops WHERE id = ANY($1::int[])', [drop]);
-    if (!/gold\s*dust/i.test(keep.name)) {
-      await pool.query('UPDATE shops SET name=$1 WHERE id=$2', ['Gold Dust', keep.id]);
+
+    // Adopt whatever is already there before creating anything: on the
+    // deployment that has been running as a single shop, that row IS Gold
+    // Dust and must keep its id, or every movement already logged against it
+    // would be orphaned.
+    for (const key of [['GD', 'Gold Dust'], ['AT', 'Atriq']]) {
+      const [code, name] = key;
+      if (existing.some(x => x.code === code)) continue;
+      const match = existing.find(
+        x => !x.code && x.name.trim().toLowerCase() === name.toLowerCase()
+      );
+      if (match) {
+        await pool.query('UPDATE shops SET code=$1 WHERE id=$2', [code, match.id]);
+        match.code = code;
+        continue;
+      }
+      // Gold Dust also adopts a lone unkeyed shop under any name, because
+      // that is the single-shop deployment being upgraded.
+      const lone = code === 'GD' && existing.length === 1 && !existing[0].code
+        ? existing[0] : null;
+      if (lone) {
+        await pool.query('UPDATE shops SET code=$1, name=$2 WHERE id=$3', [code, name, lone.id]);
+        lone.code = code;
+        continue;
+      }
+      const { rows: made } = await pool.query(
+        'INSERT INTO shops (business_id, name, address, code) VALUES ($1,$2,$3,$4) RETURNING id, name, code',
+        [businessId, name, '', code]
+      );
+      existing.push(made[0]);
+      logger.info('migration.shop_created', { name, code });
     }
-    logger.warn('migration.single_shop', { kept: keep.id, merged: drop.length });
   }
 
   // ── Audit log ───────────────────────────────────────────
@@ -681,12 +746,11 @@ app.get('/api/auth/me', auth, async (req, res) => {
       const b = await pool.query('SELECT * FROM businesses WHERE id=$1', [rows[0].business_id]);
       if (b.rows[0]) business = { id: b.rows[0].id, name: b.rows[0].name };
     }
-    // Carry the session's access level through a page reload, so the staff
-    // code does not come back with admin tabs.
-    const access = { role: req.accessRole };
-    const shopId = await theShopId();
-    const shop = shopId
-      ? (await pool.query('SELECT id, name FROM shops WHERE id=$1', [shopId])).rows[0]
+    // Carry the session's access level and shop through a page reload, so a
+    // staff code does not come back as the manager.
+    const access = { role: req.accessRole, shopCode: req.user.shopCode || null };
+    const shop = req.scopeShopId
+      ? (await pool.query('SELECT id, name, code FROM shops WHERE id=$1', [req.scopeShopId])).rows[0]
       : null;
     res.json({ user: formatUser(rows[0], access), business, shop: shop || null, trial: trialInfo(rows[0]) });
   } catch (err) {
@@ -729,27 +793,35 @@ app.get('/api/auth/export-data', auth, requireAdmin, async (req, res) => {
 });
 
 
-// Routes addressed as /api/shops/:shopId/... — a shop key may only name its own.
-// Any route naming a shop other than the one is a stale bookmark or a probe,
-// and gets the same answer either way.
+// Routes addressed as /api/shops/:shopId/... The shop must belong to this
+// business, and a staff session may only ever name its own.
 const scopedShop = async (req, res, next) => {
-  const id = await theShopId();
-  if (!id || Number(req.params.shopId) !== Number(id)) {
-    return res.status(404).json({ error: 'Shop not found' });
+  try {
+    const { rows } = await pool.query(
+      'SELECT id FROM shops WHERE id=$1 AND business_id=$2',
+      [req.params.shopId, req.user.businessId]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Shop not found' });
+    if (!shopAllowed(req, req.params.shopId)) return denyShop(res);
+    next();
+  } catch (err) {
+    logger.error('scopedShop.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
-  next();
 };
 
 // Routes addressed by stock item id. The shop is not in the URL, so it has to
 // be read from the row before we can tell whether this key may touch it.
 const scopedItem = async (req, res, next) => {
   try {
-    const { rows } = await pool.query('SELECT shop_id FROM stock_items WHERE id=$1', [req.params.id]);
+    const { rows } = await pool.query(
+      `SELECT si.shop_id FROM stock_items si
+       JOIN shops sh ON sh.id = si.shop_id
+       WHERE si.id=$1 AND sh.business_id=$2`,
+      [req.params.id, req.user.businessId]
+    );
     if (!rows.length) return res.status(404).json({ error: 'Item not found' });
-    const id = await theShopId();
-    if (Number(rows[0].shop_id) !== Number(id)) {
-      return res.status(404).json({ error: 'Item not found' });
-    }
+    if (!shopAllowed(req, rows[0].shop_id)) return denyShop(res);
     next();
   } catch (err) {
     logger.error('scopedItem.error', { err: err.message });
@@ -1884,7 +1956,8 @@ const SALE_SELECT = `
   SELECT m.id, m.type, m.qty_change, m.occurred_at, m.reason, m.note,
          COALESCE(NULLIF(m.staff_name,''), '(not recorded)') AS staff_name,
          m.staff_id, si.sku, si.name AS item_name, si.color, si.size, si.category,
-         si.fabric, COALESCE(si.price,0) AS price, COALESCE(si.cost,0) AS cost
+         si.fabric, COALESCE(si.price,0) AS price, COALESCE(si.cost,0) AS cost,
+         m.shop_id, sh.name AS shop_name
   FROM stock_movements m
   JOIN stock_items si ON si.id = m.item_id
   JOIN shops sh ON sh.id = m.shop_id
@@ -1910,6 +1983,8 @@ const shapeSale = (r) => {
     staffId: r.staff_id,
     staffName: r.staff_name,
     reason: r.reason || '',
+    shopId: r.shop_id,
+    shopName: r.shop_name || '',
   };
 };
 
@@ -1918,12 +1993,19 @@ const shapeSale = (r) => {
 app.get('/api/sales/today', auth, async (req, res) => {
   try {
     const hours = Math.min(Math.max(parseInt(req.query.hours, 10) || 24, 1), 72);
+    const params = [req.user.businessId, String(hours)];
+    const shopIds = await scopeShopIds(req);
+    let scope = '';
+    if (shopIds) {
+      params.push(shopIds);
+      scope = ` AND m.shop_id = ANY($${params.length}::int[])`;
+    }
     const { rows } = await pool.query(
       `${SALE_SELECT}
        WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}
-         AND m.occurred_at >= NOW() - ($2 || ' hours')::interval
+         AND m.occurred_at >= NOW() - ($2 || ' hours')::interval${scope}
        ORDER BY m.occurred_at DESC, m.id DESC`,
-      [req.user.businessId, String(hours)]
+      params
     );
     const items = rows.map(shapeSale);
     res.json({
@@ -1946,10 +2028,18 @@ app.get('/api/sales/today', auth, async (req, res) => {
 // and is left in the table rather than served.
 const HISTORY_MONTHS = 24;
 
-function salesFilter(req, startParamIndex) {
+// Every sales-shaped query goes through here, and the shop restriction is
+// applied inside it rather than by each caller. Adding it at six call sites
+// would mean one of them eventually forgets, and a forgotten scope silently
+// mixes Atriq's takings into Gold Dust's report — the kind of wrong number
+// nobody notices until it is used to pay someone.
+async function salesFilter(req, startParamIndex) {
   const params = [];
   let where = '';
   const push = (v) => { params.push(v); return startParamIndex + params.length - 1; };
+
+  const shopIds = await scopeShopIds(req);
+  if (shopIds) where += ` AND m.shop_id = ANY($${push(shopIds)}::int[])`;
 
   if (req.query.from) where += ` AND m.occurred_at >= $${push(new Date(req.query.from))}`;
   if (req.query.to) {
@@ -1967,12 +2057,12 @@ function salesFilter(req, startParamIndex) {
     const i = push('%' + q + '%');
     where += ` AND (si.sku ILIKE $${i} OR si.name ILIKE $${i} OR si.color ILIKE $${i} OR m.staff_name ILIKE $${i})`;
   }
-  return { where, params };
+  return { where, params, shopIds };
 }
 
 app.get('/api/sales/history', auth, requireAdmin, async (req, res) => {
   try {
-    const { where, params } = salesFilter(req, 3);
+    const { where, params } = await salesFilter(req, 3);
     const all = [req.user.businessId, String(HISTORY_MONTHS), ...params];
     const windowSql = `sh.business_id = $1 AND ${SALE_TYPES_SQL}
       AND m.occurred_at >= NOW() - ($2 || ' months')::interval ${where}`;
@@ -2032,7 +2122,7 @@ const sendCsv = (res, name, body) => {
 
 app.get('/api/sales/history.csv', auth, requireAdmin, async (req, res) => {
   try {
-    const { where, params } = salesFilter(req, 3);
+    const { where, params } = await salesFilter(req, 3);
     const all = [req.user.businessId, String(HISTORY_MONTHS), ...params];
     const { rows } = await pool.query(
       `${SALE_SELECT}
@@ -2042,10 +2132,10 @@ app.get('/api/sales/history.csv', auth, requireAdmin, async (req, res) => {
       all
     );
     const body = csvDoc(
-      ['Date', 'Time', 'Type', 'SKU', 'Item', 'Colour', 'Size', 'Units', 'Price (IDR)', 'Value (IDR)', 'Staff', 'Reason'],
+      ['Date', 'Time', 'Shop', 'Type', 'SKU', 'Item', 'Colour', 'Size', 'Units', 'Price (IDR)', 'Value (IDR)', 'Staff', 'Reason'],
       rows.map(shapeSale).map(r => {
         const d = new Date(r.occurredAt);
-        return [d.toISOString().slice(0, 10), d.toISOString().slice(11, 19),
+        return [d.toISOString().slice(0, 10), d.toISOString().slice(11, 19), r.shopName,
                 r.type, r.sku, r.itemName, r.color, r.size, r.units, r.price, r.value, r.staffName, r.reason];
       })
     );
@@ -2064,10 +2154,22 @@ app.get('/api/sales/history.csv', auth, requireAdmin, async (req, res) => {
 // one thing is three too many.
 app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
   try {
-    const { where, params } = salesFilter(req, 3);
+    const { where, params } = await salesFilter(req, 3);
     const all = [req.user.businessId, String(HISTORY_MONTHS), ...params];
     const windowSql = `sh.business_id = $1 AND ${SALE_TYPES_SQL}
       AND m.occurred_at >= NOW() - ($2 || ' months')::interval ${where}`;
+
+    // The shelf query below reads stock_items rather than movements, so it
+    // cannot reuse the movement-shaped clause salesFilter builds.
+    const shelfParams = [req.user.businessId, String(HISTORY_MONTHS)];
+    let shelfScope = '';
+    {
+      const ids = await scopeShopIds(req);
+      if (ids) {
+        shelfParams.push(ids);
+        shelfScope = ` AND si.shop_id = ANY($${shelfParams.length}::int[])`;
+      }
+    }
 
     const [sellers, trend, shelf] = await Promise.all([
       // Ranked by units and by value, because the fastest-moving garment and
@@ -2111,8 +2213,8 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
              AND m.occurred_at >= NOW() - ($2 || ' months')::interval
            GROUP BY m.item_id
          ) sold ON sold.item_id = si.id
-         WHERE sh.business_id = $1`,
-        [req.user.businessId, String(HISTORY_MONTHS)]
+         WHERE sh.business_id = $1${shelfScope}`,
+        shelfParams
       ),
     ]);
 
@@ -2193,7 +2295,7 @@ const COMMISSION_SQL = `
 `;
 
 async function commissionRows(req) {
-  const { where, params } = salesFilter(req, 3);
+  const { where, params } = await salesFilter(req, 3);
   const all = [req.user.businessId, String(HISTORY_MONTHS), ...params];
   const { rows } = await pool.query(
     `${COMMISSION_SQL}
@@ -2261,14 +2363,21 @@ app.get('/api/commission.csv', auth, requireAdmin, async (req, res) => {
 
 app.get('/api/stock.csv', auth, requireAdmin, async (req, res) => {
   try {
+    const params = [req.user.businessId];
+    const ids = await scopeShopIds(req);
+    let scope = '';
+    if (ids) {
+      params.push(ids);
+      scope = ` AND si.shop_id = ANY($${params.length}::int[])`;
+    }
     const { rows } = await pool.query(
-      `SELECT si.* FROM stock_items si JOIN shops sh ON sh.id = si.shop_id
-       WHERE sh.business_id = $1 ORDER BY si.fabric, si.color, si.name`,
-      [req.user.businessId]
+      `SELECT si.*, sh.name AS shop_name FROM stock_items si JOIN shops sh ON sh.id = si.shop_id
+       WHERE sh.business_id = $1${scope} ORDER BY sh.name, si.fabric, si.color, si.name`,
+      params
     );
     const body = csvDoc(
-      ['SKU', 'Item', 'Category', 'Fabric', 'Colour', 'Size', 'Qty', 'Low-stock at', 'Cost (IDR)', 'Price (IDR)', 'Supplier', 'Last sold'],
-      rows.map(r => [r.sku, r.name, r.category, r.fabric, r.color, r.size, r.qty, r.threshold,
+      ['Shop', 'SKU', 'Item', 'Category', 'Fabric', 'Colour', 'Size', 'Qty', 'Low-stock at', 'Cost (IDR)', 'Price (IDR)', 'Supplier', 'Last sold'],
+      rows.map(r => [r.shop_name, r.sku, r.name, r.category, r.fabric, r.color, r.size, r.qty, r.threshold,
         Number(r.cost || 0), Number(r.price || 0), r.supplier,
         r.last_sold_at ? new Date(r.last_sold_at).toISOString().slice(0, 10) : ''])
     );
