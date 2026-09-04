@@ -2568,7 +2568,7 @@ app.get('/api/stock-check', auth, async (req, res) => {
     let scope = '';
     if (ids) {
       params.push(ids);
-      scope = ` AND si.shop_id = ANY(${params.length}::int[])`;
+      scope = ` AND si.shop_id = ANY($${params.length}::int[])`;
     }
 
     // A round belongs to one shop, so expiry is per shop.
@@ -2672,7 +2672,7 @@ app.post('/api/stock-check/reset', auth, async (req, res) => {
     let scope = '';
     if (ids) {
       params.push(ids);
-      scope = ` AND id = ANY(${params.length}::int[])`;
+      scope = ` AND id = ANY($${params.length}::int[])`;
     }
     const { rows: shops } = await pool.query(
       `SELECT id FROM shops WHERE business_id = $1${scope}`, params

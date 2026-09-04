@@ -139,5 +139,36 @@ const nowMarked = await marks(1);
 check('new stock appears as unchecked', nowInStock === 4 && nowMarked === 2,
   `${nowMarked} marked of ${nowInStock} in stock`);
 
+
+// The scoped read — the path that 500'd in production because its parameter
+// placeholder was missing a dollar. Runs the real query shape with a shop
+// filter applied, so a regression fails here as well as in the lint.
+console.log('\n  the scoped read');
+for (const [label, ids] of [['all shops', null], ['Rose Gold only', [1]], ['Atriq only', [2]]]) {
+  const params = [1];
+  let scope = '';
+  if (ids) {
+    params.push(ids);
+    scope = ` AND si.shop_id = ANY($${params.length}::int[])`;
+  }
+  try {
+    const { rows } = await db.query(
+      `SELECT si.id, si.sku, si.qty, si.shop_id
+       FROM stock_items si
+       JOIN shops sh ON sh.id = si.shop_id
+       LEFT JOIN stock_check_marks m ON m.item_id = si.id
+       WHERE sh.business_id = $1 AND si.qty > 0${scope}
+       ORDER BY si.fabric, si.color, si.name, si.size`,
+      params
+    );
+    const shopsSeen = [...new Set(rows.map(r => r.shop_id))].sort();
+    const want = ids || [1, 2];
+    check(`    ${label}`, String(shopsSeen) === String(want),
+      `saw shops [${shopsSeen}], wanted [${want}]`);
+  } catch (e) {
+    check(`    ${label}`, false, e.message.split('\n')[0]);
+  }
+}
+
 console.log(failures === 0 ? '\nall checks passed' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);
