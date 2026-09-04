@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "node test/sales-filter.test.mjs && node test/reset-stock.test.mjs && node test/shop-keys.test.mjs && node test/stock-check.test.mjs"
+    "test": "node test/sales-filter.test.mjs && node test/reset-stock.test.mjs && node test/shop-keys.test.mjs && node test/stock-check.test.mjs && node test/import-stock.test.mjs"
   },
   "engines": {
     "node": ">=18"

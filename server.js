@@ -52,7 +52,7 @@ app.use(cors({
   origin: allowedOrigins,
   credentials: true,
 }));
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '8mb' }));   // a full catalogue import is a large body
 app.set('trust proxy', 1);
 
 const authLimiter = rateLimit({
@@ -561,6 +561,7 @@ async function initDB() {
     `CREATE INDEX IF NOT EXISTS idx_businesses_owner_id ON businesses(owner_id)`,
     `CREATE INDEX IF NOT EXISTS idx_shops_business_id ON shops(business_id)`,
     `CREATE INDEX IF NOT EXISTS idx_stock_shop_id ON stock_items(shop_id)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_shop_sku ON stock_items(shop_id, UPPER(sku)) WHERE COALESCE(sku,'') <> ''`,
     `CREATE INDEX IF NOT EXISTS idx_stock_name ON stock_items(name)`,
     `CREATE INDEX IF NOT EXISTS idx_blacklist_expires ON token_blacklist(expires_at)`,
     `CREATE INDEX IF NOT EXISTS idx_movements_item_id ON stock_movements(item_id)`,
@@ -2736,6 +2737,122 @@ app.delete('/api/stock-check/:itemId', auth, scopedItem, async (req, res) => {
   } catch (err) {
     logger.error('stockcheck.unmark.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// IMPORT STOCK
+// ═══════════════════════════════════════════════════════════
+// Loads a catalogue from the shop's own spreadsheet. Keyed on the code, so
+// running it twice updates rather than duplicating — which matters, because
+// the first run of an import of this size is rarely the last.
+//
+// Quantity comes from SALDO AKHIR alone. The sheet also carries SALDO AWAL,
+// BRG MASUK and BRG KELUAR, and the identity
+//     saldo awal + brg masuk − brg keluar = saldo akhir
+// holds, so the closing figure is the only one that needs reading.
+const importRowSchema = z.object({
+  sku: z.string().trim().min(1).max(100),
+  name: z.string().trim().min(1).max(200),
+  style: z.string().trim().max(100).optional().default(''),
+  color: z.string().trim().max(50).optional().default(''),
+  size: z.string().trim().max(50).optional().default(''),
+  price: z.coerce.number().min(0).max(1e12).optional().default(0),
+  qty: z.coerce.number().int().min(0).max(1e6),
+});
+const importSchema = z.object({
+  shopId: z.coerce.number().int().positive(),
+  rows: z.array(importRowSchema).min(1).max(20000),
+});
+
+app.post('/api/admin/import-stock', auth, requireAdmin, validate(importSchema), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { shopId, rows } = req.body;
+
+    const { rows: shop } = await client.query(
+      'SELECT id, name FROM shops WHERE id = $1 AND business_id = $2',
+      [shopId, req.user.businessId]
+    );
+    if (!shop.length) return res.status(404).json({ error: 'Shop not found' });
+
+    // Last row wins on a repeated code, so a sheet with an accidental
+    // duplicate lands one item rather than two fighting over the same code.
+    const byCode = new Map();
+    for (const r of rows) byCode.set(r.sku.toUpperCase(), r);
+    const deduped = [...byCode.values()];
+
+    await client.query('BEGIN');
+
+    const { rows: existing } = await client.query(
+      'SELECT id, sku FROM stock_items WHERE shop_id = $1', [shopId]
+    );
+    const idByCode = new Map(existing.map(e => [String(e.sku || '').toUpperCase(), e.id]));
+
+    const { rows: posRows } = await client.query(
+      'SELECT COALESCE(MAX(position), -1) + 1 AS p FROM stock_items WHERE shop_id = $1', [shopId]
+    );
+    let position = posRows[0].p;
+
+    let created = 0, updated = 0;
+    for (const r of deduped) {
+      const id = idByCode.get(r.sku.toUpperCase());
+      // The sheet has no fabric column of its own. STYLE is the grouping the
+      // shop actually reads by — "all the Agustine dresses" — so it fills
+      // both the category and the fabric block the Overview and Stock check
+      // screens group on.
+      const style = r.style || '';
+      if (id) {
+        await client.query(
+          `UPDATE stock_items
+             SET name=$1, category=$2, fabric=$3, color=$4, size=$5,
+                 price=$6, qty=$7, updated_at=NOW()
+           WHERE id=$8`,
+          [r.name, style, style, r.color, r.size, r.price, r.qty, id]
+        );
+        updated++;
+      } else {
+        await client.query(
+          `INSERT INTO stock_items
+             (shop_id, name, category, fabric, print, size, color, sku, brand,
+              qty, threshold, supplier, notes, position, image_url, price, cost)
+           VALUES ($1,$2,$3,$3,'',$4,$5,$6,'',$7,0,'','',$8,'',$9,0)`,
+          [shopId, r.name, style, r.size, r.color, r.sku, r.qty, position++, r.price]
+        );
+        created++;
+      }
+    }
+
+    const inStock = deduped.filter(r => r.qty > 0).length;
+    const pieces = deduped.reduce((n, r) => n + r.qty, 0);
+
+    await client.query('COMMIT');
+
+    await audit(req, {
+      action: 'import', entity: 'stock_item',
+      summary: `Imported ${deduped.length} products into ${shop[0].name}: `
+        + `${created} new, ${updated} updated, ${pieces} pieces in stock`,
+      after: { shop: shop[0].name, rows: deduped.length, created, updated, inStock, pieces },
+    });
+    logger.warn('stock.imported', { shopId, rows: deduped.length, created, updated, pieces });
+
+    res.json({
+      ok: true,
+      shop: shop[0].name,
+      received: rows.length,
+      imported: deduped.length,
+      duplicateCodes: rows.length - deduped.length,
+      created,
+      updated,
+      inStock,
+      pieces,
+    });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    logger.error('stock.import.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
   }
 });
 
