@@ -658,6 +658,7 @@ async function initDB() {
     }
   }
 
+
   // ── Audit log ───────────────────────────────────────────
   // Stock movements say what happened to the stock. This says what happened
   // to the records: a price edited, an item deleted, a staff rate changed.
@@ -679,6 +680,31 @@ async function initDB() {
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at DESC)`);
+
+  // ── Stock check ─────────────────────────────────────────
+  // A walk round the rail, ticked off item by item. One mark per item, so a
+  // second tick updates rather than duplicating; the round records when the
+  // list was last finished and when those marks fall away.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS stock_check_marks (
+      id           SERIAL PRIMARY KEY,
+      shop_id      INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+      item_id      INTEGER NOT NULL UNIQUE REFERENCES stock_items(id) ON DELETE CASCADE,
+      qty_at_check INTEGER,
+      checked_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      staff_id     INTEGER REFERENCES staff(id) ON DELETE SET NULL,
+      staff_name   TEXT DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS stock_check_rounds (
+      id            SERIAL PRIMARY KEY,
+      shop_id       INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+      items_checked INTEGER NOT NULL DEFAULT 0,
+      completed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      clears_at     TIMESTAMPTZ NOT NULL
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_check_marks_shop ON stock_check_marks(shop_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_check_rounds_shop ON stock_check_rounds(shop_id, completed_at DESC)`);
 
   // Cleanup expired blacklist tokens hourly
   setInterval(() => {
@@ -2500,6 +2526,215 @@ app.post('/api/admin/shops', auth, requireAdmin, validate(shopEditSchema), async
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'Another shop already uses that key' });
     logger.error('admin.shopcreate.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// STOCK CHECK
+// ═══════════════════════════════════════════════════════════
+// A walk round the rail with a list: every item the system believes is in
+// stock, ticked off once someone has laid eyes on it. Items at zero are not
+// listed — there is nothing to go and look at.
+//
+// The round resets a week after it is finished rather than a week after it
+// is started, so finishing early does not shorten the next one.
+const CHECK_RESET_DAYS = 7;
+
+// Clears the marks once the completed round has aged out. Called at the top
+// of every read so the list is never stale, whether or not anyone has been
+// near the app since the week elapsed.
+async function expireStockCheck(client, shopId) {
+  const { rows } = await client.query(
+    `SELECT id, completed_at, clears_at FROM stock_check_rounds
+     WHERE shop_id = $1 ORDER BY completed_at DESC LIMIT 1`,
+    [shopId]
+  );
+  const round = rows[0];
+  if (!round || new Date(round.clears_at) > new Date()) return round || null;
+
+  await client.query('DELETE FROM stock_check_marks WHERE shop_id = $1', [shopId]);
+  logger.info('stockcheck.round_expired', { shopId, roundId: round.id });
+  return null;
+}
+
+// Everything on the rail, with whether it has been seen this round.
+app.get('/api/stock-check', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const ids = await scopeShopIds(req);
+    const params = [req.user.businessId];
+    let scope = '';
+    if (ids) {
+      params.push(ids);
+      scope = ` AND si.shop_id = ANY(${params.length}::int[])`;
+    }
+
+    // A round belongs to one shop, so expiry is per shop.
+    const { rows: shopRows } = await client.query(
+      ids
+        ? 'SELECT id FROM shops WHERE business_id = $1 AND id = ANY($2::int[])'
+        : 'SELECT id FROM shops WHERE business_id = $1',
+      ids ? [req.user.businessId, ids] : [req.user.businessId]
+    );
+    let openRound = null;
+    for (const s of shopRows) {
+      const round = await expireStockCheck(client, s.id);
+      if (round && (!openRound || new Date(round.clears_at) < new Date(openRound.clears_at))) {
+        openRound = round;
+      }
+    }
+
+    const { rows } = await client.query(
+      `SELECT si.id, si.sku, si.name, si.color, si.size, si.fabric, si.category,
+              si.qty, COALESCE(si.price,0) AS price, si.shop_id, sh.name AS shop_name,
+              m.checked_at, m.staff_name AS checked_by, m.qty_at_check
+       FROM stock_items si
+       JOIN shops sh ON sh.id = si.shop_id
+       LEFT JOIN stock_check_marks m ON m.item_id = si.id
+       WHERE sh.business_id = $1 AND si.qty > 0${scope}
+       ORDER BY si.fabric, si.color, si.name, si.size`,
+      params
+    );
+
+    const items = rows.map(r => ({
+      id: r.id,
+      sku: r.sku,
+      name: r.name,
+      color: r.color || '',
+      size: r.size || '',
+      fabric: r.fabric || '',
+      category: r.category || '',
+      qty: r.qty,
+      price: Number(r.price),
+      shopId: r.shop_id,
+      shopName: r.shop_name,
+      checked: Boolean(r.checked_at),
+      checkedAt: r.checked_at,
+      checkedBy: r.checked_by || '',
+      // What the count was when it was ticked. If the shelf has moved since,
+      // the tick is still true of the moment it was made — but the person
+      // reading the list should be able to see that it moved.
+      qtyAtCheck: r.qty_at_check,
+      movedSinceCheck: r.checked_at != null && r.qty_at_check != null && r.qty_at_check !== r.qty,
+    }));
+
+    const checked = items.filter(x => x.checked).length;
+    res.json({
+      items,
+      total: items.length,
+      checked,
+      remaining: items.length - checked,
+      resetDays: CHECK_RESET_DAYS,
+      // Set only once a round is finished and waiting to clear.
+      completedAt: openRound ? openRound.completed_at : null,
+      clearsAt: openRound ? openRound.clears_at : null,
+    });
+  } catch (err) {
+    logger.error('stockcheck.list.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Records a round as finished the moment the last item is ticked, so the week
+// is counted from completion rather than from whenever someone next looks.
+async function closeRoundIfComplete(client, shopId) {
+  const { rows } = await client.query(
+    `SELECT COUNT(*)::int AS total,
+            COUNT(m.item_id)::int AS checked
+     FROM stock_items si
+     LEFT JOIN stock_check_marks m ON m.item_id = si.id
+     WHERE si.shop_id = $1 AND si.qty > 0`,
+    [shopId]
+  );
+  const { total, checked } = rows[0];
+  if (!total || checked < total) return null;
+
+  const { rows: made } = await client.query(
+    `INSERT INTO stock_check_rounds (shop_id, items_checked, clears_at)
+     VALUES ($1, $2, NOW() + ($3 || ' days')::interval)
+     RETURNING id, completed_at, clears_at`,
+    [shopId, checked, String(CHECK_RESET_DAYS)]
+  );
+  logger.info('stockcheck.round_completed', { shopId, items: checked });
+  return made[0];
+}
+
+// Starting over before the week is up — for when a count went wrong and the
+// whole walk needs doing again.
+app.post('/api/stock-check/reset', auth, async (req, res) => {
+  try {
+    const ids = await scopeShopIds(req);
+    const params = [req.user.businessId];
+    let scope = '';
+    if (ids) {
+      params.push(ids);
+      scope = ` AND id = ANY(${params.length}::int[])`;
+    }
+    const { rows: shops } = await pool.query(
+      `SELECT id FROM shops WHERE business_id = $1${scope}`, params
+    );
+    for (const s of shops) {
+      await pool.query('DELETE FROM stock_check_marks WHERE shop_id = $1', [s.id]);
+      await pool.query('DELETE FROM stock_check_rounds WHERE shop_id = $1 AND clears_at > NOW()', [s.id]);
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error('stockcheck.reset.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/stock-check/:itemId', auth, scopedItem, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const staff = await resolveStaff(req.body.staffId, req.user.businessId);
+    const { rows: item } = await client.query(
+      'SELECT id, shop_id, qty FROM stock_items WHERE id = $1', [req.params.itemId]
+    );
+    if (!item.length) return res.status(404).json({ error: 'Item not found' });
+    if (item[0].qty <= 0) {
+      return res.status(409).json({ error: 'That item is not in stock' });
+    }
+
+    await client.query(
+      `INSERT INTO stock_check_marks (shop_id, item_id, qty_at_check, staff_id, staff_name)
+       VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (item_id) DO UPDATE
+         SET checked_at = NOW(), qty_at_check = EXCLUDED.qty_at_check,
+             staff_id = EXCLUDED.staff_id, staff_name = EXCLUDED.staff_name`,
+      [item[0].shop_id, item[0].id, item[0].qty, staff.id, staff.name]
+    );
+
+    const round = await closeRoundIfComplete(client, item[0].shop_id);
+    res.json({ ok: true, checked: true, roundCompleted: Boolean(round), round: round || null });
+  } catch (err) {
+    logger.error('stockcheck.mark.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete('/api/stock-check/:itemId', auth, scopedItem, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'DELETE FROM stock_check_marks WHERE item_id = $1 RETURNING shop_id', [req.params.itemId]
+    );
+    // Unticking reopens the round: a finished round that is no longer
+    // finished should not still be counting down to its reset.
+    if (rows.length) {
+      await pool.query(
+        `DELETE FROM stock_check_rounds
+         WHERE shop_id = $1 AND clears_at > NOW()`,
+        [rows[0].shop_id]
+      );
+    }
+    res.json({ ok: true, checked: false });
+  } catch (err) {
+    logger.error('stockcheck.unmark.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
