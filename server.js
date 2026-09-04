@@ -226,22 +226,26 @@ const accessOk = (code) => !ACCESS_CODE || (typeof code === 'string' && code.tri
 // never stored in the database, never returned to the browser, never
 // rendered anywhere in the UI.
 //
-//   ADMIN_CODE     (or ACCESS_CODE)  manager: every shop
-//   SHOP_CODE_GD                     staff at Gold Dust
-//   SHOP_CODE_AT                     staff at Atriq
+//   ADMIN_CODE  (or ACCESS_CODE)   manager: every shop
+//   SHOP_CODE_<XX>                 staff at the shop whose key is <XX>
 //
-// ACCESS_CODE and STAFF_CODE are still honoured so the running deployment
-// keeps working: STAFF_CODE means Gold Dust, which is what it meant when it
-// was the only shop.
+// The <XX> half is read from the environment rather than listed here, so a
+// shop added in the app needs no code change — set SHOP_CODE_ for its key and
+// it works. The previous version hardcoded GD and AT, which meant a variable
+// named for a shop that did not exist was silently ignored.
+//
+// STAFF_CODE is deliberately NOT honoured any more. It used to mean "the
+// staff code", from when there was one shop, and it resolved to Gold Dust —
+// so a code put there for a different shop opened Gold Dust instead. A
+// mapping you cannot see is a mapping that will be wrong.
 const ADMIN_CODE = (process.env.ADMIN_CODE || process.env.ACCESS_CODE || '').trim();
 
-// Two-letter shop key → the secret that opens it. A shop with no configured
-// code simply has no staff door; the manager code still reaches it.
-const SHOP_CODES = Object.entries({
-  GD: (process.env.SHOP_CODE_GD || process.env.STAFF_CODE || '').trim(),
-  AT: (process.env.SHOP_CODE_AT || '').trim(),
-}).reduce((acc, [key, secret]) => {
-  if (secret) acc[key] = secret;
+const SHOP_CODE_PREFIX = 'SHOP_CODE_';
+const SHOP_CODES = Object.entries(process.env).reduce((acc, [name, secret]) => {
+  if (!name.startsWith(SHOP_CODE_PREFIX)) return acc;
+  const key = name.slice(SHOP_CODE_PREFIX.length).toUpperCase();
+  const value = (secret || '').trim();
+  if (/^[A-Z]{2}$/.test(key) && value) acc[key] = value;
   return acc;
 }, {});
 
@@ -604,13 +608,29 @@ async function initDB() {
       'SELECT id, name, code FROM shops WHERE business_id=$1 ORDER BY id ASC', [businessId]
     );
 
-    // Adopt whatever is already there before creating anything: on the
-    // deployment that has been running as a single shop, that row IS Gold
-    // Dust and must keep its id, or every movement already logged against it
-    // would be orphaned.
-    for (const key of [['GD', 'Gold Dust'], ['AT', 'Atriq']]) {
-      const [code, name] = key;
+    // The two shops the business actually runs. Rose Gold replaces what an
+    // earlier migration created as "Gold Dust" — that name came from this
+    // code assuming a single shop, not from the business.
+    const WANTED = [['RG', 'Rose Gold'], ['AT', 'Atriq']];
+
+    // Rename before keying, so the row that already carries all the history
+    // becomes Rose Gold rather than a fresh empty shop being made alongside
+    // it. Matched on the old key, not the name, because the name is exactly
+    // what is being corrected.
+    const goldDust = existing.find(
+      x => x.code === 'GD' || (!x.code && /gold *dust/i.test(x.name))
+    );
+    if (goldDust && !existing.some(x => x.code === 'RG')) {
+      await pool.query('UPDATE shops SET name=$1, code=$2 WHERE id=$3',
+        ['Rose Gold', 'RG', goldDust.id]);
+      logger.warn('migration.shop_renamed', { from: goldDust.name, to: 'Rose Gold', id: goldDust.id });
+      goldDust.name = 'Rose Gold';
+      goldDust.code = 'RG';
+    }
+
+    for (const [code, name] of WANTED) {
       if (existing.some(x => x.code === code)) continue;
+      // Adopt a shop already under this name that simply has no key yet.
       const match = existing.find(
         x => !x.code && x.name.trim().toLowerCase() === name.toLowerCase()
       );
@@ -619,13 +639,14 @@ async function initDB() {
         match.code = code;
         continue;
       }
-      // Gold Dust also adopts a lone unkeyed shop under any name, because
-      // that is the single-shop deployment being upgraded.
-      const lone = code === 'GD' && existing.length === 1 && !existing[0].code
-        ? existing[0] : null;
+      // Otherwise adopt a lone unkeyed shop under any name — that is the
+      // single-shop deployment being upgraded, and its id must survive or
+      // every movement logged against it is orphaned.
+      const lone = existing.length === 1 && !existing[0].code ? existing[0] : null;
       if (lone) {
         await pool.query('UPDATE shops SET code=$1, name=$2 WHERE id=$3', [code, name, lone.id]);
         lone.code = code;
+        lone.name = name;
         continue;
       }
       const { rows: made } = await pool.query(
@@ -2384,6 +2405,101 @@ app.get('/api/stock.csv', auth, requireAdmin, async (req, res) => {
     sendCsv(res, `stock-${new Date().toISOString().slice(0, 10)}.csv`, body);
   } catch (err) {
     logger.error('stock.csv.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── Shop keys ─────────────────────────────────────────────
+// Which env var opens which shop, and — the part that matters — which
+// configured codes open nothing at all. A code set for a shop key that no
+// shop uses is silently ignored, which is exactly how a code meant for one
+// shop ended up opening another. This makes that visible instead of leaving
+// it to be discovered by someone trying to sell something.
+//
+// Secrets are never returned. Only whether one is set.
+app.get('/api/admin/shop-keys', auth, requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, name, code FROM shops WHERE business_id=$1 ORDER BY name',
+      [req.user.businessId]
+    );
+    const used = new Set(rows.map(r => r.code).filter(Boolean));
+    res.json({
+      managerCodeConfigured: Boolean(ADMIN_CODE),
+      shops: rows.map(r => ({
+        id: r.id,
+        name: r.name,
+        key: r.code || null,
+        envVar: r.code ? SHOP_CODE_PREFIX + r.code : null,
+        // No key means no staff door — the manager code still reaches it.
+        codeConfigured: Boolean(r.code && SHOP_CODES[r.code]),
+      })),
+      // Configured codes whose two letters match no shop. These do nothing.
+      orphanedCodes: Object.keys(SHOP_CODES)
+        .filter(k => !used.has(k))
+        .map(k => SHOP_CODE_PREFIX + k)
+        .sort(),
+    });
+  } catch (err) {
+    logger.error('admin.shopkeys.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+const shopEditSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  code: z.string().trim().toUpperCase().regex(/^[A-Z]{2}$/, 'Use two letters, e.g. RG')
+    .nullable().optional()
+    .or(z.literal('').transform(() => null)),
+});
+
+// Renaming a shop and setting its key are manager jobs, and doing them here
+// rather than in a migration means the next shop does not need a code change.
+app.put('/api/admin/shops/:id', auth, requireAdmin, validate(shopEditSchema), async (req, res) => {
+  try {
+    const { name, code } = req.body;
+    const { rows: before } = await pool.query(
+      'SELECT id, name, code FROM shops WHERE id=$1 AND business_id=$2',
+      [req.params.id, req.user.businessId]
+    );
+    if (!before.length) return res.status(404).json({ error: 'Shop not found' });
+
+    const { rows } = await pool.query(
+      'UPDATE shops SET name=$1, code=$2 WHERE id=$3 AND business_id=$4 RETURNING *',
+      [name, code || null, req.params.id, req.user.businessId]
+    );
+    const changed = [];
+    if (before[0].name !== rows[0].name) changed.push(`name ${before[0].name} to ${rows[0].name}`);
+    if ((before[0].code || '') !== (rows[0].code || '')) {
+      changed.push(`key ${before[0].code || 'none'} to ${rows[0].code || 'none'}`);
+    }
+    if (changed.length) {
+      await audit(req, { action: 'update', entity: 'shop', entityId: rows[0].id,
+        summary: 'Shop ' + changed.join(', '), before: formatShop(before[0]), after: formatShop(rows[0]) });
+    }
+    res.json(formatShop(rows[0]));
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'Another shop already uses that key' });
+    logger.error('admin.shopedit.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/admin/shops', auth, requireAdmin, validate(shopEditSchema), async (req, res) => {
+  try {
+    if (!req.user.businessId) return res.status(400).json({ error: 'No business' });
+    const { name, code } = req.body;
+    const { rows } = await pool.query(
+      'INSERT INTO shops (business_id, name, address, code) VALUES ($1,$2,$3,$4) RETURNING *',
+      [req.user.businessId, name, '', code || null]
+    );
+    await audit(req, { action: 'create', entity: 'shop', entityId: rows[0].id,
+      summary: `Added shop ${rows[0].name}${rows[0].code ? ' (' + rows[0].code + ')' : ''}`,
+      after: formatShop(rows[0]) });
+    res.status(201).json(formatShop(rows[0]));
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'Another shop already uses that key' });
+    logger.error('admin.shopcreate.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
