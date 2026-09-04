@@ -2388,6 +2388,107 @@ app.get('/api/stock.csv', auth, requireAdmin, async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════
+// RESET STOCK DATA
+// ═══════════════════════════════════════════════════════════
+// Clears every product, every movement and every grouping, leaving the shops
+// and the staff list standing. Meant for the point where trial data has to
+// go before the real catalogue is loaded.
+//
+// This is not undoable and there is no soft-delete behind it, so it is gated
+// three ways: the manager code, an exact confirmation phrase in the body, and
+// a backup the browser downloads before it will call this at all.
+const RESET_PHRASE = 'DELETE ALL STOCK';
+
+// What is actually there, so the confirmation screen states real numbers
+// rather than asking someone to destroy an unknown quantity.
+app.get('/api/admin/data-counts', auth, requireAdmin, async (req, res) => {
+  try {
+    const businessId = req.user.businessId;
+    const one = async (sql) => Number((await pool.query(sql, [businessId])).rows[0].n);
+    res.json({
+      items: await one(
+        `SELECT COUNT(*)::int AS n FROM stock_items si
+         JOIN shops sh ON sh.id = si.shop_id WHERE sh.business_id = $1`),
+      movements: await one(
+        `SELECT COUNT(*)::int AS n FROM stock_movements m
+         JOIN shops sh ON sh.id = m.shop_id WHERE sh.business_id = $1`),
+      groups: await one(
+        `SELECT COUNT(*)::int AS n FROM item_groups g
+         JOIN shops sh ON sh.id = g.shop_id WHERE sh.business_id = $1`),
+      // Kept by the reset — shown so it is clear what survives.
+      shops: await one(`SELECT COUNT(*)::int AS n FROM shops WHERE business_id = $1`),
+      staff: await one(`SELECT COUNT(*)::int AS n FROM staff WHERE business_id = $1 AND active = TRUE`),
+    });
+  } catch (err) {
+    logger.error('admin.counts.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/admin/reset-stock', auth, requireAdmin, async (req, res) => {
+  if (String(req.body && req.body.confirm) !== RESET_PHRASE) {
+    return res.status(400).json({ error: `Type "${RESET_PHRASE}" to confirm` });
+  }
+  const client = await pool.connect();
+  try {
+    const businessId = req.user.businessId;
+    await client.query('BEGIN');
+
+    // Count before deleting, so the audit entry left behind can say how much
+    // went. Afterwards there is nothing left to count.
+    const count = async (sql) => Number((await client.query(sql, [businessId])).rows[0].n);
+    const before = {
+      items: await count(
+        `SELECT COUNT(*)::int AS n FROM stock_items si
+         JOIN shops sh ON sh.id = si.shop_id WHERE sh.business_id = $1`),
+      movements: await count(
+        `SELECT COUNT(*)::int AS n FROM stock_movements m
+         JOIN shops sh ON sh.id = m.shop_id WHERE sh.business_id = $1`),
+      groups: await count(
+        `SELECT COUNT(*)::int AS n FROM item_groups g
+         JOIN shops sh ON sh.id = g.shop_id WHERE sh.business_id = $1`),
+    };
+
+    // Movements first. They cascade from stock_items anyway, but deleting
+    // them explicitly keeps the order obvious and the counts honest.
+    await client.query(
+      `DELETE FROM stock_movements WHERE shop_id IN (SELECT id FROM shops WHERE business_id = $1)`,
+      [businessId]
+    );
+    await client.query(
+      `DELETE FROM stock_items WHERE shop_id IN (SELECT id FROM shops WHERE business_id = $1)`,
+      [businessId]
+    );
+    await client.query(
+      `DELETE FROM item_groups WHERE shop_id IN (SELECT id FROM shops WHERE business_id = $1)`,
+      [businessId]
+    );
+
+    // The old audit entries all point at items that no longer exist, so they
+    // are cleared too — but the reset itself is recorded, because "where did
+    // everything go" must always have an answer.
+    await client.query(`DELETE FROM audit_log WHERE business_id = $1`, [businessId]);
+    await client.query(
+      `INSERT INTO audit_log (business_id, action, entity, summary, before_val, actor_role)
+       VALUES ($1, 'reset', 'stock', $2, $3, $4)`,
+      [businessId,
+       `Cleared all stock: ${before.items} products, ${before.movements} movements, ${before.groups} groups. Shops and staff kept.`,
+       JSON.stringify(before), req.accessRole]
+    );
+
+    await client.query('COMMIT');
+    logger.warn('admin.reset_stock', { businessId, ...before });
+    res.json({ ok: true, removed: before });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    logger.error('admin.reset.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 initDB()
   .then(() => app.listen(PORT, () => logger.info('server.started', { port: PORT, app: 'mitrasamadi' })))
