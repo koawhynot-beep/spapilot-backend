@@ -868,14 +868,21 @@ const scopedShop = async (req, res, next) => {
 // be read from the row before we can tell whether this key may touch it.
 const scopedItem = async (req, res, next) => {
   try {
+    // The routes do not agree on what the parameter is called — most use
+    // :id, the stock-check pair use :itemId — and reading only one of them
+    // meant this looked up `undefined` and answered "Item not found" for
+    // every tick on the Stock check screen. Take whichever the route
+    // supplied, and hand the resolved id on so no handler has to guess.
+    const itemId = req.params.id ?? req.params.itemId;
     const { rows } = await pool.query(
-      `SELECT si.shop_id FROM stock_items si
+      `SELECT si.id, si.shop_id FROM stock_items si
        JOIN shops sh ON sh.id = si.shop_id
        WHERE si.id=$1 AND sh.business_id=$2`,
-      [req.params.id, req.user.businessId]
+      [itemId, req.user.businessId]
     );
     if (!rows.length) return res.status(404).json({ error: 'Item not found' });
     if (!shopAllowed(req, rows[0].shop_id)) return denyShop(res);
+    req.scopedItemId = rows[0].id;
     next();
   } catch (err) {
     logger.error('scopedItem.error', { err: err.message });
@@ -2125,7 +2132,7 @@ async function salesFilter(req, startParamIndex) {
   return { where, params, shopIds };
 }
 
-app.get('/api/sales/history', auth, requireAdmin, async (req, res) => {
+app.get('/api/sales/history', auth, async (req, res) => {
   try {
     const { where, params } = await salesFilter(req, 3);
     const all = [req.user.businessId, String(HISTORY_MONTHS), ...params];
@@ -2181,9 +2188,20 @@ const saleEditSchema = z.object({
   // null clears it, putting the row back on the item's shelf price.
   unitPrice: z.coerce.number().min(0).max(1e12).nullable().optional(),
   note: z.string().trim().max(500).optional(),
+  // When it actually happened. A sale rung up on the way home belongs to the
+  // afternoon it was made, not to the moment somebody got round to typing it.
+  occurredAt: z.coerce.date().optional(),
+  // Who is making the correction, so the audit trail names a person and not
+  // just "staff".
+  staffId: z.coerce.number().int().positive().nullable().optional(),
 });
 
-app.patch('/api/sales/:id', auth, requireAdmin, validate(saleEditSchema), async (req, res) => {
+// How far back a sale's time may be moved. A week covers "we forgot to ring
+// it up before the weekend" without leaving last quarter's takings open to
+// being rewritten.
+const EDIT_WINDOW_DAYS = 7;
+
+app.patch('/api/sales/:id', auth, validate(saleEditSchema), async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -2272,12 +2290,40 @@ app.patch('/api/sales/:id', auth, requireAdmin, validate(saleEditSchema), async 
     const unitPrice = req.body.unitPrice === undefined ? move.unit_price : req.body.unitPrice;
     const note = req.body.note === undefined ? move.note : req.body.note;
 
+    // The time it happened. Bounded in both directions: nothing in the future,
+    // because a sale cannot have happened yet, and nothing older than the
+    // window, because that is the point at which correcting a record stops
+    // being a correction.
+    let occurredAt = move.occurred_at;
+    if (req.body.occurredAt !== undefined) {
+      const when = new Date(req.body.occurredAt);
+      if (Number.isNaN(when.getTime())) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'That is not a date' });
+      }
+      const now = Date.now();
+      // A minute of slack: a tablet whose clock is a few seconds fast should
+      // not have "now" rejected as the future.
+      if (when.getTime() > now + 60000) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'A sale cannot be dated in the future' });
+      }
+      if (when.getTime() < now - EDIT_WINDOW_DAYS * 86400000) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          error: `The time can only be set within the last ${EDIT_WINDOW_DAYS} days`,
+        });
+      }
+      occurredAt = when;
+    }
+
     const { rows: saved } = await client.query(
       `UPDATE stock_movements
-          SET item_id = $1, qty_change = $2, qty_after = $3, unit_price = $4, note = $5
-        WHERE id = $6
+          SET item_id = $1, qty_change = $2, qty_after = $3, unit_price = $4,
+              note = $5, occurred_at = $6
+        WHERE id = $7
         RETURNING id`,
-      [newItemId, newQtyChange, qtyAfter, unitPrice, note, saleId]
+      [newItemId, newQtyChange, qtyAfter, unitPrice, note, occurredAt, saleId]
     );
     await client.query('COMMIT');
 
@@ -2289,8 +2335,14 @@ app.patch('/api/sales/:id', auth, requireAdmin, validate(saleEditSchema), async 
       entityId: saleId,
       summary: describe(oldItem, oldUnits, move.unit_price === null ? 'shelf price' : move.unit_price)
         + '  →  ' + describe(newItem, newUnits, unitPrice === null || unitPrice === undefined ? 'shelf price' : unitPrice),
-      before: { itemId: oldItemId, qtyChange: move.qty_change, unitPrice: move.unit_price, note: move.note },
-      after: { itemId: newItemId, qtyChange: newQtyChange, unitPrice, note },
+      before: {
+        itemId: oldItemId, qtyChange: move.qty_change,
+        unitPrice: move.unit_price, note: move.note, occurredAt: move.occurred_at,
+      },
+      after: { itemId: newItemId, qtyChange: newQtyChange, unitPrice, note, occurredAt },
+      // Names the person who made the correction, not just the role. On the
+      // shop floor "staff" is several people sharing one code.
+      staff: await resolveStaff(req.body.staffId, req.user.businessId),
     });
 
     // Hand back the corrected row in the same shape the list uses, so the
@@ -2305,6 +2357,170 @@ app.patch('/api/sales/:id', auth, requireAdmin, validate(saleEditSchema), async 
     res.status(500).json({ error: 'Internal server error' });
   } finally {
     client.release();
+  }
+});
+
+
+// Deleting a recorded movement.
+//
+// Correcting a row covers "it was the wrong garment". This covers "it never
+// happened at all" â rung up twice, or scanned by accident. The stock effect
+// is undone and the row goes, so the history reads as though the mistake was
+// never made.
+//
+// Nothing is soft-deleted. A sale that stays in the table behind a flag would
+// have to be excluded from six different revenue queries, and the first one
+// anybody forgets pays commission on a sale that did not happen. The audit
+// log keeps the record instead: it stores what the row said before it went,
+// which is the part worth keeping.
+app.delete('/api/movements/:id', auth, requireAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const moveId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(moveId)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Bad record id' });
+    }
+
+    const { rows: mv } = await client.query(
+      `SELECT m.*, si.name AS item_name, si.sku
+         FROM stock_movements m
+         JOIN stock_items si ON si.id = m.item_id
+         JOIN shops sh ON sh.id = m.shop_id
+        WHERE m.id = $1 AND sh.business_id = $2
+        FOR UPDATE OF m`,
+      [moveId, req.user.businessId]
+    );
+    if (!mv.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'That record no longer exists' });
+    }
+    const move = mv[0];
+    if (!shopAllowed(req, move.shop_id)) {
+      await client.query('ROLLBACK');
+      return denyShop(res);
+    }
+
+    // Undo whatever the row did to the stock. A sale recorded -1, so removing
+    // it puts one back; a stock-in recorded +1, so removing it takes one off.
+    const { rows: upd } = await client.query(
+      'UPDATE stock_items SET qty = GREATEST(0, qty - $1), updated_at = NOW() WHERE id = $2 RETURNING qty',
+      [move.qty_change, move.item_id]
+    );
+
+    await client.query('DELETE FROM stock_movements WHERE id = $1', [moveId]);
+    await client.query('COMMIT');
+
+    await audit(req, {
+      action: 'movement.deleted',
+      entity: 'movement',
+      entityId: moveId,
+      summary: `${move.type} ${move.qty_change > 0 ? '+' : ''}${move.qty_change} × `
+        + `${move.item_name} (${move.sku}) on `
+        + `${new Date(move.occurred_at).toISOString().slice(0, 10)} deleted`,
+      before: {
+        type: move.type, itemId: move.item_id, shopId: move.shop_id,
+        qtyChange: move.qty_change, unitPrice: move.unit_price,
+        occurredAt: move.occurred_at, staffName: move.staff_name,
+        note: move.note, reason: move.reason,
+      },
+      after: null,
+    });
+
+    res.json({ ok: true, deletedId: moveId, itemId: move.item_id, qty: upd.length ? upd[0].qty : null });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    logger.error('movement.delete.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// ── Stock in and out ─────────────────────────────────
+// The other half of the movement log. Sales answer "what did we take"; this
+// answers "where did the stock go" â deliveries in, and write-offs out with
+// the reason they left. Same filters as the sales history so the two screens
+// behave alike, and the same window.
+const STOCK_MOVE_TYPES_SQL =
+  "m.type IN ('in', 'removal', 'transfer-in', 'transfer-out')";
+
+const MOVE_SELECT = `
+  SELECT m.id, m.type, m.qty_change, m.qty_after, m.occurred_at, m.reason, m.note,
+         COALESCE(NULLIF(m.staff_name,''), '(not recorded)') AS staff_name,
+         m.staff_id, si.sku, si.name AS item_name, si.color, si.size, si.category,
+         si.fabric, COALESCE(si.price,0) AS price, m.item_id,
+         m.shop_id, sh.name AS shop_name
+  FROM stock_movements m
+  JOIN stock_items si ON si.id = m.item_id
+  JOIN shops sh ON sh.id = m.shop_id
+`;
+
+const shapeMove = (r) => ({
+  id: r.id,
+  type: r.type,
+  occurredAt: r.occurred_at,
+  sku: r.sku,
+  itemName: r.item_name,
+  color: r.color || '',
+  size: r.size || '',
+  category: r.category || '',
+  fabric: r.fabric || '',
+  // Positive means it came in, negative means it left. Kept signed so the
+  // screen does not have to know which types mean which direction.
+  units: r.qty_change,
+  qtyAfter: r.qty_after,
+  price: Number(r.price),
+  value: Math.abs(r.qty_change) * Number(r.price),
+  itemId: r.item_id,
+  staffId: r.staff_id,
+  staffName: r.staff_name,
+  reason: r.reason || '',
+  note: r.note || '',
+  shopId: r.shop_id,
+  shopName: r.shop_name || '',
+});
+
+app.get('/api/movements', auth, async (req, res) => {
+  try {
+    const { where, params } = await salesFilter(req, 3);
+    const all = [req.user.businessId, String(HISTORY_MONTHS), ...params];
+
+    // 'in', 'out', or everything when unset.
+    const dir = String(req.query.dir || '').trim();
+    let typeSql = STOCK_MOVE_TYPES_SQL;
+    if (dir === 'in') typeSql = "m.type IN ('in', 'transfer-in')";
+    else if (dir === 'out') typeSql = "m.type IN ('removal', 'transfer-out')";
+
+    const windowSql = `sh.business_id = $1 AND ${typeSql}
+      AND m.occurred_at >= NOW() - ($2 || ' months')::interval ${where}`;
+
+    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 1000);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+    const { rows } = await pool.query(
+      `${MOVE_SELECT} WHERE ${windowSql} ORDER BY m.occurred_at DESC, m.id DESC LIMIT ${limit} OFFSET ${offset}`,
+      all
+    );
+    const { rows: agg } = await pool.query(
+      `SELECT COUNT(*)::int AS n,
+              COALESCE(SUM(CASE WHEN m.qty_change > 0 THEN m.qty_change ELSE 0 END),0)::int AS in_units,
+              COALESCE(SUM(CASE WHEN m.qty_change < 0 THEN -m.qty_change ELSE 0 END),0)::int AS out_units
+       FROM stock_movements m
+       JOIN stock_items si ON si.id = m.item_id
+       JOIN shops sh ON sh.id = m.shop_id
+       WHERE ${windowSql}`,
+      all
+    );
+    res.json({
+      total: agg[0].n, limit, offset, windowMonths: HISTORY_MONTHS,
+      totals: { in: agg[0].in_units, out: agg[0].out_units },
+      items: rows.map(shapeMove),
+    });
+  } catch (err) {
+    logger.error('movements.list.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2858,7 +3074,7 @@ app.post('/api/stock-check/:itemId', auth, scopedItem, async (req, res) => {
   try {
     const staff = await resolveStaff(req.body.staffId, req.user.businessId);
     const { rows: item } = await client.query(
-      'SELECT id, shop_id, qty FROM stock_items WHERE id = $1', [req.params.itemId]
+      'SELECT id, shop_id, qty FROM stock_items WHERE id = $1', [req.scopedItemId]
     );
     if (!item.length) return res.status(404).json({ error: 'Item not found' });
     if (item[0].qty <= 0) {
@@ -2887,7 +3103,7 @@ app.post('/api/stock-check/:itemId', auth, scopedItem, async (req, res) => {
 app.delete('/api/stock-check/:itemId', auth, scopedItem, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      'DELETE FROM stock_check_marks WHERE item_id = $1 RETURNING shop_id', [req.params.itemId]
+      'DELETE FROM stock_check_marks WHERE item_id = $1 RETURNING shop_id', [req.scopedItemId]
     );
     // Unticking reopens the round: a finished round that is no longer
     // finished should not still be counting down to its reset.

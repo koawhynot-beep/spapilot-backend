@@ -186,13 +186,60 @@ check('a sale cannot be moved to another shop’s garment',
   src.includes('That item belongs to a different shop'), 'the shop guard is missing');
 check('only sales and returns can be corrected',
   src.includes('Only a sale or a return can be corrected here'), 'the type guard is missing');
-check('the correction is admin-only',
-  /app\.patch\('\/api\/sales\/:id',\s*auth,\s*requireAdmin/.test(src), 'requireAdmin is missing');
+// Deliberately open to staff: a mistake is spotted by whoever made it, and
+// scopeShopIds already pins them to their own counter. Deleting a record is
+// the one that stays behind the admin code.
+check('correcting is open to staff, not just admin',
+  /app\.patch\('\/api\/sales\/:id',\s*auth,\s*validate/.test(src),
+  'the correction route no longer takes just auth');
+check('deleting a record is still admin-only',
+  /app\.delete\('\/api\/movements\/:id',\s*auth,\s*requireAdmin/.test(src),
+  'requireAdmin is missing from the delete route');
+check('a correction is signed with the person who made it',
+  /staff: await resolveStaff\(req\.body\.staffId/.test(src),
+  'the audit entry does not name the editor');
 check('the correction is written to the audit log',
   src.includes("action: 'sale.corrected'"), 'no audit entry');
 check('the movement row is locked while it is corrected',
   /FOR UPDATE OF m/.test(src), 'no row lock — two edits could race');
 check('stock never goes negative', src.includes('GREATEST(0, qty + $1)'), 'no clamp');
+
+// ── Moving a sale's time ─────────────────────────────────────────────────
+// The rule is bounded at both ends: not the future, and not older than the
+// window. Read the window out of the source so the two cannot disagree.
+console.log('\n  moving the time it was sold');
+const WINDOW = Number(/const EDIT_WINDOW_DAYS = (\d+)/.exec(src)[1]);
+check(`the window is ${WINDOW} days`, WINDOW === 7, `got ${WINDOW}`);
+
+const withinWindow = (whenMs, nowMs = Date.now()) => {
+  if (whenMs > nowMs + 60000) return 'future';
+  if (whenMs < nowMs - WINDOW * 86400000) return 'too old';
+  return 'ok';
+};
+const DAY = 86400000;
+check('a time three days ago is allowed', withinWindow(Date.now() - 3 * DAY) === 'ok',
+  withinWindow(Date.now() - 3 * DAY));
+check('right now is allowed', withinWindow(Date.now()) === 'ok', withinWindow(Date.now()));
+check('a tablet clock a few seconds fast is not called the future',
+  withinWindow(Date.now() + 20000) === 'ok', withinWindow(Date.now() + 20000));
+check('tomorrow is refused', withinWindow(Date.now() + DAY) === 'future',
+  withinWindow(Date.now() + DAY));
+check(`${WINDOW + 1} days ago is refused`, withinWindow(Date.now() - (WINDOW + 1) * DAY) === 'too old',
+  withinWindow(Date.now() - (WINDOW + 1) * DAY));
+check('the handler refuses a future date', src.includes('A sale cannot be dated in the future'),
+  'no future guard');
+check('the handler refuses one older than the window',
+  src.includes('The time can only be set within the last'), 'no window guard');
+check('the new time is actually written', /occurred_at = \$6/.test(src),
+  'occurred_at is not in the UPDATE');
+
+// And it lands in the row.
+const newWhen = new Date(Date.now() - 2 * DAY);
+await db.query('UPDATE stock_movements SET occurred_at = $1 WHERE id = 1', [newWhen]);
+const moved = await moveOf(1);
+check('the row carries the corrected time',
+  Math.abs(new Date(moved.occurred_at).getTime() - newWhen.getTime()) < 1000,
+  `${moved.occurred_at} vs ${newWhen.toISOString()}`);
 
 console.log(failures === 0 ? '\nall checks passed' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

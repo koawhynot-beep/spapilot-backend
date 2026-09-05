@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "node test/sql-placeholders.test.mjs && node test/sales-filter.test.mjs && node test/reset-stock.test.mjs && node test/shop-keys.test.mjs && node test/stock-check.test.mjs && node test/import-stock.test.mjs && node test/sale-edit.test.mjs"
+    "test": "node test/sql-placeholders.test.mjs && node test/sales-filter.test.mjs && node test/reset-stock.test.mjs && node test/shop-keys.test.mjs && node test/stock-check.test.mjs && node test/import-stock.test.mjs && node test/sale-edit.test.mjs && node test/movements.test.mjs && node test/route-params.test.mjs"
   },
   "engines": {
     "node": ">=18"
