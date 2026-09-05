@@ -64,27 +64,45 @@ await scenario('live shape: Gold Dust (GD) + Atriq (AT), with stock',
   `INSERT INTO shops (business_id, name, address, code) VALUES (1,'Gold Dust','','GD'),(1,'Atriq','','AT');
    INSERT INTO stock_items (shop_id, name, sku, qty) VALUES (1,'MAX TOP','MT-1001',5),(2,'KAFTAN','BU-3040',3);
    INSERT INTO stock_movements (item_id, shop_id, type, qty_change) VALUES (1,1,'sale',-1),(2,2,'sale',-1);`,
-  { shops: 'AT:Atriq | RG:Rose Gold', keepsIdOf: 1 });
+  { shops: 'AT:Atriq | GD:Goldust | RG:Rose Gold', keepsIdOf: 1 });
 
 // A single unkeyed shop, as it was before shop keys existed.
 await scenario('single unkeyed shop named Gold Dust',
   `INSERT INTO shops (business_id, name, address) VALUES (1,'Gold Dust','');
    INSERT INTO stock_items (shop_id, name, sku, qty) VALUES (1,'MAX TOP','MT-1001',5);`,
-  { shops: 'AT:Atriq | RG:Rose Gold', keepsIdOf: 1 });
+  { shops: 'AT:Atriq | GD:Goldust | RG:Rose Gold', keepsIdOf: 1 });
 
 // Nothing at all — a fresh database.
-await scenario('empty database', null, { shops: 'AT:Atriq | RG:Rose Gold' });
+await scenario('empty database', null, { shops: 'AT:Atriq | GD:Goldust | RG:Rose Gold' });
 
 // Already correct: the migration must be a no-op, not create duplicates.
 await scenario('already Rose Gold + Atriq (re-running the migration)',
   `INSERT INTO shops (business_id, name, address, code) VALUES (1,'Rose Gold','','RG'),(1,'Atriq','','AT');`,
-  { shops: 'AT:Atriq | RG:Rose Gold', keepsIdOf: 1 });
+  { shops: 'AT:Atriq | GD:Goldust | RG:Rose Gold', keepsIdOf: 1 });
 
 // A shop the manager renamed by hand must not be clobbered back.
 await scenario('a third shop exists and is left alone',
   `INSERT INTO shops (business_id, name, address, code)
      VALUES (1,'Gold Dust','','GD'),(1,'Atriq','','AT'),(1,'Attrick','','KK');`,
-  { shops: 'AT:Atriq | KK:Attrick | RG:Rose Gold', keepsIdOf: 1 });
+  { shops: 'AT:Atriq | GD:Goldust | KK:Attrick | RG:Rose Gold', keepsIdOf: 1 });
+
+// Goldust is a real third shop now, and 'GD' is its key. The historical
+// rename must not reach for it: a boot after Goldust exists has to leave it
+// alone, keeping its own name and its own key.
+await scenario('re-running once Goldust exists',
+  `INSERT INTO shops (business_id, name, address, code)
+     VALUES (1,'Rose Gold','','RG'),(1,'Atriq','','AT'),(1,'Goldust','','GD');
+   INSERT INTO stock_items (shop_id, name, sku, qty) VALUES (3,'MAX TOP','MT-1001',5);`,
+  { shops: 'AT:Atriq | GD:Goldust | RG:Rose Gold', keepsIdOf: 1 });
+
+// And the reverse: a database still carrying the old name, keyed GD, must
+// still become Rose Gold on the row that holds its history — Goldust is then
+// created fresh, because GD has been freed.
+await scenario('old Gold Dust keyed GD still becomes Rose Gold',
+  `INSERT INTO shops (business_id, name, address, code) VALUES (1,'Gold Dust','','GD');
+   INSERT INTO stock_items (shop_id, name, sku, qty) VALUES (1,'MAX TOP','MT-1001',5);
+   INSERT INTO stock_movements (item_id, shop_id, type, qty_change) VALUES (1,1,'sale',-1);`,
+  { shops: 'AT:Atriq | GD:Goldust | RG:Rose Gold', keepsIdOf: 1 });
 
 // ── Code → shop mapping ───────────────────────────────────
 console.log('\n  code → shop mapping (SHOP_CODE_* scanning)');
@@ -101,14 +119,20 @@ const readCodes = (env) => {
 const mapped = readCodes({
   SHOP_CODE_RG: 'rose-secret',
   SHOP_CODE_AT: 'atriq-secret',
-  SHOP_CODE_GD: 'stale-secret',
+  SHOP_CODE_GD: 'goldust-secret',
+  SHOP_CODE_ZZ: 'no-such-shop',
   STAFF_CODE: 'legacy-secret',
   SHOP_CODE_TOOLONG: 'ignored',
   SHOP_CODE_AT_BLANK: '',
 });
-check('    RG and AT both map', mapped.RG === 'rose-secret' && mapped.AT === 'atriq-secret', JSON.stringify(mapped));
+check('    all three shops map', mapped.RG === 'rose-secret' && mapped.AT === 'atriq-secret' && mapped.GD === 'goldust-secret', JSON.stringify(mapped));
 check('    STAFF_CODE no longer maps to anything', !Object.values(mapped).includes('legacy-secret'), 'legacy fallback still present');
-check('    a stale SHOP_CODE_GD is picked up so it can be reported', mapped.GD === 'stale-secret', 'not seen');
+// A key for a shop that does not exist is still read, so the Shops & keys
+// screen can list it as doing nothing rather than leaving it invisible.
+check('    a key with no matching shop is picked up so it can be reported', mapped.ZZ === 'no-such-shop', 'not seen');
+// The three shops must have three different doors.
+const secrets = [mapped.RG, mapped.AT, mapped.GD];
+check('    each shop has its own key', new Set(secrets).size === 3, secrets.join(' / '));
 check('    malformed keys ignored', !('TOOLONG' in mapped) && !('AT_BLANK' in mapped), JSON.stringify(Object.keys(mapped)));
 
 console.log(failures === 0 ? '\nall checks passed' : `\n${failures} FAILED`);

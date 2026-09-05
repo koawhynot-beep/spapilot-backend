@@ -621,18 +621,28 @@ async function initDB() {
       'SELECT id, name, code FROM shops WHERE business_id=$1 ORDER BY id ASC', [businessId]
     );
 
-    // The two shops the business actually runs. Rose Gold replaces what an
+    // The shops the business actually runs. Rose Gold replaces what an
     // earlier migration created as "Gold Dust" — that name came from this
     // code assuming a single shop, not from the business.
-    const WANTED = [['RG', 'Rose Gold'], ['AT', 'Atriq']];
+    const WANTED = [['RG', 'Rose Gold'], ['AT', 'Atriq'], ['GD', 'Goldust']];
 
     // Rename before keying, so the row that already carries all the history
     // becomes Rose Gold rather than a fresh empty shop being made alongside
-    // it. Matched on the old key, not the name, because the name is exactly
-    // what is being corrected.
-    const goldDust = existing.find(
-      x => x.code === 'GD' || (!x.code && /gold *dust/i.test(x.name))
-    );
+    // it.
+    //
+    // Matched on the name alone. It used to also match the key 'GD', which
+    // cannot stand now that GD is Goldust's own key — the next boot after
+    // Goldust was created would have found it, renamed it to Rose Gold and
+    // handed it Rose Gold's key.
+    //
+    // The name is the safe discriminator because the two spellings differ:
+    // "Gold Dust" is the old single-shop name this corrects, and "Goldust"
+    // has no d before the "ust", so it cannot match. A shop that still has
+    // the old name keeps being renamed whether or not it was keyed, which
+    // matters — that row carries all the history, and a deployment where it
+    // was already keyed GD must still end up as Rose Gold rather than having
+    // a fresh empty Rose Gold created alongside it.
+    const goldDust = existing.find(x => /gold *dust/i.test(x.name));
     if (goldDust && !existing.some(x => x.code === 'RG')) {
       await pool.query('UPDATE shops SET name=$1, code=$2 WHERE id=$3',
         ['Rose Gold', 'RG', goldDust.id]);
