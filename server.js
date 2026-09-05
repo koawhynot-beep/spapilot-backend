@@ -524,6 +524,12 @@ async function initDB() {
     ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS staff_id   INTEGER REFERENCES staff(id) ON DELETE SET NULL;
     ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS staff_name TEXT DEFAULT '';
     ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS reason     TEXT DEFAULT '';
+    -- What this particular sale actually went at. Null means "whatever the
+    -- item costs now", which is how every movement behaved before this
+    -- column existed, so old rows keep reading exactly as they did. It is
+    -- set when a sale is corrected to a price that is not the shelf price —
+    -- a swap where the customer paid a difference, or a discount.
+    ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS unit_price NUMERIC(14,2);
   `);
 
   // Reclassify transfers logged before the type split. They were written as
@@ -2000,11 +2006,18 @@ app.get('/api/audit', auth, requireAdmin, async (req, res) => {
 // only right while prices are stable: the movement log does not store the
 // price struck on the day, so changing an item's price rewrites its sales
 // history. Worth knowing before anyone reconciles these against a drawer.
+// The money a sold piece was worth. The price stored on the movement wins;
+// otherwise the item's current price, which is what every figure used before
+// per-sale prices existed. Every revenue figure has to go through this, or a
+// corrected sale reads one way on the History list and another in the totals.
+const SALE_PRICE_SQL = 'COALESCE(m.unit_price, si.price, 0)';
+
 const SALE_SELECT = `
   SELECT m.id, m.type, m.qty_change, m.occurred_at, m.reason, m.note,
          COALESCE(NULLIF(m.staff_name,''), '(not recorded)') AS staff_name,
          m.staff_id, si.sku, si.name AS item_name, si.color, si.size, si.category,
-         si.fabric, COALESCE(si.price,0) AS price, COALESCE(si.cost,0) AS cost,
+         si.fabric, ${SALE_PRICE_SQL} AS price, COALESCE(si.cost,0) AS cost,
+         m.unit_price AS unit_price, m.item_id, m.qty_change AS raw_qty_change,
          m.shop_id, sh.name AS shop_name
   FROM stock_movements m
   JOIN stock_items si ON si.id = m.item_id
@@ -2026,6 +2039,10 @@ const shapeSale = (r) => {
     fabric: r.fabric || '',
     units,
     price,
+    // The item this row points at, and whether the price above was agreed on
+    // the sale or just read off the shelf — the correction screen needs both.
+    itemId: r.item_id,
+    unitPrice: r.unit_price === null || r.unit_price === undefined ? null : Number(r.unit_price),
     value: units * price,
     margin: units * (price - Number(r.cost)),
     staffId: r.staff_id,
@@ -2125,7 +2142,7 @@ app.get('/api/sales/history', auth, requireAdmin, async (req, res) => {
     const { rows: agg } = await pool.query(
       `SELECT COUNT(*)::int AS n,
               COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units,
-              COALESCE(SUM(${NET_UNITS_SQL} * COALESCE(si.price,0)),0)::numeric AS revenue
+              COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_PRICE_SQL}),0)::numeric AS revenue
        FROM stock_movements m
        JOIN stock_items si ON si.id = m.item_id
        JOIN shops sh ON sh.id = m.shop_id
@@ -2140,6 +2157,154 @@ app.get('/api/sales/history', auth, requireAdmin, async (req, res) => {
   } catch (err) {
     logger.error('sales.history.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── Correcting a recorded sale ───────────────────────
+// A customer who swaps a garment for a different style has not returned
+// anything and has not bought a second thing: the sale that was recorded was
+// simply of the wrong garment. Reversing and re-entering it would leave two
+// misleading rows in the history and pay commission twice, so the row is
+// corrected in place.
+//
+// Style, colour and size are not fields on the movement — they belong to the
+// stock item — so changing them means pointing the sale at a different item,
+// and the stock has to follow: the garment that was wrongly sold goes back on
+// the rail, and the one that actually left comes off it.
+//
+// Every correction is written to the audit log with the before and after,
+// because a screen that can quietly rewrite last month's takings needs to
+// leave a trail.
+const saleEditSchema = z.object({
+  itemId: z.coerce.number().int().positive().optional(),
+  qty: z.coerce.number().int().min(1).max(999).optional(),
+  // null clears it, putting the row back on the item's shelf price.
+  unitPrice: z.coerce.number().min(0).max(1e12).nullable().optional(),
+  note: z.string().trim().max(500).optional(),
+});
+
+app.patch('/api/sales/:id', auth, requireAdmin, validate(saleEditSchema), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const saleId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(saleId)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Bad sale id' });
+    }
+
+    const { rows: mv } = await client.query(
+      `SELECT m.*, sh.business_id
+         FROM stock_movements m
+         JOIN shops sh ON sh.id = m.shop_id
+        WHERE m.id = $1 AND sh.business_id = $2
+        FOR UPDATE OF m`,
+      [saleId, req.user.businessId]
+    );
+    if (!mv.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'That record no longer exists' });
+    }
+    const move = mv[0];
+    if (!shopAllowed(req, move.shop_id)) {
+      await client.query('ROLLBACK');
+      return denyShop(res);
+    }
+    // Only the rows History actually shows. Stock-in and write-offs are a
+    // different correction with different arithmetic, and quietly accepting
+    // them here would corrupt stock in a way nobody would notice.
+    if (move.type !== 'sale' && move.type !== 'return') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Only a sale or a return can be corrected here' });
+    }
+
+    const oldItemId = move.item_id;
+    const newItemId = req.body.itemId === undefined ? oldItemId : Number(req.body.itemId);
+
+    // The direction is fixed by the row's type: correcting a sale can never
+    // turn it into a return. That is a different event and needs its own row.
+    const sign = move.qty_change < 0 ? -1 : 1;
+    const oldUnits = Math.abs(move.qty_change);
+    const newUnits = req.body.qty === undefined ? oldUnits : Number(req.body.qty);
+    const newQtyChange = sign * newUnits;
+
+    // A sale belongs to the shop it happened in; it cannot be moved to a
+    // garment sitting in the other shop.
+    const { rows: items } = await client.query(
+      `SELECT id, shop_id, name, sku, qty, COALESCE(price,0) AS price
+         FROM stock_items WHERE id = ANY($1::int[]) FOR UPDATE`,
+      [[...new Set([oldItemId, newItemId])]]
+    );
+    const byId = new Map(items.map(i => [i.id, i]));
+    const oldItem = byId.get(oldItemId);
+    const newItem = byId.get(newItemId);
+    if (!newItem) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'That item no longer exists' });
+    }
+    if (newItem.shop_id !== move.shop_id) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'That item belongs to a different shop' });
+    }
+
+    // Net the stock effect per item, so swapping between two sizes of the
+    // same garment — or editing only the quantity — is one arithmetic pass
+    // rather than two updates fighting over the same row.
+    const delta = new Map();
+    const bump = (id, n) => delta.set(id, (delta.get(id) || 0) + n);
+    if (oldItem) bump(oldItemId, -move.qty_change);   // undo what was recorded
+    bump(newItemId, newQtyChange);                    // apply what really happened
+
+    let qtyAfter = move.qty_after;
+    for (const [id, d] of delta) {
+      if (d === 0) continue;
+      const { rows: upd } = await client.query(
+        'UPDATE stock_items SET qty = GREATEST(0, qty + $1), updated_at = NOW() WHERE id = $2 RETURNING qty',
+        [d, id]
+      );
+      if (id === newItemId) qtyAfter = upd[0].qty;
+    }
+    if (!delta.get(newItemId)) {
+      const { rows: cur } = await client.query('SELECT qty FROM stock_items WHERE id = $1', [newItemId]);
+      qtyAfter = cur[0].qty;
+    }
+
+    const unitPrice = req.body.unitPrice === undefined ? move.unit_price : req.body.unitPrice;
+    const note = req.body.note === undefined ? move.note : req.body.note;
+
+    const { rows: saved } = await client.query(
+      `UPDATE stock_movements
+          SET item_id = $1, qty_change = $2, qty_after = $3, unit_price = $4, note = $5
+        WHERE id = $6
+        RETURNING id`,
+      [newItemId, newQtyChange, qtyAfter, unitPrice, note, saleId]
+    );
+    await client.query('COMMIT');
+
+    const describe = (it, units, price) =>
+      `${units} × ${it ? it.name : 'deleted item'}${it ? ' (' + it.sku + ')' : ''} @ ${price}`;
+    await audit(req, {
+      action: 'sale.corrected',
+      entity: 'movement',
+      entityId: saleId,
+      summary: describe(oldItem, oldUnits, move.unit_price === null ? 'shelf price' : move.unit_price)
+        + '  →  ' + describe(newItem, newUnits, unitPrice === null || unitPrice === undefined ? 'shelf price' : unitPrice),
+      before: { itemId: oldItemId, qtyChange: move.qty_change, unitPrice: move.unit_price, note: move.note },
+      after: { itemId: newItemId, qtyChange: newQtyChange, unitPrice, note },
+    });
+
+    // Hand back the corrected row in the same shape the list uses, so the
+    // screen can drop it straight in without a refetch.
+    const { rows: fresh } = await pool.query(
+      `${SALE_SELECT} WHERE m.id = $1`, [saved[0].id]
+    );
+    res.json(shapeSale(fresh[0]));
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    logger.error('sales.correct.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
   }
 });
 
@@ -2225,7 +2390,7 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
       pool.query(
         `SELECT si.sku, MIN(si.name) AS name, MIN(si.color) AS color,
                 COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units,
-                COALESCE(SUM(${NET_UNITS_SQL} * COALESCE(si.price,0)),0)::numeric AS revenue
+                COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_PRICE_SQL}),0)::numeric AS revenue
          FROM stock_movements m
          JOIN stock_items si ON si.id = m.item_id
          JOIN shops sh ON sh.id = m.shop_id
@@ -2237,7 +2402,7 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
       pool.query(
         `SELECT to_char(date_trunc('month', m.occurred_at), 'YYYY-MM') AS month,
                 COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units,
-                COALESCE(SUM(${NET_UNITS_SQL} * COALESCE(si.price,0)),0)::numeric AS revenue
+                COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_PRICE_SQL}),0)::numeric AS revenue
          FROM stock_movements m
          JOIN stock_items si ON si.id = m.item_id
          JOIN shops sh ON sh.id = m.shop_id
@@ -2335,8 +2500,8 @@ const COMMISSION_SQL = `
          MIN(m.staff_id) AS staff_id,
          COALESCE(SUM(CASE WHEN m.type='sale'   THEN -m.qty_change ELSE 0 END),0)::int AS sold_units,
          COALESCE(SUM(CASE WHEN m.type='return' THEN  m.qty_change ELSE 0 END),0)::int AS returned_units,
-         COALESCE(SUM(CASE WHEN m.type='sale'   THEN -m.qty_change * COALESCE(si.price,0) ELSE 0 END),0)::numeric AS gross,
-         COALESCE(SUM(CASE WHEN m.type='return' THEN  m.qty_change * COALESCE(si.price,0) ELSE 0 END),0)::numeric AS returned
+         COALESCE(SUM(CASE WHEN m.type='sale'   THEN -m.qty_change * ${SALE_PRICE_SQL} ELSE 0 END),0)::numeric AS gross,
+         COALESCE(SUM(CASE WHEN m.type='return' THEN  m.qty_change * ${SALE_PRICE_SQL} ELSE 0 END),0)::numeric AS returned
   FROM stock_movements m
   JOIN stock_items si ON si.id = m.item_id
   JOIN shops sh ON sh.id = m.shop_id

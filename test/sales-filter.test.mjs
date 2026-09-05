@@ -29,6 +29,10 @@ const value = (decl, end) =>
 
 const SALE_TYPES_SQL = value('const SALE_TYPES_SQL =', ';');
 const NET_UNITS_SQL = value('const NET_UNITS_SQL =', ';');
+// SALE_SELECT interpolates this, so it has to exist before SALE_SELECT is
+// evaluated — same order as in the server.
+// eslint-disable-next-line no-unused-vars
+const SALE_PRICE_SQL = value('const SALE_PRICE_SQL =', ';');
 const SALE_SELECT = value('const SALE_SELECT =', '`;');
 const HISTORY_MONTHS = 24;
 
@@ -61,7 +65,8 @@ await db.exec(`
   CREATE TABLE stock_movements (
     id SERIAL PRIMARY KEY, item_id INT, shop_id INT, user_id INT, type TEXT,
     qty_change INT, qty_after INT, occurred_at TIMESTAMPTZ DEFAULT NOW(),
-    note TEXT DEFAULT '', reason TEXT DEFAULT '', staff_id INT, staff_name TEXT DEFAULT ''
+    note TEXT DEFAULT '', reason TEXT DEFAULT '', staff_id INT, staff_name TEXT DEFAULT '',
+    unit_price NUMERIC(14,2)
   );
   INSERT INTO businesses (name) VALUES ('Mitra Samadi');
   INSERT INTO shops (business_id, name, address, code) VALUES (1, 'Gold Dust', '', 'GD');
