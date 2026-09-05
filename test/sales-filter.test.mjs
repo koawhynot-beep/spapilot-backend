@@ -66,7 +66,7 @@ await db.exec(`
     id SERIAL PRIMARY KEY, item_id INT, shop_id INT, user_id INT, type TEXT,
     qty_change INT, qty_after INT, occurred_at TIMESTAMPTZ DEFAULT NOW(),
     note TEXT DEFAULT '', reason TEXT DEFAULT '', staff_id INT, staff_name TEXT DEFAULT '',
-    unit_price NUMERIC(14,2)
+    unit_price NUMERIC(14,2), payment TEXT DEFAULT ''
   );
   INSERT INTO businesses (name) VALUES ('Mitra Samadi');
   INSERT INTO shops (business_id, name, address, code) VALUES (1, 'Gold Dust', '', 'GD');

@@ -530,6 +530,12 @@ async function initDB() {
     -- set when a sale is corrected to a price that is not the shelf price —
     -- a swap where the customer paid a difference, or a discount.
     ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS unit_price NUMERIC(14,2);
+
+    -- How the customer paid. Empty means nobody recorded it, which is what
+    -- every sale taken before this column existed will read as -- there is no
+    -- honest way to guess, and defaulting them all to cash would invent a
+    -- till balance that never happened.
+    ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS payment TEXT DEFAULT '';
   `);
 
   // Reclassify transfers logged before the type split. They were written as
@@ -1614,9 +1620,10 @@ app.post('/api/shops/:shopId/sell', auth, scopedShop, async (req, res) => {
       [newQty, item.id]
     );
     await client.query(
-      `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note)
-       VALUES ($1,$2,$3,'sale',$4,$5,NOW(),$6)`,
-      [item.id, item.shop_id, req.user.id, change, newQty, manual ? 'manual sale' : 'barcode sale']
+      `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note, payment)
+       VALUES ($1,$2,$3,'sale',$4,$5,NOW(),$6,$7)`,
+      [item.id, item.shop_id, req.user.id, change, newQty,
+       manual ? 'manual sale' : 'barcode sale', cleanPayment(req.body.payment)]
     );
     await client.query('COMMIT');
     // -change, not qtySold: asking for 5 when 3 are left sells the 3 there are.
@@ -1634,6 +1641,19 @@ app.post('/api/shops/:shopId/sell', auth, scopedShop, async (req, res) => {
 // Sell, arrive from the factory, leave without being sold, or move to another
 // shop. Staff scan the same box every time and only the mode changes, so
 // there is one thing to learn instead of four.
+// The ways a customer can pay. A closed set, because this ends up in the
+// takings: a free-text field would give you "card", "Card", "kartu" and
+// "debit" as four different payment methods by the end of the month.
+const PAYMENT_METHODS = ['cash', 'card'];
+const cleanPayment = (v) => {
+  // Only an actual string. JSON can carry ["cash"], and String() would
+  // flatten that to "cash" — harmless here, but a normaliser that quietly
+  // accepts the wrong shape is one that stops normalising later.
+  if (typeof v !== 'string') return '';
+  const t = v.trim().toLowerCase();
+  return PAYMENT_METHODS.includes(t) ? t : '';
+};
+
 const SCAN_MODES = {
   sell:   { type: 'sale',    dir: -1, label: 'Sold' },
   in:     { type: 'in',      dir: +1, label: 'Stocked in' },
@@ -1653,6 +1673,9 @@ app.post('/api/shops/:shopId/scan', auth, scopedShop, async (req, res) => {
     const itemId = parseInt(req.body.itemId, 10);
     const qty = Math.max(1, Math.min(999, parseInt(req.body.qty, 10) || 1));
     const reason = String(req.body.reason || '').trim().slice(0, 80);
+    // Only a sale is paid for. A stock-in or a write-off has no customer, and
+    // storing a method against one would put it in the takings breakdown.
+    const payment = type === 'sale' ? cleanPayment(req.body.payment) : '';
     const note = String(req.body.note || '').trim().slice(0, 500);
     if (!code && !Number.isInteger(itemId)) {
       return res.status(400).json({ error: 'No item or barcode provided' });
@@ -1703,12 +1726,12 @@ app.post('/api/shops/:shopId/scan', auth, scopedShop, async (req, res) => {
     const { rows: upd } = await client.query(sql, [newQty, item.id]);
     await client.query(
       `INSERT INTO stock_movements
-         (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note, reason, staff_id, staff_name)
-       VALUES ($1,$2,$3,$4,$5,$6,NOW(),$7,$8,$9,$10)`,
+         (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note, reason, staff_id, staff_name, payment)
+       VALUES ($1,$2,$3,$4,$5,$6,NOW(),$7,$8,$9,$10,$11)`,
       [
         item.id, item.shop_id, req.user.id, type, change, newQty,
         note || (Number.isInteger(itemId) ? 'manual' : 'barcode'),
-        reason, staff.id, staff.name,
+        reason, staff.id, staff.name, payment,
       ]
     );
     await client.query('COMMIT');
@@ -2025,6 +2048,7 @@ const SALE_SELECT = `
          m.staff_id, si.sku, si.name AS item_name, si.color, si.size, si.category,
          si.fabric, ${SALE_PRICE_SQL} AS price, COALESCE(si.cost,0) AS cost,
          m.unit_price AS unit_price, m.item_id, m.qty_change AS raw_qty_change,
+         COALESCE(m.payment,'') AS payment,
          m.shop_id, sh.name AS shop_name
   FROM stock_movements m
   JOIN stock_items si ON si.id = m.item_id
@@ -2055,6 +2079,7 @@ const shapeSale = (r) => {
     staffId: r.staff_id,
     staffName: r.staff_name,
     reason: r.reason || '',
+    payment: r.payment || '',
     shopId: r.shop_id,
     shopName: r.shop_name || '',
   };
@@ -2194,6 +2219,8 @@ const saleEditSchema = z.object({
   // Who is making the correction, so the audit trail names a person and not
   // just "staff".
   staffId: z.coerce.number().int().positive().nullable().optional(),
+  // '' clears it back to "not recorded".
+  payment: z.string().trim().max(20).optional(),
 });
 
 // How far back a sale's time may be moved. A week covers "we forgot to ring
@@ -2289,6 +2316,10 @@ app.patch('/api/sales/:id', auth, validate(saleEditSchema), async (req, res) => 
 
     const unitPrice = req.body.unitPrice === undefined ? move.unit_price : req.body.unitPrice;
     const note = req.body.note === undefined ? move.note : req.body.note;
+    // A return is a refund, so it carries a method too; anything else does not.
+    const payment = req.body.payment === undefined
+      ? (move.payment || '')
+      : cleanPayment(req.body.payment);
 
     // The time it happened. Bounded in both directions: nothing in the future,
     // because a sale cannot have happened yet, and nothing older than the
@@ -2320,10 +2351,10 @@ app.patch('/api/sales/:id', auth, validate(saleEditSchema), async (req, res) => 
     const { rows: saved } = await client.query(
       `UPDATE stock_movements
           SET item_id = $1, qty_change = $2, qty_after = $3, unit_price = $4,
-              note = $5, occurred_at = $6
-        WHERE id = $7
+              note = $5, occurred_at = $6, payment = $7
+        WHERE id = $8
         RETURNING id`,
-      [newItemId, newQtyChange, qtyAfter, unitPrice, note, occurredAt, saleId]
+      [newItemId, newQtyChange, qtyAfter, unitPrice, note, occurredAt, payment, saleId]
     );
     await client.query('COMMIT');
 
@@ -2337,9 +2368,10 @@ app.patch('/api/sales/:id', auth, validate(saleEditSchema), async (req, res) => 
         + '  →  ' + describe(newItem, newUnits, unitPrice === null || unitPrice === undefined ? 'shelf price' : unitPrice),
       before: {
         itemId: oldItemId, qtyChange: move.qty_change,
-        unitPrice: move.unit_price, note: move.note, occurredAt: move.occurred_at,
+        unitPrice: move.unit_price, note: move.note,
+        occurredAt: move.occurred_at, payment: move.payment || '',
       },
-      after: { itemId: newItemId, qtyChange: newQtyChange, unitPrice, note, occurredAt },
+      after: { itemId: newItemId, qtyChange: newQtyChange, unitPrice, note, occurredAt, payment },
       // Names the person who made the correction, not just the role. On the
       // shop floor "staff" is several people sharing one code.
       staff: await resolveStaff(req.body.staffId, req.user.businessId),
@@ -2561,11 +2593,12 @@ app.get('/api/sales/history.csv', auth, requireAdmin, async (req, res) => {
       all
     );
     const body = csvDoc(
-      ['Date', 'Time', 'Shop', 'Type', 'SKU', 'Item', 'Colour', 'Size', 'Units', 'Price (IDR)', 'Value (IDR)', 'Staff', 'Reason'],
+      ['Date', 'Time', 'Shop', 'Type', 'SKU', 'Item', 'Colour', 'Size', 'Units', 'Price (IDR)', 'Value (IDR)', 'Staff', 'Paid by', 'Reason'],
       rows.map(shapeSale).map(r => {
         const d = new Date(r.occurredAt);
         return [d.toISOString().slice(0, 10), d.toISOString().slice(11, 19), r.shopName,
-                r.type, r.sku, r.itemName, r.color, r.size, r.units, r.price, r.value, r.staffName, r.reason];
+                r.type, r.sku, r.itemName, r.color, r.size, r.units, r.price, r.value,
+                r.staffName, r.payment, r.reason];
       })
     );
     sendCsv(res, `sales-${new Date().toISOString().slice(0, 10)}.csv`, body);
