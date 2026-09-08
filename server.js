@@ -734,6 +734,10 @@ async function initDB() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_check_marks_shop ON stock_check_marks(shop_id)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_check_rounds_shop ON stock_check_rounds(shop_id, completed_at DESC)`);
 
+  // Real material names in the fabric block. Runs on every boot, and only
+  // touches rows that are plainly wrong, so a later import cannot re-break it.
+  await backfillFabrics();
+
   // Office's opening stock. Not a migration — it is data, and it runs after
   // every table it touches exists. Once, and only into an empty shop.
   await seedOfficeStock();
@@ -2256,6 +2260,37 @@ app.get('/api/sales/history', auth, async (req, res) => {
 // Only ever into an empty shop. Anything else would undo a month's selling on
 // the next deploy: these counts are an opening balance, not the truth about
 // what is on the rail today.
+// Puts the real material into the fabric block.
+//
+// The per-shop stock sheets carry no fabric column, so the importer had been
+// putting the STYLE name there instead. The shop browses by fabric first, so
+// the "all fabrics" list was offering "AGUSTINE DRESS LONG" where it should
+// have offered "RAYON VOIL" — which is what the owner reported.
+//
+// Only two kinds of row are touched: one whose fabric is empty, and one whose
+// fabric is character-for-character its own style. Both are the signature of
+// the bug. Anything else is a value somebody chose, and it is left alone —
+// this runs on every boot, and a boot must not undo an edit.
+async function backfillFabrics() {
+  try {
+    const map = require('./fabrics.js');
+    const codes = Object.keys(map);
+    const { rows } = await pool.query(
+      `UPDATE stock_items si
+          SET fabric = v.fabric, updated_at = NOW()
+         FROM (SELECT UNNEST($1::text[]) AS sku, UNNEST($2::text[]) AS fabric) v
+        WHERE UPPER(si.sku) = UPPER(v.sku)
+          AND si.fabric IS DISTINCT FROM v.fabric
+          AND (COALESCE(si.fabric,'') = '' OR si.fabric = si.category)
+        RETURNING si.id`,
+      [codes, codes.map(c => map[c])]
+    );
+    if (rows.length) logger.warn('fabric.backfill.done', { rows: rows.length, codes: codes.length });
+  } catch (err) {
+    logger.error('fabric.backfill.error', { err: err.message });
+  }
+}
+
 async function seedOfficeStock() {
   const client = await pool.connect();
   try {
@@ -3403,10 +3438,12 @@ app.delete('/api/stock-check/:itemId', auth, scopedItem, async (req, res) => {
 // BRG MASUK and BRG KELUAR, and the identity
 //     saldo awal + brg masuk − brg keluar = saldo akhir
 // holds, so the closing figure is the only one that needs reading.
+const FABRICS = require('./fabrics.js');
 const importRowSchema = z.object({
   sku: z.string().trim().min(1).max(100),
   name: z.string().trim().min(1).max(200),
   style: z.string().trim().max(100).optional().default(''),
+  fabric: z.string().trim().max(100).optional().default(''),
   color: z.string().trim().max(50).optional().default(''),
   size: z.string().trim().max(50).optional().default(''),
   price: z.coerce.number().min(0).max(1e12).optional().default(0),
@@ -3449,18 +3486,21 @@ app.post('/api/admin/import-stock', auth, requireAdmin, validate(importSchema), 
     let created = 0, updated = 0;
     for (const r of deduped) {
       const id = idByCode.get(r.sku.toUpperCase());
-      // The sheet has no fabric column of its own. STYLE is the grouping the
-      // shop actually reads by — "all the Agustine dresses" — so it fills
-      // both the category and the fabric block the Overview and Stock check
-      // screens group on.
+      // STYLE is the grouping the shop reads by — "all the Agustine dresses"
+      // — and it fills the category. FABRIC is what the garment is made of,
+      // and it must never be filled with the style: the shop browses by
+      // fabric first, and a style name in that slot makes the fabric list
+      // meaningless. A sheet without a fabric column leaves it blank, and
+      // fabrics.js fills it in from the master workbook on the next boot.
       const style = r.style || '';
+      const fabric = r.fabric || FABRICS[r.sku.toUpperCase()] || '';
       if (id) {
         await client.query(
           `UPDATE stock_items
              SET name=$1, category=$2, fabric=$3, color=$4, size=$5,
                  price=$6, qty=$7, updated_at=NOW()
            WHERE id=$8`,
-          [r.name, style, style, r.color, r.size, r.price, r.qty, id]
+          [r.name, style, fabric, r.color, r.size, r.price, r.qty, id]
         );
         updated++;
       } else {
@@ -3468,8 +3508,8 @@ app.post('/api/admin/import-stock', auth, requireAdmin, validate(importSchema), 
           `INSERT INTO stock_items
              (shop_id, name, category, fabric, print, size, color, sku, brand,
               qty, threshold, supplier, notes, position, image_url, price, cost)
-           VALUES ($1,$2,$3,$3,'',$4,$5,$6,'',$7,0,'','',$8,'',$9,0)`,
-          [shopId, r.name, style, r.size, r.color, r.sku, r.qty, position++, r.price]
+           VALUES ($1,$2,$3,$4,'',$5,$6,$7,'',$8,0,'','',$9,'',$10,0)`,
+          [shopId, r.name, style, fabric, r.size, r.color, r.sku, r.qty, position++, r.price]
         );
         created++;
       }
