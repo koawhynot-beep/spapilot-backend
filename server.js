@@ -629,7 +629,7 @@ async function initDB() {
     // The shops the business actually runs. Rose Gold replaces what an
     // earlier migration created as "Gold Dust" — that name came from this
     // code assuming a single shop, not from the business.
-    const WANTED = [['RG', 'Rose Gold'], ['AT', 'Atriq'], ['GD', 'Goldust']];
+    const WANTED = [['RG', 'Rose Gold'], ['AT', 'Atriq'], ['GD', 'Goldust'], ['OF', 'Office']];
 
     // Rename before keying, so the row that already carries all the history
     // becomes Rose Gold rather than a fresh empty shop being made alongside
@@ -733,6 +733,10 @@ async function initDB() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_check_marks_shop ON stock_check_marks(shop_id)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_check_rounds_shop ON stock_check_rounds(shop_id, completed_at DESC)`);
+
+  // Office's opening stock. Not a migration — it is data, and it runs after
+  // every table it touches exists. Once, and only into an empty shop.
+  await seedOfficeStock();
 
   // Cleanup expired blacklist tokens hourly
   setInterval(() => {
@@ -2240,6 +2244,87 @@ app.get('/api/sales/history', auth, async (req, res) => {
   }
 });
 
+
+// Gives Office its catalogue and its opening counts.
+//
+// Office starts with the same catalogue as Rose Gold, then the counts from
+// the sheet's STOCK OFFICE column are applied on top. Taking the product
+// details from a shop that already has them beats transcribing 1,100 rows a
+// second time, and it guarantees the two shops describe the same garment the
+// same way.
+//
+// Only ever into an empty shop. Anything else would undo a month's selling on
+// the next deploy: these counts are an opening balance, not the truth about
+// what is on the rail today.
+async function seedOfficeStock() {
+  const client = await pool.connect();
+  try {
+    const { rows: shops } = await client.query(
+      `SELECT id, code FROM shops WHERE code IN ('OF','RG')`
+    );
+    const office = shops.find(x => x.code === 'OF');
+    const roseGold = shops.find(x => x.code === 'RG');
+    if (!office || !roseGold) return;
+
+    const { rows: already } = await client.query(
+      'SELECT COUNT(*)::int AS n FROM stock_items WHERE shop_id = $1', [office.id]
+    );
+    if (already[0].n > 0) return;
+
+    const { rows: source } = await client.query(
+      'SELECT COUNT(*)::int AS n FROM stock_items WHERE shop_id = $1', [roseGold.id]
+    );
+    if (source[0].n === 0) {
+      logger.warn('office.seed.skipped', { why: 'Rose Gold has no catalogue to copy' });
+      return;
+    }
+
+    await client.query('BEGIN');
+    // The catalogue, at zero. last_sold_at is deliberately not copied: those
+    // sales happened at Rose Gold, and carrying the date over would tell the
+    // dead-stock report that Office had sold something it never had.
+    await client.query(
+      `INSERT INTO stock_items
+         (shop_id, name, category, fabric, print, size, color, sku, brand,
+          qty, threshold, supplier, notes, position, image_url, price, cost)
+       SELECT $1, name, category, fabric, print, size, color, sku, brand,
+              0, threshold, supplier, notes, position, image_url, price, cost
+         FROM stock_items WHERE shop_id = $2`,
+      [office.id, roseGold.id]
+    );
+
+    const wanted = require('./office-stock.js');
+    const codes = Object.keys(wanted);
+    const { rows: updated } = await client.query(
+      `UPDATE stock_items si
+          SET qty = v.qty, updated_at = NOW()
+         FROM (SELECT UNNEST($1::text[]) AS sku, UNNEST($2::int[]) AS qty) v
+        WHERE si.shop_id = $3 AND UPPER(si.sku) = UPPER(v.sku)
+        RETURNING si.sku`,
+      [codes, codes.map(c => wanted[c]), office.id]
+    );
+
+    // A code that matched nothing is a garment Office holds and Rose Gold has
+    // never listed. Saying so is the point: it is stock that would otherwise
+    // be invisible.
+    const landed = new Set(updated.map(r => String(r.sku).toUpperCase()));
+    const missing = codes.filter(c => !landed.has(c.toUpperCase()));
+
+    await client.query('COMMIT');
+    logger.info('office.seed.done', {
+      catalogue: source[0].n,
+      codesGiven: codes.length,
+      codesApplied: updated.length,
+      missing: missing.length ? missing.join(',') : 'none',
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    logger.error('office.seed.error', { err: err.message });
+  } finally {
+    client.release();
+  }
+}
+
 // ── Correcting a recorded sale ───────────────────────
 // A customer who swaps a garment for a different style has not returned
 // anything and has not bought a second thing: the sale that was recorded was
@@ -2605,6 +2690,104 @@ app.get('/api/movements', auth, async (req, res) => {
     });
   } catch (err) {
     logger.error('movements.list.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
+// ── Drilling into the takings ─────────────────────────────
+// Year, then month, then week, then day. Each level answers "what did each
+// of these add up to", so the next click is an informed one rather than a
+// guess.
+//
+// Grouped in the shop's own timezone, not in UTC. Bali runs eight hours
+// ahead, so a sale at seven in the evening is already tomorrow by UTC — group
+// on that and a normal trading evening lands on the wrong day, every day.
+const SHOP_TZ = process.env.SHOP_TZ || 'Asia/Makassar';
+
+// Weeks are counted inside the month rather than as ISO weeks. An ISO week
+// runs across the end of a month, so drilling month → week → day would show
+// days that belong to the month you did not pick.
+const WEEK_OF_MONTH_SQL = `LEAST(5, FLOOR((EXTRACT(DAY FROM local_at) - 1) / 7) + 1)::int`;
+
+app.get('/api/sales/periods', auth, requireAdmin, async (req, res) => {
+  try {
+    const level = ['year', 'month', 'week', 'day'].includes(req.query.level)
+      ? req.query.level : 'year';
+    const year = parseInt(req.query.year, 10);
+    const month = parseInt(req.query.month, 10);
+    const week = parseInt(req.query.week, 10);
+
+    // Each level below the first needs the one above it to be chosen.
+    if (level !== 'year' && !Number.isInteger(year)) {
+      return res.status(400).json({ error: 'Pick a year first' });
+    }
+    if ((level === 'week' || level === 'day') && !(month >= 1 && month <= 12)) {
+      return res.status(400).json({ error: 'Pick a month first' });
+    }
+    if (level === 'day' && !(week >= 1 && week <= 5)) {
+      return res.status(400).json({ error: 'Pick a week first' });
+    }
+
+    const { where, params } = await salesFilter(req, 3);
+    const all = [req.user.businessId, SHOP_TZ, ...params];
+    let scope = '';
+    const add = (v) => { all.push(v); return all.length; };
+    if (Number.isInteger(year)) scope += ` AND EXTRACT(YEAR FROM local_at) = $${add(year)}`;
+    if (level === 'week' || level === 'day') scope += ` AND EXTRACT(MONTH FROM local_at) = $${add(month)}`;
+    if (level === 'day') scope += ` AND ${WEEK_OF_MONTH_SQL} = $${add(week)}`;
+
+    const bucket = {
+      year:  'EXTRACT(YEAR FROM local_at)::int',
+      month: 'EXTRACT(MONTH FROM local_at)::int',
+      week:  WEEK_OF_MONTH_SQL,
+      day:   'EXTRACT(DAY FROM local_at)::int',
+    }[level];
+
+    // The local timestamp is computed once in a sub-select so every
+    // expression above reads the same value.
+    // The units and the money are worked out in the inner query, where both
+    // the movement and its item are in scope. Computing them outside it
+    // reaches for si.price in a place where si no longer exists.
+    const { rows } = await pool.query(
+      `SELECT ${bucket} AS key,
+              COUNT(*)::int AS entries,
+              COALESCE(SUM(net_units),0)::int AS units,
+              COALESCE(SUM(net_units * net_price),0)::numeric AS revenue,
+              MIN(local_at) AS first_at,
+              MAX(local_at) AS last_at
+         FROM (
+           SELECT (m.occurred_at AT TIME ZONE $2) AS local_at,
+                  ${NET_UNITS_SQL} AS net_units,
+                  ${SALE_NET_SQL} AS net_price
+             FROM stock_movements m
+             JOIN stock_items si ON si.id = m.item_id
+             JOIN shops sh ON sh.id = m.shop_id
+            WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL} ${where}
+         ) t
+        WHERE TRUE ${scope}
+        GROUP BY 1
+        ORDER BY 1 DESC`,
+      all
+    );
+
+    res.json({
+      level,
+      timezone: SHOP_TZ,
+      year: Number.isInteger(year) ? year : null,
+      month: month >= 1 && month <= 12 ? month : null,
+      week: week >= 1 && week <= 5 ? week : null,
+      buckets: rows.map(r => ({
+        key: Number(r.key),
+        entries: r.entries,
+        units: r.units,
+        revenue: Number(r.revenue),
+        firstAt: r.first_at,
+        lastAt: r.last_at,
+      })),
+    });
+  } catch (err) {
+    logger.error('sales.periods.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
