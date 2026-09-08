@@ -2730,6 +2730,68 @@ app.get('/api/movements', auth, async (req, res) => {
 });
 
 
+
+// ── Takings per seller ────────────────────────────────────
+// "Totalan penjualan per nama yang jualan" — what each person sold, over
+// whatever period is on screen. The same figures the commission page works
+// from, without the rates: this answers "who sold what", which is a question
+// worth being able to ask on its own.
+//
+// Sales net of returns and of discounts, so a heavily discounted rail cannot
+// flatter a total. A sale entered without a name is still counted, under a
+// name that says so — dropping it would make the totals disagree with the
+// history list, and a total that does not reconcile is worse than a gap.
+app.get('/api/sales/by-staff', auth, requireAdmin, async (req, res) => {
+  try {
+    const { where, params } = await salesFilter(req, 3);
+    const all = [req.user.businessId, String(HISTORY_MONTHS), ...params];
+    const { rows } = await pool.query(
+      `SELECT COALESCE(NULLIF(m.staff_name,''), '') AS name,
+              MIN(m.staff_id) AS staff_id,
+              COUNT(*)::int AS entries,
+              COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units,
+              COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_NET_SQL}),0)::numeric AS revenue,
+              MAX(m.occurred_at) AS last_at
+         FROM stock_movements m
+         JOIN stock_items si ON si.id = m.item_id
+         JOIN shops sh ON sh.id = m.shop_id
+        WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}
+          AND m.occurred_at >= NOW() - ($2 || ' months')::interval ${where}
+        GROUP BY 1
+        -- Biggest first, but the unnamed row last whatever it comes to: it is
+        -- not a person, and it should not sit in the middle of a list of them.
+        -- The name breaks ties, so two equal totals do not swap places between
+        -- one look at the page and the next.
+        ORDER BY (COALESCE(NULLIF(m.staff_name,''), '') = '') ASC,
+                 COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_NET_SQL}),0) DESC,
+                 1 ASC`,
+      all
+    );
+
+    const items = rows.map(r => ({
+      staffId: r.staff_id,
+      name: r.name,
+      entries: r.entries,
+      units: r.units,
+      revenue: Number(r.revenue),
+      lastAt: r.last_at,
+    }));
+
+    res.json({
+      items,
+      totals: {
+        sellers: items.filter(i => i.name).length,
+        entries: items.reduce((n, i) => n + i.entries, 0),
+        units: items.reduce((n, i) => n + i.units, 0),
+        revenue: items.reduce((n, i) => n + i.revenue, 0),
+      },
+    });
+  } catch (err) {
+    logger.error('sales.byStaff.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ── Drilling into the takings ─────────────────────────────
 // Year, then month, then week, then day. Each level answers "what did each
 // of these add up to", so the next click is an informed one rather than a
