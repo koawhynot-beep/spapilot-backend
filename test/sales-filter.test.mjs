@@ -33,6 +33,10 @@ const NET_UNITS_SQL = value('const NET_UNITS_SQL =', ';');
 // evaluated — same order as in the server.
 // eslint-disable-next-line no-unused-vars
 const SALE_PRICE_SQL = value('const SALE_PRICE_SQL =', ';');
+// SALE_NET_SQL is built from SALE_PRICE_SQL, so it has to come after it and
+// before anything that interpolates it.
+// eslint-disable-next-line no-unused-vars
+const SALE_NET_SQL = value('const SALE_NET_SQL =', ';');
 const SALE_SELECT = value('const SALE_SELECT =', '`;');
 const HISTORY_MONTHS = 24;
 
@@ -66,7 +70,7 @@ await db.exec(`
     id SERIAL PRIMARY KEY, item_id INT, shop_id INT, user_id INT, type TEXT,
     qty_change INT, qty_after INT, occurred_at TIMESTAMPTZ DEFAULT NOW(),
     note TEXT DEFAULT '', reason TEXT DEFAULT '', staff_id INT, staff_name TEXT DEFAULT '',
-    unit_price NUMERIC(14,2), payment TEXT DEFAULT ''
+    unit_price NUMERIC(14,2), payment TEXT DEFAULT '', discount_pct NUMERIC(5,2) DEFAULT 0
   );
   INSERT INTO businesses (name) VALUES ('Mitra Samadi');
   INSERT INTO shops (business_id, name, address, code) VALUES (1, 'Gold Dust', '', 'GD');

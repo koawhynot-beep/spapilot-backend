@@ -536,6 +536,11 @@ async function initDB() {
     -- honest way to guess, and defaulting them all to cash would invent a
     -- till balance that never happened.
     ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS payment TEXT DEFAULT '';
+
+    -- The percentage taken off this sale. Zero, not null, because "no
+    -- discount" is a fact worth stating and it keeps the arithmetic below
+    -- from having to guard every multiplication.
+    ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS discount_pct NUMERIC(5,2) DEFAULT 0;
   `);
 
   // Reclassify transfers logged before the type split. They were written as
@@ -1664,6 +1669,16 @@ const cleanPayment = (v) => {
   return PAYMENT_METHODS.includes(t) ? t : '';
 };
 
+// A percentage off. Bounded at both ends: below zero would be a surcharge
+// wearing a discount's name, and above a hundred would pay the customer to
+// take the garment. Rounded to whole percent -- a shop floor does not hand
+// out 12.5% and storing the fraction only invites a rounding argument later.
+const cleanDiscount = (v) => {
+  const n = typeof v === 'number' ? v : (typeof v === 'string' ? Number(v.trim()) : NaN);
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(100, Math.max(0, Math.round(n)));
+};
+
 const SCAN_MODES = {
   sell:   { type: 'sale',    dir: -1, label: 'Sold' },
   in:     { type: 'in',      dir: +1, label: 'Stocked in' },
@@ -1686,6 +1701,8 @@ app.post('/api/shops/:shopId/scan', auth, scopedShop, async (req, res) => {
     // Only a sale is paid for. A stock-in or a write-off has no customer, and
     // storing a method against one would put it in the takings breakdown.
     const payment = type === 'sale' ? cleanPayment(req.body.payment) : '';
+    // Same reasoning for the discount: nothing is discounted off a delivery.
+    const discountPct = type === 'sale' ? cleanDiscount(req.body.discountPct) : 0;
     const note = String(req.body.note || '').trim().slice(0, 500);
     if (!code && !Number.isInteger(itemId)) {
       return res.status(400).json({ error: 'No item or barcode provided' });
@@ -1736,12 +1753,12 @@ app.post('/api/shops/:shopId/scan', auth, scopedShop, async (req, res) => {
     const { rows: upd } = await client.query(sql, [newQty, item.id]);
     await client.query(
       `INSERT INTO stock_movements
-         (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note, reason, staff_id, staff_name, payment)
-       VALUES ($1,$2,$3,$4,$5,$6,NOW(),$7,$8,$9,$10,$11)`,
+         (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note, reason, staff_id, staff_name, payment, discount_pct)
+       VALUES ($1,$2,$3,$4,$5,$6,NOW(),$7,$8,$9,$10,$11,$12)`,
       [
         item.id, item.shop_id, req.user.id, type, change, newQty,
         note || (Number.isInteger(itemId) ? 'manual' : 'barcode'),
-        reason, staff.id, staff.name, payment,
+        reason, staff.id, staff.name, payment, discountPct,
       ]
     );
     await client.query('COMMIT');
@@ -2052,11 +2069,22 @@ app.get('/api/audit', auth, requireAdmin, async (req, res) => {
 // corrected sale reads one way on the History list and another in the totals.
 const SALE_PRICE_SQL = 'COALESCE(m.unit_price, si.price, 0)';
 
+// What the customer actually handed over, per piece. Every figure that
+// represents money taken goes through this rather than through the price
+// above, or a discounted sale would be counted at its ticket price and the
+// takings would never reconcile with the till.
+//
+// Rounded to whole rupiah because that is the smallest unit anyone in the
+// shop handles; leaving fractions in would put 807,499.9995 in a total that
+// somebody has to match against cash.
+const SALE_NET_SQL = `ROUND(${SALE_PRICE_SQL} * (1 - COALESCE(m.discount_pct, 0) / 100.0))`;
+
 const SALE_SELECT = `
   SELECT m.id, m.type, m.qty_change, m.occurred_at, m.reason, m.note,
          COALESCE(NULLIF(m.staff_name,''), '(not recorded)') AS staff_name,
          m.staff_id, si.sku, si.name AS item_name, si.color, si.size, si.category,
-         si.fabric, ${SALE_PRICE_SQL} AS price, COALESCE(si.cost,0) AS cost,
+         si.fabric, ${SALE_PRICE_SQL} AS price, ${SALE_NET_SQL} AS net_price,
+         COALESCE(m.discount_pct, 0) AS discount_pct, COALESCE(si.cost,0) AS cost,
          m.unit_price AS unit_price, m.item_id, m.qty_change AS raw_qty_change,
          COALESCE(m.payment,'') AS payment,
          m.shop_id, sh.name AS shop_name
@@ -2068,6 +2096,11 @@ const SALE_SELECT = `
 const shapeSale = (r) => {
   const units = -r.qty_change;                 // sale: +n · return: -n
   const price = Number(r.price);
+  // Fall back to the ticket price when the column is not selected, so a query
+  // that does not ask for the net still reports the sale rather than nothing.
+  const netPrice = r.net_price === undefined || r.net_price === null
+    ? price
+    : Number(r.net_price);
   return {
     id: r.id,
     type: r.type,
@@ -2079,13 +2112,18 @@ const shapeSale = (r) => {
     category: r.category || '',
     fabric: r.fabric || '',
     units,
+    // price is the ticket price, netPrice is what was charged after the
+    // discount. Both, because the row shows the first struck through and the
+    // second beside it, and a screen given only the total cannot do that.
     price,
+    discountPct: Number(r.discount_pct) || 0,
+    netPrice,
     // The item this row points at, and whether the price above was agreed on
     // the sale or just read off the shelf — the correction screen needs both.
     itemId: r.item_id,
     unitPrice: r.unit_price === null || r.unit_price === undefined ? null : Number(r.unit_price),
-    value: units * price,
-    margin: units * (price - Number(r.cost)),
+    value: units * netPrice,
+    margin: units * (netPrice - Number(r.cost)),
     staffId: r.staff_id,
     staffName: r.staff_name,
     reason: r.reason || '',
@@ -2184,7 +2222,7 @@ app.get('/api/sales/history', auth, async (req, res) => {
     const { rows: agg } = await pool.query(
       `SELECT COUNT(*)::int AS n,
               COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units,
-              COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_PRICE_SQL}),0)::numeric AS revenue
+              COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_NET_SQL}),0)::numeric AS revenue
        FROM stock_movements m
        JOIN stock_items si ON si.id = m.item_id
        JOIN shops sh ON sh.id = m.shop_id
@@ -2231,6 +2269,7 @@ const saleEditSchema = z.object({
   staffId: z.coerce.number().int().positive().nullable().optional(),
   // '' clears it back to "not recorded".
   payment: z.string().trim().max(20).optional(),
+  discountPct: z.coerce.number().min(0).max(100).optional(),
 });
 
 // How far back a sale's time may be moved. A week covers "we forgot to ring
@@ -2330,6 +2369,9 @@ app.patch('/api/sales/:id', auth, validate(saleEditSchema), async (req, res) => 
     const payment = req.body.payment === undefined
       ? (move.payment || '')
       : cleanPayment(req.body.payment);
+    const discountPct = req.body.discountPct === undefined
+      ? (Number(move.discount_pct) || 0)
+      : cleanDiscount(req.body.discountPct);
 
     // The time it happened. Bounded in both directions: nothing in the future,
     // because a sale cannot have happened yet, and nothing older than the
@@ -2361,10 +2403,10 @@ app.patch('/api/sales/:id', auth, validate(saleEditSchema), async (req, res) => 
     const { rows: saved } = await client.query(
       `UPDATE stock_movements
           SET item_id = $1, qty_change = $2, qty_after = $3, unit_price = $4,
-              note = $5, occurred_at = $6, payment = $7
-        WHERE id = $8
+              note = $5, occurred_at = $6, payment = $7, discount_pct = $8
+        WHERE id = $9
         RETURNING id`,
-      [newItemId, newQtyChange, qtyAfter, unitPrice, note, occurredAt, payment, saleId]
+      [newItemId, newQtyChange, qtyAfter, unitPrice, note, occurredAt, payment, discountPct, saleId]
     );
     await client.query('COMMIT');
 
@@ -2380,8 +2422,9 @@ app.patch('/api/sales/:id', auth, validate(saleEditSchema), async (req, res) => 
         itemId: oldItemId, qtyChange: move.qty_change,
         unitPrice: move.unit_price, note: move.note,
         occurredAt: move.occurred_at, payment: move.payment || '',
+        discountPct: Number(move.discount_pct) || 0,
       },
-      after: { itemId: newItemId, qtyChange: newQtyChange, unitPrice, note, occurredAt, payment },
+      after: { itemId: newItemId, qtyChange: newQtyChange, unitPrice, note, occurredAt, payment, discountPct },
       // Names the person who made the correction, not just the role. On the
       // shop floor "staff" is several people sharing one code.
       staff: await resolveStaff(req.body.staffId, req.user.businessId),
@@ -2603,11 +2646,13 @@ app.get('/api/sales/history.csv', auth, requireAdmin, async (req, res) => {
       all
     );
     const body = csvDoc(
-      ['Date', 'Time', 'Shop', 'Type', 'SKU', 'Item', 'Colour', 'Size', 'Units', 'Price (IDR)', 'Value (IDR)', 'Staff', 'Paid by', 'Reason'],
+      ['Date', 'Time', 'Shop', 'Type', 'SKU', 'Item', 'Colour', 'Size', 'Units',
+       'Price (IDR)', 'Discount %', 'Charged (IDR)', 'Value (IDR)', 'Staff', 'Paid by', 'Reason'],
       rows.map(shapeSale).map(r => {
         const d = new Date(r.occurredAt);
         return [d.toISOString().slice(0, 10), d.toISOString().slice(11, 19), r.shopName,
-                r.type, r.sku, r.itemName, r.color, r.size, r.units, r.price, r.value,
+                r.type, r.sku, r.itemName, r.color, r.size, r.units,
+                r.price, r.discountPct, r.netPrice, r.value,
                 r.staffName, r.payment, r.reason];
       })
     );
@@ -2649,7 +2694,7 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
       pool.query(
         `SELECT si.sku, MIN(si.name) AS name, MIN(si.color) AS color,
                 COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units,
-                COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_PRICE_SQL}),0)::numeric AS revenue
+                COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_NET_SQL}),0)::numeric AS revenue
          FROM stock_movements m
          JOIN stock_items si ON si.id = m.item_id
          JOIN shops sh ON sh.id = m.shop_id
@@ -2661,7 +2706,7 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
       pool.query(
         `SELECT to_char(date_trunc('month', m.occurred_at), 'YYYY-MM') AS month,
                 COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units,
-                COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_PRICE_SQL}),0)::numeric AS revenue
+                COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_NET_SQL}),0)::numeric AS revenue
          FROM stock_movements m
          JOIN stock_items si ON si.id = m.item_id
          JOIN shops sh ON sh.id = m.shop_id
@@ -2759,8 +2804,8 @@ const COMMISSION_SQL = `
          MIN(m.staff_id) AS staff_id,
          COALESCE(SUM(CASE WHEN m.type='sale'   THEN -m.qty_change ELSE 0 END),0)::int AS sold_units,
          COALESCE(SUM(CASE WHEN m.type='return' THEN  m.qty_change ELSE 0 END),0)::int AS returned_units,
-         COALESCE(SUM(CASE WHEN m.type='sale'   THEN -m.qty_change * ${SALE_PRICE_SQL} ELSE 0 END),0)::numeric AS gross,
-         COALESCE(SUM(CASE WHEN m.type='return' THEN  m.qty_change * ${SALE_PRICE_SQL} ELSE 0 END),0)::numeric AS returned
+         COALESCE(SUM(CASE WHEN m.type='sale'   THEN -m.qty_change * ${SALE_NET_SQL} ELSE 0 END),0)::numeric AS gross,
+         COALESCE(SUM(CASE WHEN m.type='return' THEN  m.qty_change * ${SALE_NET_SQL} ELSE 0 END),0)::numeric AS returned
   FROM stock_movements m
   JOIN stock_items si ON si.id = m.item_id
   JOIN shops sh ON sh.id = m.shop_id
