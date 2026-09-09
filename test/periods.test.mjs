@@ -1,9 +1,14 @@
-// Drilling year → month → week → day, against REAL Postgres.
+// Slicing the takings by date, against REAL Postgres.
 //
-// The check that matters most is the timezone one. Bali runs eight hours
-// ahead of UTC, so a sale at seven in the evening is already tomorrow by UTC.
-// Group on that and every busy evening lands on the wrong day — quietly, and
-// on every single day, which is exactly the kind of wrong that gets believed.
+// Two things are being checked. The first is the timezone: Bali runs eight
+// hours ahead of UTC, so a sale at seven in the evening is already tomorrow
+// by UTC. Group on that and every busy evening lands on the wrong day —
+// quietly, and on every single day, which is the kind of wrong that gets
+// believed.
+//
+// The second is that year, month, week and day are four independent filters
+// rather than four steps. A day on its own has to mean that date in every
+// month, or "how does the 12th usually go" cannot be asked at all.
 import { PGlite } from '@electric-sql/pglite';
 import fs from 'fs';
 
@@ -39,56 +44,55 @@ const grab = (decl, end) => {
   const b = src.indexOf(end, a);
   return src.slice(a, b + end.length);
 };
-const value = (decl, end) =>
-  // eslint-disable-next-line no-eval
-  eval(grab(decl, end).slice(decl.length).replace(/;$/, ''));
+// eslint-disable-next-line no-eval
+const value = (decl, end) => eval(grab(decl, end).slice(decl.length).replace(/;$/, ''));
 
 const SALE_TYPES_SQL = value('const SALE_TYPES_SQL =', ';');
 const NET_UNITS_SQL = value('const NET_UNITS_SQL =', ';');
 // eslint-disable-next-line no-unused-vars
 const SALE_PRICE_SQL = value('const SALE_PRICE_SQL =', ';');
 const SALE_NET_SQL = value('const SALE_NET_SQL =', ';');
-const WEEK_OF_MONTH_SQL = value('const WEEK_OF_MONTH_SQL =', ';');
 const TZ = /const SHOP_TZ = process\.env\.SHOP_TZ \|\| '([^']+)'/.exec(src)[1];
 
-console.log(`\nReal Postgres · drilling into the takings (${TZ})\n`);
+// The shipped period expressions, built in a scope where SHOP_TZ exists, so
+// what is tested is what runs.
+const { LOCAL_AT_SQL, WEEK_OF_SQL, PERIOD_PARTS } = new Function('SHOP_TZ', `
+  ${grab('const LOCAL_AT_SQL =', ';')}
+  ${grab('const WEEK_OF_MONTH_SQL =', ';')}
+  ${grab('const WEEK_OF_SQL =', ';')}
+  ${grab('const PERIOD_PARTS = [', '\n];')}
+  return { LOCAL_AT_SQL, WEEK_OF_SQL, PERIOD_PARTS };
+`)(TZ);
 
-check('the shop timezone is an Indonesian one, not UTC',
-  /^Asia\//.test(TZ), TZ);
+console.log(`\nReal Postgres · the takings sliced by date (${TZ})\n`);
+
+check('the shop timezone is an Indonesian one, not UTC', /^Asia\//.test(TZ), TZ);
 
 // ── The evening that UTC would move ──────────────────────────────────────
-// 2026-03-10 19:30 in Bali (UTC+8) is 11:30 UTC the same day.
-// 2026-03-10 23:30 in Bali is 15:30 UTC — still the 10th.
-// 2026-03-11 01:00 in Bali is 2026-03-10 17:00 UTC — a different day in UTC.
+// 2026-03-11 01:00 in Bali is 2026-03-10 17:00 UTC — a different day.
 await db.query(`INSERT INTO stock_movements (item_id, shop_id, type, qty_change, qty_after, occurred_at) VALUES
   (1,1,'sale',-1,0,'2026-03-10T11:30:00Z'),
   (1,1,'sale',-1,0,'2026-03-10T15:30:00Z'),
   (1,1,'sale',-1,0,'2026-03-10T17:00:00Z')`);
 
-const localDays = async () => (await db.query(
-  `SELECT EXTRACT(DAY FROM (occurred_at AT TIME ZONE $1))::int AS d, COUNT(*)::int AS n
-     FROM stock_movements GROUP BY 1 ORDER BY 1`, [TZ]
-)).rows;
-const utcDays = async () => (await db.query(
-  `SELECT EXTRACT(DAY FROM (occurred_at AT TIME ZONE 'UTC'))::int AS d, COUNT(*)::int AS n
-     FROM stock_movements GROUP BY 1 ORDER BY 1`
-)).rows;
+const dayCounts = async (expr) => (await db.query(
+  `SELECT ${expr} AS d, COUNT(*)::int AS n FROM stock_movements m GROUP BY 1 ORDER BY 1`
+)).rows.map(r => ({ d: Number(r.d), n: r.n }));
 
-const local = await localDays();
-const utc = await utcDays();
+const localDays = await dayCounts(`EXTRACT(DAY FROM ${LOCAL_AT_SQL})`);
+const utcDays = await dayCounts(`EXTRACT(DAY FROM (m.occurred_at AT TIME ZONE 'UTC'))`);
 check('two sales on the 10th and one just after midnight on the 11th, locally',
-  JSON.stringify(local) === JSON.stringify([{ d: 10, n: 2 }, { d: 11, n: 1 }]),
-  JSON.stringify(local));
+  JSON.stringify(localDays) === JSON.stringify([{ d: 10, n: 2 }, { d: 11, n: 1 }]),
+  JSON.stringify(localDays));
 check('and UTC would have put all three on the 10th — which is the bug',
-  JSON.stringify(utc) === JSON.stringify([{ d: 10, n: 3 }]), JSON.stringify(utc));
+  JSON.stringify(utcDays) === JSON.stringify([{ d: 10, n: 3 }]), JSON.stringify(utcDays));
 
-// ── The buckets ──────────────────────────────────────────────────────────
+// ── The data the slicing is tested against ───────────────────────────────
 await db.exec('DELETE FROM stock_movements');
-// Spread across two years, three months, and several weeks of March 2026.
-// Times are chosen mid-afternoon Bali so the timezone cannot blur the day.
 const at = (iso) => `${iso}T04:00:00Z`;          // noon in Bali
 await db.query(`INSERT INTO stock_movements (item_id, shop_id, type, qty_change, qty_after, occurred_at, unit_price) VALUES
   (1,1,'sale',-1,0,'${at('2025-11-05')}', 500000),
+  (1,1,'sale',-1,0,'${at('2025-03-06')}', 700000),
   (1,1,'sale',-2,0,'${at('2026-01-20')}', 500000),
   (1,1,'sale',-1,0,'${at('2026-03-03')}', 1000000),
   (1,1,'sale',-1,0,'${at('2026-03-06')}', 1000000),
@@ -97,101 +101,120 @@ await db.query(`INSERT INTO stock_movements (item_id, shop_id, type, qty_change,
   (1,1,'sale',-1,0,'${at('2026-03-29')}', 1000000),
   (1,1,'return', 1,0,'${at('2026-03-09')}', 1000000)`);
 
-const periods = async (level, { year, month, week } = {}) => {
-  const all = [1, TZ];
-  const add = (v) => { all.push(v); return all.length; };
-  let scope = '';
-  if (year) scope += ` AND EXTRACT(YEAR FROM local_at) = $${add(year)}`;
-  if (level === 'week' || level === 'day') scope += ` AND EXTRACT(MONTH FROM local_at) = $${add(month)}`;
-  if (level === 'day') scope += ` AND ${WEEK_OF_MONTH_SQL} = $${add(week)}`;
-  const bucket = {
-    year: 'EXTRACT(YEAR FROM local_at)::int',
-    month: 'EXTRACT(MONTH FROM local_at)::int',
-    week: WEEK_OF_MONTH_SQL,
-    day: 'EXTRACT(DAY FROM local_at)::int',
-  }[level];
-  const { rows } = await db.query(
-    `SELECT ${bucket} AS key, COUNT(*)::int AS entries,
-            COALESCE(SUM(net_units),0)::int AS units,
-            COALESCE(SUM(net_units * net_price),0)::numeric AS revenue
-       FROM (SELECT (m.occurred_at AT TIME ZONE $2) AS local_at,
-                    ${NET_UNITS_SQL} AS net_units,
-                    ${SALE_NET_SQL} AS net_price
-               FROM stock_movements m
-               JOIN stock_items si ON si.id = m.item_id
-               JOIN shops sh ON sh.id = m.shop_id
-              WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}) t
-      WHERE TRUE ${scope}
-      GROUP BY 1 ORDER BY 1 DESC`, all);
-  return rows.map(r => ({ key: Number(r.key), entries: r.entries, units: r.units, revenue: Number(r.revenue) }));
+// The shipped filter, applied exactly as salesFilter applies it.
+const scope = (sel) => {
+  const params = [];
+  let where = '';
+  for (const [name, valid, expr] of PERIOD_PARTS) {
+    const v = sel[name];
+    if (!Number.isInteger(v) || !valid(v)) continue;
+    params.push(v);
+    where += ` AND ${expr} = $${params.length}`;
+  }
+  return { where, params };
 };
 
-console.log('\n  year');
-const years = await periods('year');
-check('both years appear, newest first',
-  years.map(y => y.key).join(',') === '2026,2025', years.map(y => y.key).join(','));
-check('2025 holds the one sale', years.find(y => y.key === 2025).units === 1,
-  String(years.find(y => y.key === 2025).units));
+const totals = async (sel) => {
+  const { where, params } = scope(sel);
+  const { rows: [r] } = await db.query(
+    `SELECT COUNT(*)::int AS entries,
+            COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units,
+            COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_NET_SQL}),0)::numeric AS revenue
+       FROM stock_movements m
+       JOIN stock_items si ON si.id = m.item_id
+      WHERE ${SALE_TYPES_SQL} ${where}`, params);
+  return { entries: r.entries, units: r.units, revenue: Number(r.revenue) };
+};
 
-console.log('\n  month within 2026');
-const months = await periods('month', { year: 2026 });
-check('January and March, newest first',
-  months.map(m => m.key).join(',') === '3,1', months.map(m => m.key).join(','));
-const march = months.find(m => m.key === 3);
-check('March nets the return off: 1+1+3+1+1 sold, 1 returned = 6',
-  march.units === 6, String(march.units));
-check('March revenue is 6,000,000', march.revenue === 6000000, String(march.revenue));
+const bucket = {
+  year: `EXTRACT(YEAR FROM ${LOCAL_AT_SQL})::int`,
+  month: `EXTRACT(MONTH FROM ${LOCAL_AT_SQL})::int`,
+  week: WEEK_OF_SQL,
+  day: `EXTRACT(DAY FROM ${LOCAL_AT_SQL})::int`,
+};
+// A facet leaves its own part out — the point of the whole design.
+const facet = async (level, sel) => {
+  const { where, params } = scope({ ...sel, [level]: undefined });
+  const { rows } = await db.query(
+    `SELECT ${bucket[level]} AS key, COUNT(*)::int AS entries
+       FROM stock_movements m
+       JOIN stock_items si ON si.id = m.item_id
+      WHERE ${SALE_TYPES_SQL} ${where} GROUP BY 1 ORDER BY 1`, params);
+  return rows.map(r => Number(r.key));
+};
 
-console.log('\n  week within March 2026');
-const weeks = await periods('week', { year: 2026, month: 3 });
-// Weeks are seven-day blocks: 1-7, 8-14, 15-21, 22-28, 29 onwards. So the
-// 3rd and 6th are week 1, the 9th is week 2, the 17th week 3, the 29th week 5.
-check('weeks 1, 2, 3 and 5 have trade',
-  weeks.map(w => w.key).sort().join(',') === '1,2,3,5', weeks.map(w => w.key).join(','));
-const w1 = weeks.find(w => w.key === 1);
-check('the 3rd and 6th fall in week 1', w1.entries === 2, `${w1.entries} entries`);
-const w2 = weeks.find(w => w.key === 2);
-check('the 9th falls in week 2, with its sale and its return', w2.entries === 2, `${w2.entries} entries`);
-check('week 2 nets the return: 3 sold, 1 back = 2', w2.units === 2, String(w2.units));
+console.log('\n  each part on its own');
+check('a year alone', (await totals({ year: 2025 })).entries === 2,
+  String((await totals({ year: 2025 })).entries));
+// Both Marches: 2025-03-06, and six entries in March 2026 counting the
+// return, which is an entry like any other.
+check('a month alone means that month in every year — both Marches',
+  (await totals({ month: 3 })).entries === 7, String((await totals({ month: 3 })).entries));
+check('a day alone means that date in every month — two 6ths',
+  (await totals({ day: 6 })).entries === 2, String((await totals({ day: 6 })).entries));
+check('a week alone', (await totals({ week: 1 })).entries === 4,
+  String((await totals({ week: 1 })).entries));
+
+console.log('\n  parts combined, in any mixture');
+check('a day and a year, with no month between them',
+  (await totals({ year: 2026, day: 6 })).entries === 1,
+  String((await totals({ year: 2026, day: 6 })).entries));
+check('a month and a day, with no year',
+  (await totals({ month: 3, day: 6 })).entries === 2,
+  String((await totals({ month: 3, day: 6 })).entries));
+check('all four together',
+  (await totals({ year: 2026, month: 3, week: 1, day: 6 })).entries === 1,
+  String((await totals({ year: 2026, month: 3, week: 1, day: 6 })).entries));
+check('a combination nothing falls into comes back empty rather than wrong',
+  (await totals({ year: 2025, month: 1, day: 1 })).entries === 0, 'it found something');
+
+console.log('\n  the arithmetic');
+const march26 = await totals({ year: 2026, month: 3 });
+check('March 2026 nets the return off: 1+1+3+1+1 sold, 1 back = 6',
+  march26.units === 6, String(march26.units));
+check('and comes to 6,000,000', march26.revenue === 6000000, String(march26.revenue));
+
+console.log('\n  the weeks');
+check('the 9th falls in week 2, not week 1',
+  (await facet('week', { year: 2026, month: 3, day: 9 })).join(',') === '2',
+  (await facet('week', { year: 2026, month: 3, day: 9 })).join(','));
 check('the 29th lands in week 5, not week 4',
-  weeks.some(w => w.key === 5) && !weeks.some(w => w.key === 4), weeks.map(w => w.key).join(','));
+  (await facet('week', { year: 2026, month: 3, day: 29 })).join(',') === '5',
+  (await facet('week', { year: 2026, month: 3, day: 29 })).join(','));
+await db.query(`INSERT INTO stock_movements (item_id, shop_id, type, qty_change, qty_after, occurred_at) VALUES
+  (1,1,'sale',-1,0,'${at('2026-01-30')}'), (1,1,'sale',-1,0,'${at('2026-01-31')}')`);
+const janWeeks = await facet('week', { year: 2026, month: 1 });
+check('the last three days of a 31-day month share week 5, never a sixth',
+  janWeeks.includes(5) && !janWeeks.some(w => w > 5), janWeeks.join(','));
 
-console.log('\n  day within a week');
-const days1 = await periods('day', { year: 2026, month: 3, week: 1 });
-check('week 1 holds the 3rd and the 6th',
-  days1.map(d => d.key).sort((a, b) => a - b).join(',') === '3,6', days1.map(d => d.key).join(','));
-const days2 = await periods('day', { year: 2026, month: 3, week: 2 });
-check('week 2 holds only the 9th', days2.length === 1 && days2[0].key === 9,
-  JSON.stringify(days2.map(d => d.key)));
-check('the 9th shows the sale and the return together', days2[0].entries === 2,
-  String(days2[0].entries));
-check('and nets to 2', days2[0].units === 2, String(days2[0].units));
-check('a week only ever shows its own seven days',
-  days2.every(d => d.key >= 8 && d.key <= 14), JSON.stringify(days2.map(d => d.key)));
+console.log('\n  the lists stay reachable');
+// This is what makes the picker usable: choosing March must not leave March
+// as the only month on offer, or the only way out is to clear everything.
+const monthsWithMarchOn = await facet('month', { year: 2026, month: 3 });
+check('picking a month still lists every other month',
+  monthsWithMarchOn.length > 1 && monthsWithMarchOn.includes(1) && monthsWithMarchOn.includes(3),
+  monthsWithMarchOn.join(','));
+const yearsWithMarchOn = await facet('year', { month: 3 });
+check('the years shown are still narrowed by the other choices',
+  yearsWithMarchOn.join(',') === '2025,2026', yearsWithMarchOn.join(','));
 
 // ── The guards ───────────────────────────────────────────────────────────
 console.log('\n  what the endpoint enforces');
 check('it is admin-only',
   /app\.get\('\/api\/sales\/periods', auth, requireAdmin/.test(src), 'requireAdmin missing');
-check('a month cannot be asked for without a year', src.includes('Pick a year first'), 'no guard');
-check('a week cannot be asked for without a month', src.includes('Pick a month first'), 'no guard');
-check('a day cannot be asked for without a week', src.includes('Pick a week first'), 'no guard');
-check('the level is a closed set, not whatever was sent',
-  /\['year', 'month', 'week', 'day'\]\.includes\(req\.query\.level\)/.test(src), 'level not validated');
-check('weeks are counted inside the month, so a drill-down cannot escape it',
-  /EXTRACT\(DAY FROM local_at\) - 1\) \/ 7\) \+ 1/.test(WEEK_OF_MONTH_SQL), WEEK_OF_MONTH_SQL);
-check('the 31st cannot make a sixth week', WEEK_OF_MONTH_SQL.includes('LEAST(5'), WEEK_OF_MONTH_SQL);
-
-// A 31-day month: the 29th, 30th and 31st must all be week 5.
-await db.exec('DELETE FROM stock_movements');
-await db.query(`INSERT INTO stock_movements (item_id, shop_id, type, qty_change, qty_after, occurred_at) VALUES
-  (1,1,'sale',-1,0,'${at('2026-01-29')}'),
-  (1,1,'sale',-1,0,'${at('2026-01-30')}'),
-  (1,1,'sale',-1,0,'${at('2026-01-31')}')`);
-const janWeeks = await periods('week', { year: 2026, month: 1 });
-check('the last three days of a 31-day month share week 5',
-  janWeeks.length === 1 && janWeeks[0].key === 5 && janWeeks[0].entries === 3,
-  JSON.stringify(janWeeks));
+check('nothing has to be picked before anything else any more',
+  !src.includes('Pick a year first') && !src.includes('Pick a month first'),
+  'a step-by-step guard survived');
+check('each part is range-checked, so a query cannot ask for month 99',
+  PERIOD_PARTS.every(([, valid]) => !valid(99) && !valid(0)), 'a part accepts nonsense');
+check('a day of 31 is allowed and 32 is not',
+  PERIOD_PARTS.find(p => p[0] === 'day')[1](31) && !PERIOD_PARTS.find(p => p[0] === 'day')[1](32),
+  'the day range is wrong');
+check('a facet leaves its own part out',
+  /salesFilter\(req, 2, level\)/.test(src), 'the facet counts apply their own filter');
+check('the sales list underneath is filtered the same way, through salesFilter',
+  /for \(const \[name, valid, expr\] of PERIOD_PARTS\)/.test(src),
+  'the period filter is not part of salesFilter');
 
 console.log(failures === 0 ? '\nall checks passed' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

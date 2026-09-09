@@ -49,7 +49,8 @@ const pool = { query: (text, params) => db.query(text, params) };
 const build = new Function('pool', `
   ${grab('const parseShopIds = (v) => {', '\n};')}
   ${grab('async function scopeShopIds(req) {', '\n}')}
-  ${grab('async function salesFilter(req, startParamIndex) {', '\n}')}
+  ${grab('const SHOP_TZ = process.env.SHOP_TZ', '\n];')}
+  ${grab('async function salesFilter(req, startParamIndex, skip) {', '\n}')}
   return { salesFilter, scopeShopIds, parseShopIds };
 `);
 const { salesFilter } = build(pool);

@@ -2186,7 +2186,31 @@ const HISTORY_MONTHS = 24;
 // would mean one of them eventually forgets, and a forgotten scope silently
 // mixes Atriq's takings into Gold Dust's report — the kind of wrong number
 // nobody notices until it is used to pay someone.
-async function salesFilter(req, startParamIndex) {
+// The shop's own timezone. Bali runs eight hours ahead of UTC, so a sale at
+// seven in the evening is already tomorrow by UTC — group or filter on that
+// and a normal trading evening lands on the wrong day, every day.
+const SHOP_TZ = process.env.SHOP_TZ || 'Asia/Makassar';
+const LOCAL_AT_SQL = `(m.occurred_at AT TIME ZONE '${SHOP_TZ.replace(/'/g, "''")}')`;
+
+// Weeks are counted inside the month rather than as ISO weeks. An ISO week
+// runs across the end of a month, so a month and a week chosen together would
+// pull in days belonging to the month that was not picked.
+const WEEK_OF_MONTH_SQL = `LEAST(5, FLOOR((EXTRACT(DAY FROM local_at) - 1) / 7) + 1)::int`;
+const WEEK_OF_SQL = WEEK_OF_MONTH_SQL.replace('local_at', LOCAL_AT_SQL);
+
+// Year, month, week and day are four independent filters, not four steps.
+// Any of them can be set without the others: a day on its own means that date
+// in every month, a month on its own means that month in every year. Asking
+// for the 12th of every month is a real question, and making someone walk a
+// tree to reach it is making them work for the software.
+const PERIOD_PARTS = [
+  ['year',  (v) => v >= 2000 && v <= 2100, `EXTRACT(YEAR FROM ${LOCAL_AT_SQL})`],
+  ['month', (v) => v >= 1 && v <= 12,      `EXTRACT(MONTH FROM ${LOCAL_AT_SQL})`],
+  ['week',  (v) => v >= 1 && v <= 5,       WEEK_OF_SQL],
+  ['day',   (v) => v >= 1 && v <= 31,      `EXTRACT(DAY FROM ${LOCAL_AT_SQL})`],
+];
+
+async function salesFilter(req, startParamIndex, skip) {
   const params = [];
   let where = '';
   const push = (v) => { params.push(v); return startParamIndex + params.length - 1; };
@@ -2210,7 +2234,19 @@ async function salesFilter(req, startParamIndex) {
     const i = push('%' + q + '%');
     where += ` AND (si.sku ILIKE $${i} OR si.name ILIKE $${i} OR si.color ILIKE $${i} OR m.staff_name ILIKE $${i})`;
   }
-  return { where, params, shopIds };
+
+  // The period parts. `skip` lets a facet count leave its own part out, so
+  // the list of months still shows every month once one of them is chosen.
+  const period = {};
+  for (const [name, valid, expr] of PERIOD_PARTS) {
+    if (name === skip) continue;
+    const n = parseInt(req.query[name], 10);
+    if (!Number.isInteger(n) || !valid(n)) continue;
+    period[name] = n;
+    where += ` AND ${expr} = $${push(n)}`;
+  }
+
+  return { where, params, shopIds, period };
 }
 
 app.get('/api/sales/history', auth, async (req, res) => {
@@ -2792,96 +2828,71 @@ app.get('/api/sales/by-staff', auth, requireAdmin, async (req, res) => {
   }
 });
 
-// ── Drilling into the takings ─────────────────────────────
-// Year, then month, then week, then day. Each level answers "what did each
-// of these add up to", so the next click is an informed one rather than a
-// guess.
+// ── The takings, sliced by date ────────────────────
+// Year, month, week and day, all four at once and each independent. Pick a
+// day without a month and you get that date in every month; pick a month
+// without a year and you get that month across every year. Nothing has to be
+// chosen before anything else.
 //
-// Grouped in the shop's own timezone, not in UTC. Bali runs eight hours
-// ahead, so a sale at seven in the evening is already tomorrow by UTC — group
-// on that and a normal trading evening lands on the wrong day, every day.
-const SHOP_TZ = process.env.SHOP_TZ || 'Asia/Makassar';
-
-// Weeks are counted inside the month rather than as ISO weeks. An ISO week
-// runs across the end of a month, so drilling month → week → day would show
-// days that belong to the month you did not pick.
-const WEEK_OF_MONTH_SQL = `LEAST(5, FLOOR((EXTRACT(DAY FROM local_at) - 1) / 7) + 1)::int`;
-
+// Each list is counted with the *other* three filters applied but not its
+// own — the same way a shop's size filter still shows every size once you
+// have picked one. Otherwise choosing March would leave March as the only
+// month on offer, and there would be no way back but to clear it.
 app.get('/api/sales/periods', auth, requireAdmin, async (req, res) => {
   try {
-    const level = ['year', 'month', 'week', 'day'].includes(req.query.level)
-      ? req.query.level : 'year';
-    const year = parseInt(req.query.year, 10);
-    const month = parseInt(req.query.month, 10);
-    const week = parseInt(req.query.week, 10);
+    const bucketSql = {
+      year:  `EXTRACT(YEAR FROM ${LOCAL_AT_SQL})::int`,
+      month: `EXTRACT(MONTH FROM ${LOCAL_AT_SQL})::int`,
+      week:  WEEK_OF_SQL,
+      day:   `EXTRACT(DAY FROM ${LOCAL_AT_SQL})::int`,
+    };
 
-    // Each level below the first needs the one above it to be chosen.
-    if (level !== 'year' && !Number.isInteger(year)) {
-      return res.status(400).json({ error: 'Pick a year first' });
-    }
-    if ((level === 'week' || level === 'day') && !(month >= 1 && month <= 12)) {
-      return res.status(400).json({ error: 'Pick a month first' });
-    }
-    if (level === 'day' && !(week >= 1 && week <= 5)) {
-      return res.status(400).json({ error: 'Pick a week first' });
-    }
+    const countFor = async (level) => {
+      const { where, params } = await salesFilter(req, 2, level);
+      const { rows } = await pool.query(
+        `SELECT ${bucketSql[level]} AS key,
+                COUNT(*)::int AS entries,
+                COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units,
+                COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_NET_SQL}),0)::numeric AS revenue
+           FROM stock_movements m
+           JOIN stock_items si ON si.id = m.item_id
+           JOIN shops sh ON sh.id = m.shop_id
+          WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL} ${where}
+          GROUP BY 1 ORDER BY 1 ${level === 'year' ? 'DESC' : 'ASC'}`,
+        [req.user.businessId, ...params]
+      );
+      return rows.map(r => ({
+        key: Number(r.key), entries: r.entries, units: r.units, revenue: Number(r.revenue),
+      }));
+    };
 
-    const { where, params } = await salesFilter(req, 3);
-    const all = [req.user.businessId, SHOP_TZ, ...params];
-    let scope = '';
-    const add = (v) => { all.push(v); return all.length; };
-    if (Number.isInteger(year)) scope += ` AND EXTRACT(YEAR FROM local_at) = $${add(year)}`;
-    if (level === 'week' || level === 'day') scope += ` AND EXTRACT(MONTH FROM local_at) = $${add(month)}`;
-    if (level === 'day') scope += ` AND ${WEEK_OF_MONTH_SQL} = $${add(week)}`;
+    // The totals for what is actually selected — every part applied.
+    const { where, params, period } = await salesFilter(req, 2);
+    const { rows: [t] } = await pool.query(
+      `SELECT COUNT(*)::int AS entries,
+              COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units,
+              COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_NET_SQL}),0)::numeric AS revenue
+         FROM stock_movements m
+         JOIN stock_items si ON si.id = m.item_id
+         JOIN shops sh ON sh.id = m.shop_id
+        WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL} ${where}`,
+      [req.user.businessId, ...params]
+    );
 
-    const bucket = {
-      year:  'EXTRACT(YEAR FROM local_at)::int',
-      month: 'EXTRACT(MONTH FROM local_at)::int',
-      week:  WEEK_OF_MONTH_SQL,
-      day:   'EXTRACT(DAY FROM local_at)::int',
-    }[level];
-
-    // The local timestamp is computed once in a sub-select so every
-    // expression above reads the same value.
-    // The units and the money are worked out in the inner query, where both
-    // the movement and its item are in scope. Computing them outside it
-    // reaches for si.price in a place where si no longer exists.
-    const { rows } = await pool.query(
-      `SELECT ${bucket} AS key,
-              COUNT(*)::int AS entries,
-              COALESCE(SUM(net_units),0)::int AS units,
-              COALESCE(SUM(net_units * net_price),0)::numeric AS revenue,
-              MIN(local_at) AS first_at,
-              MAX(local_at) AS last_at
-         FROM (
-           SELECT (m.occurred_at AT TIME ZONE $2) AS local_at,
-                  ${NET_UNITS_SQL} AS net_units,
-                  ${SALE_NET_SQL} AS net_price
-             FROM stock_movements m
-             JOIN stock_items si ON si.id = m.item_id
-             JOIN shops sh ON sh.id = m.shop_id
-            WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL} ${where}
-         ) t
-        WHERE TRUE ${scope}
-        GROUP BY 1
-        ORDER BY 1 DESC`,
-      all
+    const [years, months, weeks, days] = await Promise.all(
+      ['year', 'month', 'week', 'day'].map(countFor)
     );
 
     res.json({
-      level,
       timezone: SHOP_TZ,
-      year: Number.isInteger(year) ? year : null,
-      month: month >= 1 && month <= 12 ? month : null,
-      week: week >= 1 && week <= 5 ? week : null,
-      buckets: rows.map(r => ({
-        key: Number(r.key),
-        entries: r.entries,
-        units: r.units,
-        revenue: Number(r.revenue),
-        firstAt: r.first_at,
-        lastAt: r.last_at,
-      })),
+      selected: {
+        year: period.year ?? null,
+        month: period.month ?? null,
+        week: period.week ?? null,
+        day: period.day ?? null,
+      },
+      years, months, weeks, days,
+      totals: { entries: t.entries, units: t.units, revenue: Number(t.revenue) },
     });
   } catch (err) {
     logger.error('sales.periods.error', { err: err.message });
