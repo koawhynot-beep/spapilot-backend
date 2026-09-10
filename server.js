@@ -734,6 +734,43 @@ async function initDB() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_check_marks_shop ON stock_check_marks(shop_id)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_check_rounds_shop ON stock_check_rounds(shop_id, completed_at DESC)`);
 
+
+  // ── Stock transfers ─────────────────────
+  // A transfer is written down before anything moves. The admin builds the
+  // list; nothing leaves the source shop until every line has been checked
+  // off by somebody with the goods in front of them.
+  //
+  // Two things follow from that. The stock stays where it is while the
+  // transfer is pending — it can still be sold, and the check at the end is
+  // what catches that. And the whole list moves at once or not at all: half
+  // a delivery landing is worse than none of it, because nobody can tell
+  // which half.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS stock_transfers (
+      id            SERIAL PRIMARY KEY,
+      business_id   INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+      from_shop_id  INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+      to_shop_id    INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+      status        TEXT NOT NULL DEFAULT 'pending',
+      note          TEXT DEFAULT '',
+      created_by    TEXT DEFAULT '',
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      resets_at     TIMESTAMPTZ NOT NULL,
+      completed_at  TIMESTAMPTZ,
+      completed_by  TEXT DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS stock_transfer_lines (
+      id          SERIAL PRIMARY KEY,
+      transfer_id INTEGER NOT NULL REFERENCES stock_transfers(id) ON DELETE CASCADE,
+      item_id     INTEGER NOT NULL REFERENCES stock_items(id) ON DELETE CASCADE,
+      qty         INTEGER NOT NULL,
+      checked_at  TIMESTAMPTZ,
+      checked_by  TEXT DEFAULT ''
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_transfers_pending ON stock_transfers(business_id, status)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_transfer_lines ON stock_transfer_lines(transfer_id)`);
+
   // Real material names in the fabric block. Runs on every boot, and only
   // touches rows that are plainly wrong, so a later import cannot re-break it.
   await backfillFabrics();
@@ -1133,6 +1170,9 @@ app.get('/api/shops/:shopId/stock', auth, scopedShop, async (req, res) => {
     // Blank fabrics/colours sort to the bottom (see the overview endpoint).
     const ORDERS = {
       'fabric-color': "NULLIF(fabric,'') ASC NULLS LAST, NULLIF(color,'') ASC NULLS LAST, category ASC, size ASC",
+      // Fabric on its own: everything in one material together, whatever
+      // style or colour it is. Blanks last, as everywhere else.
+      'fabric':       "NULLIF(fabric,'') ASC NULLS LAST, name ASC, size ASC",
       'color':        "NULLIF(color,'') ASC NULLS LAST, category ASC, NULLIF(fabric,'') ASC NULLS LAST, size ASC",
       'style':        "category ASC, NULLIF(color,'') ASC NULLS LAST, size ASC",
       'name':         "name ASC",
@@ -1184,6 +1224,7 @@ app.get('/api/business/stock-overview', auth, requireAdmin, async (req, res) => 
     // jewellery) at the bottom instead of crowding the top of the list.
     const ORDERS = {
       'fabric-color': "NULLIF(MIN(si.fabric),'') ASC NULLS LAST, NULLIF(MIN(si.color),'') ASC NULLS LAST, MIN(si.category) ASC, MIN(si.size) ASC",
+      'fabric':       "NULLIF(MIN(si.fabric),'') ASC NULLS LAST, MIN(si.name) ASC, MIN(si.size) ASC",
       'color':        "NULLIF(MIN(si.color),'') ASC NULLS LAST, MIN(si.category) ASC, NULLIF(MIN(si.fabric),'') ASC NULLS LAST, MIN(si.size) ASC",
       'style':        "MIN(si.category) ASC, NULLIF(MIN(si.color),'') ASC NULLS LAST, MIN(si.size) ASC",
       'name':         'MIN(si.name) ASC',
@@ -1378,19 +1419,49 @@ app.get('/api/business/sku-history', auth, requireAdmin, async (req, res) => {
 
     // Which years have anything at all, so the year picker only offers real ones.
     const { rows: yearRows } = await pool.query(
-      `SELECT DISTINCT EXTRACT(YEAR FROM m.occurred_at)::int AS year
+      `SELECT DISTINCT EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $3))::int AS year
        FROM stock_movements m
        JOIN stock_items si ON si.id = m.item_id
        JOIN shops s ON s.id = si.shop_id
        WHERE s.business_id = $1 AND si.sku = $2
        ORDER BY year DESC`,
-      [businessId, sku]
+      [businessId, sku, SHOP_TZ]
     );
+
+    // How many went out the door in each of the last five years, kept apart
+    // rather than added together. "Thirty in 2025 and twenty in 2026" is the
+    // shape of a garment going quiet, and a single total of fifty hides it.
+    //
+    // Not narrowed by the year picker: this is the long view, and it is the
+    // reason to open the year picker at all. Returns come off the year they
+    // came back in.
+    const thisYear = new Date().getFullYear();
+    const { rows: byYearRows } = await pool.query(
+      `SELECT EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $3))::int AS year,
+              COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS sold,
+              COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_NET_SQL}),0)::numeric AS revenue
+         FROM stock_movements m
+         JOIN stock_items si ON si.id = m.item_id
+         JOIN shops s ON s.id = si.shop_id
+        WHERE s.business_id = $1 AND si.sku = $2 AND ${SALE_TYPES_SQL}
+          AND EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $3)) > $4
+        GROUP BY 1 ORDER BY 1 DESC`,
+      [businessId, sku, SHOP_TZ, thisYear - 5]
+    );
+    // Every one of the five years, including the ones that sold nothing —
+    // a gap in the list is a fact about the garment, not a row to leave out.
+    const soldByYear = new Map(byYearRows.map(r => [r.year, r]));
+    const byYear = [];
+    for (let y = thisYear; y > thisYear - 5; y--) {
+      const r = soldByYear.get(y);
+      byYear.push({ year: y, sold: r ? r.sold : 0, revenue: r ? Number(r.revenue) : 0 });
+    }
 
     res.json({
       sku,
       year,
       years: yearRows.map(r => r.year),
+      byYear,
       months: Object.values(months).sort((a, b) => b.month.localeCompare(a.month)),
       movements: rows.map(r => ({
         id: r.id,
@@ -2259,8 +2330,18 @@ app.get('/api/sales/history', auth, async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit, 10) || 100, 1000);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 
+    // Newest first is the default and the right one nearly always. Sorting by
+    // fabric answers a different question — what has the linen been doing —
+    // and within a fabric the rows stay newest first, so it reads as a set of
+    // small histories rather than one shuffled list.
+    const SALE_ORDERS = {
+      recent: 'm.occurred_at DESC, m.id DESC',
+      fabric: "NULLIF(si.fabric,'') ASC NULLS LAST, m.occurred_at DESC, m.id DESC",
+    };
+    const orderBy = SALE_ORDERS[req.query.sort] || SALE_ORDERS.recent;
+
     const { rows } = await pool.query(
-      `${SALE_SELECT} WHERE ${windowSql} ORDER BY m.occurred_at DESC, m.id DESC LIMIT ${limit} OFFSET ${offset}`,
+      `${SALE_SELECT} WHERE ${windowSql} ORDER BY ${orderBy} LIMIT ${limit} OFFSET ${offset}`,
       all
     );
     const { rows: agg } = await pool.query(
@@ -3287,6 +3368,420 @@ app.post('/api/admin/shops', auth, requireAdmin, validate(shopEditSchema), async
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'Another shop already uses that key' });
     logger.error('admin.shopcreate.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
+// ═══════════════════════════════════════════════════════════
+// STOCK TRANSFERS
+// ═══════════════════════════════════════════════════════════
+// Moving stock between shops, written down first and checked before it
+// moves. The admin builds a list; nothing leaves the source until every
+// line has been ticked off by somebody with the goods in front of them.
+//
+// The stock is deliberately NOT held back while the transfer is pending.
+// Reserving it would mean the shop cannot sell a garment that is still on
+// its own rail, which is worse than the alternative: the re-check at the
+// moment of completion catches anything that sold in the meantime, and
+// refuses the whole transfer rather than moving what is left.
+//
+// The whole list moves at once or not at all. Half a delivery landing is
+// worse than none of it, because nobody can tell which half.
+const TRANSFER_RESET_HOURS = 48;
+
+// Ticks are not kept forever. A list left half-done for two days is a list
+// somebody walked away from, and the safe assumption is that the ticks on it
+// can no longer be trusted — so they are cleared and the count starts again.
+// The transfer itself survives; only the checking is undone.
+//
+// Deliberately no countdown anywhere: a clock on the screen turns a careful
+// job into a race, and the whole point of the checklist is that somebody
+// looked properly.
+async function resetStaleTransfers(client, businessId) {
+  const { rows } = await client.query(
+    `UPDATE stock_transfers
+        SET resets_at = NOW() + ($2 || ' hours')::interval
+      WHERE business_id = $1 AND status = 'pending' AND resets_at <= NOW()
+      RETURNING id`,
+    [businessId, String(TRANSFER_RESET_HOURS)]
+  );
+  if (!rows.length) return;
+  const ids = rows.map(r => r.id);
+  const { rowCount } = await client.query(
+    `UPDATE stock_transfer_lines
+        SET checked_at = NULL, checked_by = ''
+      WHERE transfer_id = ANY($1::int[]) AND checked_at IS NOT NULL`,
+    [ids]
+  );
+  logger.info('transfer.checks_reset', { transfers: ids.join(','), linesCleared: rowCount });
+}
+
+const transferLinesSql = `
+  SELECT l.id, l.transfer_id, l.item_id, l.qty, l.checked_at, l.checked_by,
+         si.sku, si.name, si.color, si.size, si.fabric, si.category,
+         si.qty AS source_qty
+    FROM stock_transfer_lines l
+    JOIN stock_items si ON si.id = l.item_id
+   WHERE l.transfer_id = ANY($1::int[])
+   ORDER BY NULLIF(si.fabric,'') ASC NULLS LAST, si.name ASC, si.size ASC, l.id ASC
+`;
+
+const shapeLine = (r) => ({
+  id: r.id,
+  itemId: r.item_id,
+  sku: r.sku,
+  name: r.name,
+  color: r.color || '',
+  size: r.size || '',
+  fabric: r.fabric || '',
+  style: r.category || '',
+  qty: r.qty,
+  // What the source shop has right now, so a line that can no longer be
+  // filled is visible on the list rather than only at the moment it fails.
+  sourceQty: r.source_qty,
+  short: r.source_qty < r.qty,
+  checked: Boolean(r.checked_at),
+  checkedAt: r.checked_at,
+  checkedBy: r.checked_by || '',
+});
+
+// Everything still waiting to be checked. Open to staff as well as the
+// admin: they are the ones standing at the rail counting.
+app.get('/api/transfers', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await resetStaleTransfers(client, req.user.businessId);
+
+    const { rows: transfers } = await client.query(
+      `SELECT t.id, t.from_shop_id, t.to_shop_id, t.status, t.note,
+              t.created_by, t.created_at, t.completed_at, t.completed_by,
+              f.name AS from_name, d.name AS to_name
+         FROM stock_transfers t
+         JOIN shops f ON f.id = t.from_shop_id
+         JOIN shops d ON d.id = t.to_shop_id
+        WHERE t.business_id = $1 AND t.status = 'pending'
+        ORDER BY t.created_at ASC`,
+      [req.user.businessId]
+    );
+    if (!transfers.length) return res.json({ transfers: [] });
+
+    const { rows: lines } = await client.query(transferLinesSql, [transfers.map(t => t.id)]);
+
+    res.json({
+      transfers: transfers.map(t => {
+        const mine = lines.filter(l => l.transfer_id === t.id).map(shapeLine);
+        return {
+          id: t.id,
+          from: { id: t.from_shop_id, name: t.from_name },
+          to: { id: t.to_shop_id, name: t.to_name },
+          note: t.note || '',
+          createdBy: t.created_by || '',
+          createdAt: t.created_at,
+          lines: mine,
+          totals: {
+            lines: mine.length,
+            checked: mine.filter(l => l.checked).length,
+            pieces: mine.reduce((n, l) => n + l.qty, 0),
+            short: mine.filter(l => l.short).length,
+          },
+        };
+      }),
+    });
+  } catch (err) {
+    logger.error('transfer.list.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Building the list. Admin only, and nothing moves here.
+const transferSchema = z.object({
+  fromShopId: z.coerce.number().int().positive(),
+  toShopId: z.coerce.number().int().positive(),
+  note: z.string().trim().max(300).optional().default(''),
+  lines: z.array(z.object({
+    itemId: z.coerce.number().int().positive(),
+    qty: z.coerce.number().int().min(1).max(100000),
+  })).min(1).max(500),
+});
+
+app.post('/api/transfers', auth, requireAdmin, validate(transferSchema), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { fromShopId, toShopId, note, lines } = req.body;
+    if (fromShopId === toShopId) {
+      return res.status(400).json({ error: 'Pick a different shop to send it to' });
+    }
+
+    const { rows: shops } = await client.query(
+      'SELECT id, name FROM shops WHERE business_id = $1 AND id = ANY($2::int[])',
+      [req.user.businessId, [fromShopId, toShopId]]
+    );
+    if (shops.length !== 2) return res.status(404).json({ error: 'Shop not found' });
+
+    // One line per item, so adding the same garment twice adds up rather
+    // than writing two lines that each look complete on their own.
+    const wanted = new Map();
+    for (const l of lines) wanted.set(l.itemId, (wanted.get(l.itemId) || 0) + l.qty);
+
+    const { rows: items } = await client.query(
+      `SELECT id, sku, name, qty FROM stock_items
+        WHERE shop_id = $1 AND id = ANY($2::int[])`,
+      [fromShopId, [...wanted.keys()]]
+    );
+    const byId = new Map(items.map(i => [i.id, i]));
+
+    // Only what is actually there, and only as much of it as is there.
+    const problems = [];
+    for (const [itemId, qty] of wanted) {
+      const item = byId.get(itemId);
+      if (!item) { problems.push({ itemId, reason: 'notAtSource' }); continue; }
+      if (item.qty < qty) {
+        problems.push({ itemId, sku: item.sku, name: item.name, reason: 'notEnough', have: item.qty, wanted: qty });
+      }
+    }
+    if (problems.length) {
+      return res.status(400).json({ error: 'Some items are not in stock there', problems });
+    }
+
+    await client.query('BEGIN');
+    const { rows: [transfer] } = await client.query(
+      `INSERT INTO stock_transfers
+         (business_id, from_shop_id, to_shop_id, note, created_by, resets_at)
+       VALUES ($1,$2,$3,$4,$5, NOW() + ($6 || ' hours')::interval)
+       RETURNING id, created_at`,
+      [req.user.businessId, fromShopId, toShopId, note,
+       req.user.email || 'admin', String(TRANSFER_RESET_HOURS)]
+    );
+    const ids = [...wanted.keys()];
+    await client.query(
+      `INSERT INTO stock_transfer_lines (transfer_id, item_id, qty)
+       SELECT $1, UNNEST($2::int[]), UNNEST($3::int[])`,
+      [transfer.id, ids, ids.map(i => wanted.get(i))]
+    );
+    await client.query('COMMIT');
+
+    const from = shops.find(s => s.id === fromShopId);
+    const to = shops.find(s => s.id === toShopId);
+    await audit(req, {
+      action: 'create', entity: 'transfer', entityId: transfer.id,
+      summary: `Transfer of ${ids.length} products from ${from.name} to ${to.name}, waiting to be checked`,
+      after: { from: from.name, to: to.name, lines: ids.length,
+               pieces: [...wanted.values()].reduce((a, b) => a + b, 0) },
+    });
+    logger.warn('transfer.created', { id: transfer.id, from: from.name, to: to.name, lines: ids.length });
+
+    res.status(201).json({ ok: true, id: transfer.id, lines: ids.length });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    logger.error('transfer.create.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Moves the goods. Called only once every line on the transfer is ticked.
+// Runs inside the caller's transaction so the whole list lands together.
+async function completeTransfer(client, req, transferId) {
+  const { rows: [t] } = await client.query(
+    `SELECT t.*, f.name AS from_name, d.name AS to_name
+       FROM stock_transfers t
+       JOIN shops f ON f.id = t.from_shop_id
+       JOIN shops d ON d.id = t.to_shop_id
+      WHERE t.id = $1 FOR UPDATE`,
+    [transferId]
+  );
+  if (!t || t.status !== 'pending') return { moved: false };
+
+  const { rows: lines } = await client.query(
+    `SELECT l.id, l.item_id, l.qty, si.sku, si.name, si.category, si.fabric,
+            si.print, si.size, si.color, si.brand, si.threshold, si.supplier,
+            si.notes, si.image_url, si.price, si.cost, si.qty AS have
+       FROM stock_transfer_lines l
+       JOIN stock_items si ON si.id = l.item_id
+      WHERE l.transfer_id = $1
+      FOR UPDATE OF si`,
+    [transferId]
+  );
+
+  // The last look before anything moves. Stock was never held back, so a
+  // garment on this list may have been sold in the meantime — and moving
+  // what is left of a checked list is exactly the silent wrong this whole
+  // feature exists to avoid.
+  const short = lines.filter(l => l.have < l.qty);
+  if (short.length) {
+    return {
+      moved: false,
+      short: short.map(l => ({ sku: l.sku, name: l.name, wanted: l.qty, have: l.have })),
+    };
+  }
+
+  for (const l of lines) {
+    const after = l.have - l.qty;
+    await client.query(
+      'UPDATE stock_items SET qty = $1, updated_at = NOW() WHERE id = $2',
+      [after, l.item_id]
+    );
+    await client.query(
+      `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note)
+       VALUES ($1,$2,$3,'transfer-out',$4,$5,NOW(),$6)`,
+      [l.item_id, t.from_shop_id, req.user.id, -l.qty, after, `to ${t.to_name}`]
+    );
+
+    // The same garment at the destination, created if that shop has never
+    // carried it. Matched on the code, which is the only thing that is
+    // reliably the same in both places.
+    const { rows: [dest] } = await client.query(
+      `SELECT id, qty FROM stock_items WHERE shop_id = $1 AND UPPER(sku) = UPPER($2) LIMIT 1`,
+      [t.to_shop_id, l.sku]
+    );
+    let destId, destAfter;
+    if (dest) {
+      destId = dest.id;
+      destAfter = dest.qty + l.qty;
+      await client.query(
+        'UPDATE stock_items SET qty = $1, updated_at = NOW() WHERE id = $2',
+        [destAfter, destId]
+      );
+    } else {
+      destAfter = l.qty;
+      const { rows: [made] } = await client.query(
+        `INSERT INTO stock_items
+           (shop_id, name, category, fabric, print, size, color, sku, brand,
+            qty, threshold, supplier, notes, position, image_url, price, cost)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
+                 (SELECT COALESCE(MAX(position), -1) + 1 FROM stock_items WHERE shop_id = $1),
+                 $14,$15,$16)
+         RETURNING id`,
+        [t.to_shop_id, l.name, l.category, l.fabric, l.print, l.size, l.color,
+         l.sku, l.brand, l.qty, l.threshold, l.supplier, l.notes,
+         l.image_url, l.price, l.cost]
+      );
+      destId = made.id;
+    }
+    await client.query(
+      `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note)
+       VALUES ($1,$2,$3,'transfer-in',$4,$5,NOW(),$6)`,
+      [destId, t.to_shop_id, req.user.id, l.qty, destAfter, `from ${t.from_name}`]
+    );
+  }
+
+  await client.query(
+    `UPDATE stock_transfers SET status = 'done', completed_at = NOW(), completed_by = $2
+      WHERE id = $1`,
+    [transferId, req.accessRole === 'admin' ? 'admin' : 'staff']
+  );
+
+  return {
+    moved: true,
+    from: t.from_name,
+    to: t.to_name,
+    lines: lines.length,
+    pieces: lines.reduce((n, l) => n + l.qty, 0),
+  };
+}
+
+// Ticking a line off, and un-ticking it. Open to everyone: the person with
+// the garment in their hands is the one who should be ticking.
+const checkTransferLine = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const transferId = parseInt(req.params.id, 10);
+    const lineId = parseInt(req.params.lineId, 10);
+    if (!Number.isInteger(transferId) || !Number.isInteger(lineId)) {
+      return res.status(400).json({ error: 'Bad request' });
+    }
+    // POST ticks, DELETE un-ticks. The verb decides, not the body.
+    const on = req.method === 'POST';
+
+    await resetStaleTransfers(client, req.user.businessId);
+    await client.query('BEGIN');
+
+    const { rows: [line] } = await client.query(
+      `SELECT l.id FROM stock_transfer_lines l
+         JOIN stock_transfers t ON t.id = l.transfer_id
+        WHERE l.id = $1 AND l.transfer_id = $2
+          AND t.business_id = $3 AND t.status = 'pending'`,
+      [lineId, transferId, req.user.businessId]
+    );
+    if (!line) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'That transfer is no longer waiting to be checked' });
+    }
+
+    await client.query(
+      on
+        ? `UPDATE stock_transfer_lines SET checked_at = NOW(), checked_by = $2 WHERE id = $1`
+        : `UPDATE stock_transfer_lines SET checked_at = NULL, checked_by = '' WHERE id = $1`,
+      on ? [lineId, req.accessRole === 'admin' ? 'admin' : 'staff'] : [lineId]
+    );
+
+    // The last tick is what moves the goods. Nothing else does.
+    const { rows: [remaining] } = await client.query(
+      `SELECT COUNT(*) FILTER (WHERE checked_at IS NULL)::int AS left
+         FROM stock_transfer_lines WHERE transfer_id = $1`,
+      [transferId]
+    );
+
+    let result = { moved: false };
+    if (remaining.left === 0) {
+      result = await completeTransfer(client, req, transferId);
+      if (!result.moved && result.short) {
+        // Nothing moved, and the ticks stay as they are: the list is right,
+        // the stock is not, and clearing the work would hide that.
+        await client.query('COMMIT');
+        return res.status(409).json({
+          error: 'Some of this is no longer in stock at the shop it is coming from',
+          short: result.short,
+        });
+      }
+    }
+
+    await client.query('COMMIT');
+
+    if (result.moved) {
+      await audit(req, {
+        action: 'transfer', entity: 'transfer', entityId: transferId,
+        summary: `Checked off and moved ${result.pieces} pieces `
+          + `(${result.lines} products) from ${result.from} to ${result.to}`,
+        after: result,
+      });
+      logger.warn('transfer.completed', { id: transferId, ...result });
+    }
+
+    res.json({ ok: true, checked: on, moved: result.moved, transfer: result.moved ? result : null });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    logger.error('transfer.check.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+};
+app.post('/api/transfers/:id/lines/:lineId', auth, checkTransferLine);
+app.delete('/api/transfers/:id/lines/:lineId', auth, checkTransferLine);
+
+// Calling off a transfer that should not have been raised. Admin only —
+// the person who can create one is the person who can withdraw it.
+app.delete('/api/transfers/:id', auth, requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE stock_transfers SET status = 'cancelled', completed_at = NOW()
+        WHERE id = $1 AND business_id = $2 AND status = 'pending'
+        RETURNING id`,
+      [req.params.id, req.user.businessId]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Transfer not found' });
+    await audit(req, {
+      action: 'delete', entity: 'transfer', entityId: rows[0].id,
+      summary: 'Called off a transfer before it was checked',
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error('transfer.cancel.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
