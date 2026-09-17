@@ -1926,6 +1926,116 @@ app.post('/api/stock/:id/movements', auth, scopedItem, validate(movementSchema),
   }
 });
 
+// One garment in all its sizes, with what each size sold in each year.
+//
+// This is the owner's sketch: the product once at the top, then a line per
+// size — S/M, M/L — and along each line the years and how many went, then
+// what is on the rail now. Nothing else. The stock list is for glancing at,
+// and a glance is one product and its sizes.
+//
+// The sizes are found by matching on what the garment IS — style, fabric,
+// colour — with the size left out. Codes are of no use for this: the S/M and
+// the M/L of one dress carry unrelated codes. Where a garment has no style or
+// colour recorded, its name with the trailing size stripped is used instead.
+app.get('/api/stock/sizes', auth, async (req, res) => {
+  try {
+    const sku = String(req.query.sku || '').trim();
+    if (!sku) return res.status(400).json({ error: 'No sku provided' });
+
+    const { rows: [seed] } = await pool.query(
+      `SELECT si.name, si.category, si.fabric, si.color, si.size
+         FROM stock_items si JOIN shops sh ON sh.id = si.shop_id
+        WHERE sh.business_id = $1 AND UPPER(si.sku) = UPPER($2)
+        LIMIT 1`,
+      [req.user.businessId, sku]
+    );
+    if (!seed) return res.status(404).json({ error: 'Item not found' });
+
+    // Siblings: same style, fabric and colour; or, failing those, the same
+    // name once the size on the end has been taken off.
+    const stripSize = (name, size) => {
+      let n = String(name || '').trim();
+      if (size) n = n.replace(new RegExp('\\s*' + size.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&') + '\\s*$', 'i'), '');
+      return n.replace(/\s+(X\/?S|S\/?M|M\/?L|X\/?L|XX\/?L|O\/S|S|M|L|XL|XXL)\s*$/i, '').trim().toUpperCase();
+    };
+    const params = [req.user.businessId];
+    let match;
+    if (seed.category && seed.color) {
+      params.push(seed.category, seed.fabric || '', seed.color);
+      match = `si.category = $2 AND COALESCE(si.fabric,'') = $3 AND si.color = $4`;
+    } else {
+      params.push(stripSize(seed.name, seed.size));
+      match = `UPPER(REGEXP_REPLACE(si.name, '\\s+(X/?S|S/?M|M/?L|X/?L|XX/?L|O/S|S|M|L|XL|XXL)\\s*$', '', 'i')) = $2`;
+    }
+    const ids = await scopeShopIds(req);
+    let scope = '';
+    if (ids) { params.push(ids); scope = ` AND si.shop_id = ANY($${params.length}::int[])`; }
+
+    const { rows: siblings } = await pool.query(
+      `SELECT si.id, si.sku, COALESCE(si.size,'') AS size, si.qty
+         FROM stock_items si JOIN shops sh ON sh.id = si.shop_id
+        WHERE sh.business_id = $1 AND ${match}${scope}`,
+      params
+    );
+    if (!siblings.length) return res.json({ sizes: [], years: [] });
+
+    // Sales per size per year, every shop, ten years at most.
+    const thisYear = new Date().getFullYear();
+    const { rows: sold } = await pool.query(
+      `SELECT COALESCE(si.size,'') AS size,
+              EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $2))::int AS year,
+              COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS sold
+         FROM stock_movements m
+         JOIN stock_items si ON si.id = m.item_id
+        WHERE m.item_id = ANY($1::int[]) AND ${SALE_TYPES_SQL}
+          AND EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $2)) >= $3
+        GROUP BY 1, 2`,
+      [siblings.map(x => x.id), SHOP_TZ, thisYear - 9]
+    );
+
+    // Every year from the first sale of any size to now, so the columns line
+    // up across sizes and a quiet year shows as a gap rather than vanishing.
+    const first = sold.length ? Math.min(...sold.map(r => r.year)) : thisYear;
+    const years = [];
+    for (let y = first; y <= thisYear; y++) years.push(y);
+
+    // Sizes in the order they are worn, not alphabetically.
+    const ORDER = ['X/S', 'XS', 'S', 'S/M', 'M', 'M/L', 'L', 'L/XL', 'X/L', 'XL', 'XXL', 'O/S'];
+    const rank = (sz) => { const i = ORDER.indexOf(sz.toUpperCase()); return i < 0 ? 99 : i; };
+
+    const bySize = new Map();
+    for (const sib of siblings) {
+      if (!bySize.has(sib.size)) bySize.set(sib.size, { size: sib.size, skus: new Set(), stock: 0, byYear: {}, total: 0 });
+      const b = bySize.get(sib.size);
+      b.skus.add(sib.sku);
+      b.stock += Number(sib.qty) || 0;
+    }
+    for (const r of sold) {
+      const b = bySize.get(r.size);
+      if (!b) continue;
+      b.byYear[r.year] = (b.byYear[r.year] || 0) + r.sold;
+      b.total += r.sold;
+    }
+
+    res.json({
+      sku,
+      years,
+      sizes: [...bySize.values()]
+        .sort((a, b) => rank(a.size) - rank(b.size) || a.size.localeCompare(b.size))
+        .map(b => ({
+          size: b.size,
+          skus: [...b.skus],
+          stock: b.stock,
+          total: b.total,
+          byYear: years.map(y => b.byYear[y] || 0),
+        })),
+    });
+  } catch (err) {
+    logger.error('stock.sizes.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // How many of one garment went out the door in each year, kept apart rather
 // than added together. Thirty one year and twenty the next is the shape of a
 // garment going quiet; a single total of fifty hides it.
