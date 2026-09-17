@@ -1926,6 +1926,65 @@ app.post('/api/stock/:id/movements', auth, scopedItem, validate(movementSchema),
   }
 });
 
+// How many of one garment went out the door in each year, kept apart rather
+// than added together. Thirty one year and twenty the next is the shape of a
+// garment going quiet; a single total of fifty hides it.
+//
+// Open to staff: it is the detail panel on their own stock list, and a shop
+// deciding whether to reorder needs the answer as much as the owner does.
+// The shop scope applies, so a staff key only ever sees its own shop's sales.
+//
+// Every year from the first sale to now is listed, gaps included — a year
+// that sold nothing is a fact about the garment. Nothing is padded further
+// back than the first sale, and nothing further back than ten years.
+app.get('/api/stock/sold-by-year', auth, async (req, res) => {
+  try {
+    const sku = String(req.query.sku || '').trim();
+    if (!sku) return res.status(400).json({ error: 'No sku provided' });
+
+    const params = [req.user.businessId, sku.toUpperCase(), SHOP_TZ];
+    let scope = '';
+    const ids = await scopeShopIds(req);
+    if (ids) { params.push(ids); scope += ` AND m.shop_id = ANY($${params.length}::int[])`; }
+    const shopId = parseInt(req.query.shopId, 10);
+    if (Number.isInteger(shopId)) { params.push(shopId); scope += ` AND m.shop_id = $${params.length}`; }
+
+    const thisYear = new Date().getFullYear();
+    params.push(thisYear - 9);
+    const { rows } = await pool.query(
+      `SELECT EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $3))::int AS year,
+              COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS sold,
+              COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_NET_SQL}),0)::numeric AS revenue
+         FROM stock_movements m
+         JOIN stock_items si ON si.id = m.item_id
+         JOIN shops sh ON sh.id = m.shop_id
+        WHERE sh.business_id = $1 AND UPPER(si.sku) = $2 AND ${SALE_TYPES_SQL}
+          AND EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $3)) >= $${params.length} ${scope}
+        GROUP BY 1 ORDER BY 1 DESC`,
+      params
+    );
+
+    const bySold = new Map(rows.map(r => [r.year, r]));
+    const first = rows.length ? Math.min(...rows.map(r => r.year)) : thisYear;
+    const years = [];
+    for (let y = thisYear; y >= first; y--) {
+      const r = bySold.get(y);
+      years.push({ year: y, sold: r ? r.sold : 0, revenue: r ? Number(r.revenue) : 0 });
+    }
+    res.json({
+      sku,
+      years,
+      totals: {
+        sold: years.reduce((n, y) => n + y.sold, 0),
+        revenue: years.reduce((n, y) => n + y.revenue, 0),
+      },
+    });
+  } catch (err) {
+    logger.error('stock.soldByYear.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.get('/api/stock/:id/movements', auth, scopedItem, async (req, res) => {
   try {
     const { rows: own } = await pool.query(
@@ -3070,6 +3129,7 @@ app.get('/api/sales/by-staff', auth, requireAdmin, async (req, res) => {
   }
 });
 
+
 // ── The takings, sliced by date ────────────────────
 // Year, month, week and day, all four at once and each independent. Pick a
 // day without a month and you get that date in every month; pick a month
@@ -3221,7 +3281,12 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
       }
     }
 
-    const [sellers, trend, shelf] = await Promise.all([
+    // How long the best and worst lists are. Twenty by default; the owner
+    // can ask for fifteen or a hundred. Capped so a typo cannot ask for the
+    // whole catalogue.
+    const LIMIT = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 200);
+
+    const [sellers, trend, shelf, dow] = await Promise.all([
       // Ranked by units and by value, because the fastest-moving garment and
       // the most profitable one are rarely the same garment.
       pool.query(
@@ -3246,6 +3311,26 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
          WHERE ${windowSql}
          GROUP BY 1 ORDER BY 1`,
         all
+      ),
+      // Which weekday sells. Pieces per trading day, not totals: a shop open
+      // on seven Saturdays and three Mondays in the period would otherwise
+      // make Saturday look busier than it is.
+      //
+      // The sales loaded from the hand-kept sheet are left out here. They
+      // carry no real day — every one sits on the 15th — so counting them
+      // would land each month's trade on whatever weekday the 15th fell on.
+      // They stay in the garment rankings, where the day does not matter.
+      pool.query(
+        `SELECT EXTRACT(ISODOW FROM ${LOCAL_AT_SQL})::int AS dow,
+                COUNT(DISTINCT (${LOCAL_AT_SQL})::date)::int AS days,
+                COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS pieces,
+                COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_NET_SQL}),0)::numeric AS revenue
+         FROM stock_movements m
+         JOIN stock_items si ON si.id = m.item_id
+         JOIN shops sh ON sh.id = m.shop_id
+         WHERE ${windowSql} AND COALESCE(m.note,'') <> $${all.length + 1}
+         GROUP BY 1 ORDER BY 1`,
+        [...all, SALES_IMPORT_NOTE]
       ),
       // Everything on the shelf with when it last sold. Stock that has NEVER
       // sold is the point of the dead-stock report, so a null last_sold_at
@@ -3273,6 +3358,17 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
       units: r.units, revenue: Number(r.revenue),
     }));
     const byRevenue = [...ranked].sort((a, b) => b.revenue - a.revenue);
+
+    const weekdays = dow.rows.map(x => ({
+      dow: x.dow,
+      days: x.days,
+      pieces: x.pieces,
+      revenue: Number(x.revenue),
+      perDay: x.days ? x.pieces / x.days : 0,
+      revenuePerDay: x.days ? Number(x.revenue) / x.days : 0,
+    })).sort((a, b) => b.perDay - a.perDay || b.revenuePerDay - a.revenuePerDay);
+    // Enough real days to say anything. Three Thursdays is a coincidence.
+    const realDays = weekdays.reduce((n, w) => n + w.days, 0);
 
     const DAY = 86400000;
     const now = Date.now();
@@ -3304,9 +3400,13 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
     res.json({
       windowMonths: HISTORY_MONTHS,
       deadAfterDays: DEAD_DAYS,
-      bestByUnits: ranked.slice(0, 15),
-      worstByUnits: ranked.filter(x => x.units > 0).slice(-15).reverse(),
-      bestByRevenue: byRevenue.slice(0, 15),
+      limit: LIMIT,
+      bestByUnits: ranked.slice(0, LIMIT),
+      worstByUnits: ranked.filter(x => x.units > 0).slice(-LIMIT).reverse(),
+      bestByRevenue: byRevenue.slice(0, LIMIT),
+      weekdays,
+      enoughDays: realDays >= 14,
+      realDays,
       trend: trend.rows.map(r => ({ month: r.month, units: r.units, revenue: Number(r.revenue) })),
       fastMoving: [...stock].sort((a, b) => b.velocity - a.velocity).slice(0, 15),
       deadStock: deadStock.slice(0, 100),
