@@ -126,6 +126,9 @@ check('and never further back than ten years', /thisYear - 9/.test(ep), 'no ten-
 check('it is open to staff, scoped to their own shop',
   /app\.get\('\/api\/stock\/sold-by-year', auth, async/.test(src) && /scopeShopIds\(req\)/.test(ep),
   'it is admin-only or unscoped');
+check('for the owner it counts every shop, not the one on screen',
+  !/req\.query\.shopId/.test(ep) && /byShop: shopRows/.test(ep),
+  'the garment is still judged by one shop');
 
 console.log('\n  what the Best & worst endpoint enforces');
 const pep = grab("app.get('/api/analytics/summary'", '\n});');

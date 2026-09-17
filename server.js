@@ -1934,6 +1934,12 @@ app.post('/api/stock/:id/movements', auth, scopedItem, validate(movementSchema),
 // deciding whether to reorder needs the answer as much as the owner does.
 // The shop scope applies, so a staff key only ever sees its own shop's sales.
 //
+// For the owner it counts EVERY shop, whichever one is on screen. The
+// question is how well the garment sells, not how well it sells here, and
+// a dress that moved forty at Goldust is not a dress that never sold just
+// because Office is the tab that happens to be open. The split by shop is
+// returned alongside so the answer to "where" is one glance away.
+//
 // Every year from the first sale to now is listed, gaps included — a year
 // that sold nothing is a fact about the garment. Nothing is padded further
 // back than the first sale, and nothing further back than ten years.
@@ -1946,9 +1952,6 @@ app.get('/api/stock/sold-by-year', auth, async (req, res) => {
     let scope = '';
     const ids = await scopeShopIds(req);
     if (ids) { params.push(ids); scope += ` AND m.shop_id = ANY($${params.length}::int[])`; }
-    const shopId = parseInt(req.query.shopId, 10);
-    if (Number.isInteger(shopId)) { params.push(shopId); scope += ` AND m.shop_id = $${params.length}`; }
-
     const thisYear = new Date().getFullYear();
     params.push(thisYear - 9);
     const { rows } = await pool.query(
@@ -1964,6 +1967,19 @@ app.get('/api/stock/sold-by-year', auth, async (req, res) => {
       params
     );
 
+    // Where it sold, over the same span.
+    const { rows: shopRows } = await pool.query(
+      `SELECT sh.name, COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS sold
+         FROM stock_movements m
+         JOIN stock_items si ON si.id = m.item_id
+         JOIN shops sh ON sh.id = m.shop_id
+        WHERE sh.business_id = $1 AND UPPER(si.sku) = $2 AND ${SALE_TYPES_SQL}
+          AND EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $3)) >= $${params.length} ${scope}
+        GROUP BY 1 HAVING COALESCE(SUM(${NET_UNITS_SQL}),0) <> 0
+        ORDER BY 2 DESC, 1 ASC`,
+      params
+    );
+
     const bySold = new Map(rows.map(r => [r.year, r]));
     const first = rows.length ? Math.min(...rows.map(r => r.year)) : thisYear;
     const years = [];
@@ -1974,6 +1990,7 @@ app.get('/api/stock/sold-by-year', auth, async (req, res) => {
     res.json({
       sku,
       years,
+      byShop: shopRows.map(r => ({ shop: r.name, sold: r.sold })),
       totals: {
         sold: years.reduce((n, y) => n + y.sold, 0),
         revenue: years.reduce((n, y) => n + y.revenue, 0),
