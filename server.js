@@ -3286,7 +3286,8 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
     // whole catalogue.
     const LIMIT = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 200);
 
-    const [sellers, trend, shelf, dow] = await Promise.all([
+    // Order matters: the queries below are destructured by position.
+    const [sellers, trend, dow, shelf] = await Promise.all([
       // Ranked by units and by value, because the fastest-moving garment and
       // the most profitable one are rarely the same garment.
       pool.query(
