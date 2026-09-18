@@ -1926,6 +1926,115 @@ app.post('/api/stock/:id/movements', auth, scopedItem, validate(movementSchema),
   }
 });
 
+// ═══════════════════════════════════════════════════════════
+// QUICK CHECK
+// ═══════════════════════════════════════════════════════════
+// The stock list with the answers already showing. One line per garment —
+// not per size — with every size and its count along one row, and what the
+// garment sold in each of the last ten years alongside. Nothing to tap.
+//
+// The garment is the unit here, not the code: the S/M and the M/L of one
+// dress carry unrelated codes, so sizes are gathered by what the garment IS
+// — style, fabric, colour — and only fall back to the name with the size
+// stripped where those are blank.
+//
+// Stock is what is on the rail at the shop(s) on screen. Sales are every
+// shop's, always: how well the garment sells is a question about the
+// garment, not about whichever tab happens to be open.
+const QUICK_YEARS = 10;
+const SIZE_TAIL_SQL = `'\\s+(X/?S|S/?M|M/?L|L/?XL|X/?L|XX/?L|O/S|S|M|L|XL|XXL)\\s*$'`;
+const GARMENT_KEY_SQL = `
+  CASE WHEN COALESCE(si.category,'') <> '' AND COALESCE(si.color,'') <> ''
+       THEN UPPER(si.category) || '|' || UPPER(COALESCE(si.fabric,'')) || '|' || UPPER(si.color)
+       ELSE 'N|' || UPPER(REGEXP_REPLACE(COALESCE(si.name,''), ${SIZE_TAIL_SQL}, '', 'i'))
+  END`;
+
+app.get('/api/quick-check', auth, async (req, res) => {
+  try {
+    const businessId = req.user.businessId;
+    const ids = await scopeShopIds(req);
+    const stockParams = [businessId];
+    let stockScope = '';
+    if (ids) { stockParams.push(ids); stockScope = ` AND si.shop_id = ANY($${stockParams.length}::int[])`; }
+
+    const thisYear = new Date().getFullYear();
+    const firstYear = thisYear - (QUICK_YEARS - 1);
+
+    const [{ rows: items }, { rows: sold }] = await Promise.all([
+      // Every size of every garment in scope, with its count and its codes.
+      pool.query(
+        `SELECT ${GARMENT_KEY_SQL} AS key,
+                MIN(si.name) AS name, MIN(si.category) AS style,
+                MIN(COALESCE(si.fabric,'')) AS fabric, MIN(COALESCE(si.color,'')) AS color,
+                MAX(si.price) AS price,
+                COALESCE(si.size,'') AS size,
+                SUM(si.qty)::int AS qty,
+                ARRAY_AGG(DISTINCT si.sku) AS skus
+           FROM stock_items si
+           JOIN shops sh ON sh.id = si.shop_id
+          WHERE sh.business_id = $1 AND COALESCE(si.sku,'') <> ''${stockScope}
+          GROUP BY 1, 7`,
+        stockParams
+      ),
+      // What each garment sold in each year, every shop.
+      pool.query(
+        `SELECT ${GARMENT_KEY_SQL} AS key,
+                EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $2))::int AS year,
+                COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS sold
+           FROM stock_movements m
+           JOIN stock_items si ON si.id = m.item_id
+           JOIN shops sh ON sh.id = m.shop_id
+          WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}
+            AND EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $2)) >= $3
+          GROUP BY 1, 2`,
+        [businessId, SHOP_TZ, firstYear]
+      ),
+    ]);
+
+    // Sizes in wearing order, not alphabetical.
+    const ORDER = ['X/S', 'XS', 'S', 'S/M', 'M', 'M/L', 'L', 'L/XL', 'X/L', 'XL', 'XXL', 'O/S'];
+    const rank = (sz) => { const i = ORDER.indexOf(String(sz).toUpperCase()); return i < 0 ? 99 : i; };
+
+    const garments = new Map();
+    for (const r of items) {
+      if (!garments.has(r.key)) {
+        garments.set(r.key, {
+          key: r.key, name: r.name, style: r.style || '', fabric: r.fabric || '', color: r.color || '',
+          price: Number(r.price) || 0, sizes: [], skus: [], stock: 0, byYear: {},
+        });
+      }
+      const g = garments.get(r.key);
+      g.sizes.push({ size: r.size, qty: r.qty });
+      g.skus.push(...r.skus);
+      g.stock += r.qty;
+    }
+    for (const r of sold) {
+      const g = garments.get(r.key);
+      if (g) g.byYear[r.year] = (g.byYear[r.year] || 0) + r.sold;
+    }
+
+    const years = [];
+    for (let y = firstYear; y <= thisYear; y++) years.push(y);
+
+    res.json({
+      years,
+      garments: [...garments.values()].map(g => ({
+        ...g,
+        sizes: g.sizes.sort((a, b) => rank(a.size) - rank(b.size) || a.size.localeCompare(b.size)),
+        skus: [...new Set(g.skus)].sort(),
+        byYear: years.map(y => g.byYear[y] || 0),
+        total: years.reduce((n, y) => n + (g.byYear[y] || 0), 0),
+      })).sort((a, b) =>
+        (a.fabric || '\uffff').localeCompare(b.fabric || '\uffff')
+        || a.style.localeCompare(b.style)
+        || a.color.localeCompare(b.color)),
+    });
+  } catch (err) {
+    logger.error('quickcheck.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // One garment in all its sizes, with what each size sold in each year.
 //
 // This is the owner's sketch: the product once at the top, then a line per
