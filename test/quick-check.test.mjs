@@ -60,10 +60,10 @@ const NET_UNITS_SQL = value('const NET_UNITS_SQL =', ';');
 const SHOP_TZ = /const SHOP_TZ = process\.env\.SHOP_TZ \|\| '([^']+)'/.exec(src)[1];
 
 const consts = grab('const QUICK_YEARS =', ';') + '\n' + grab('const SIZE_TAIL_SQL =', ';') + '\n' + grab('const GARMENT_KEY_SQL =', '`;');
-const body = grab("app.get('/api/quick-check', auth, async (req, res) => {", '\n});');
+const body = grab("app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {", '\n});');
 const make = (ids) => new Function('pool', 'logger', 'scopeShopIds', 'NET_UNITS_SQL', 'SALE_TYPES_SQL', 'SHOP_TZ', `
   ${consts}
-  return ${body.replace(/^app\.get\([^,]+,\s*auth,\s*/, '(')}
+  return ${body.replace(/^app\.get\([^,]+,\s*auth,\s*requireAdmin,\s*/, '(')}
 `)({ query: (t, p) => db.query(t, p) }, { error: (k, v) => console.log(k, v) }, async () => ids, NET_UNITS_SQL, SALE_TYPES_SQL, SHOP_TZ);
 const call = (ids) => new Promise((resolve) => {
   const res = { status(c) { this.code = c; return this; }, json(v) { resolve({ code: this.code || 200, ...v }); } };
@@ -106,8 +106,8 @@ check('stock is that shop’s: S/M 2, not 5', bb1.sizes[0].qty === 2, String(bb1
 check('but sales are still every shop’s: 2026 = 4 was Rose Gold’s sale', y(bb1, 2026) === 4, String(y(bb1, 2026)));
 
 console.log('\n  what the endpoint enforces');
-check('it is open to staff, scoped to their shop for stock',
-  /app\.get\('\/api\/quick-check', auth, async/.test(src) && /scopeShopIds\(req\)/.test(body), 'admin-only or unscoped');
+check('it is admin-only',
+  /app\.get\('\/api\/quick-check', auth, requireAdmin, async/.test(src), 'staff can reach it');
 check('the sales query is NOT scoped by shop', !/stockScope/.test(body.slice(body.indexOf('What each garment sold'))), 'sales are scoped');
 check('fabric first, then style, then colour — the way she reads the rail',
   /localeCompare\(b\.fabric/.test(body) && /a\.style\.localeCompare\(b\.style\)/.test(body), 'a different order');

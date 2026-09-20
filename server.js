@@ -1941,6 +1941,9 @@ app.post('/api/stock/:id/movements', auth, scopedItem, validate(movementSchema),
 // Stock is what is on the rail at the shop(s) on screen. Sales are every
 // shop's, always: how well the garment sells is a question about the
 // garment, not about whichever tab happens to be open.
+//
+// Admin only. Ten years of every garment's sales is the business laid bare,
+// and that is the owner's to read, not the shop floor's.
 const QUICK_YEARS = 10;
 const SIZE_TAIL_SQL = `'\\s+(X/?S|S/?M|M/?L|L/?XL|X/?L|XX/?L|O/S|S|M|L|XL|XXL)\\s*$'`;
 const GARMENT_KEY_SQL = `
@@ -1949,7 +1952,7 @@ const GARMENT_KEY_SQL = `
        ELSE 'N|' || UPPER(REGEXP_REPLACE(COALESCE(si.name,''), ${SIZE_TAIL_SQL}, '', 'i'))
   END`;
 
-app.get('/api/quick-check', auth, async (req, res) => {
+app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
   try {
     const businessId = req.user.businessId;
     const ids = await scopeShopIds(req);
