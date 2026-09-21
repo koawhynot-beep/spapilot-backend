@@ -86,6 +86,21 @@ for (const sku of rgSkus) {
 }
 const before = await one(`SELECT COUNT(*)::int AS n, COALESCE(SUM(qty),0)::int AS pieces FROM stock_items`);
 
+// ── What is already in the book before the seeder runs ──────────────────
+// Two first-import entries, which this round replaces, and one sale rung up
+// in the app by hand, which it must leave exactly as it is.
+const V1_NOTE = /const SALES_IMPORT_NOTE_V1 = '([^']+)'/.exec(src)[1];
+const V2_NOTE = /const SALES_IMPORT_NOTE = '([^']+)'/.exec(src)[1];
+const firstItem = await one(`SELECT id FROM stock_items WHERE shop_id = 1 ORDER BY id LIMIT 1`);
+await db.query(
+  `INSERT INTO stock_movements (item_id, shop_id, type, qty_change, qty_after, occurred_at, unit_price, note) VALUES
+     ($1, 1, 'sale', -1, 9, '2025-03-15T04:00:00Z', 950000, $2),
+     ($1, 1, 'sale', -2, 7, '2025-04-15T04:00:00Z', 950000, $2),
+     ($1, 1, 'sale', -1, 6, '2026-09-18T06:30:00Z', 950000, 'rung up by hand')`,
+  [firstItem.id, V1_NOTE]);
+const MANUAL = 1;
+const NOT_MANUAL = `note <> 'rung up by hand'`;
+
 // ── The shipped seeder, run as it ships ─────────────────────────────────
 const grab = (decl, end) => {
   const a = src.indexOf(decl);
@@ -97,6 +112,7 @@ const logs = [];
 const logger = { info: (k, v) => logs.push([k, v]), warn: (k, v) => logs.push([k, v]), error: (k, v) => logs.push([k, v]) };
 const pool = { connect: async () => ({ query: (t, p) => db.query(t, p), release() {} }) };
 const seed = new Function('pool', 'logger', 'require', `
+  ${grab('const SALES_IMPORT_NOTE_V1 =', ';')}
   ${grab('const SALES_IMPORT_NOTE =', ';')}
   ${grab('async function seedSalesHistory() {', '\n}')}
   return seedSalesHistory;
@@ -108,9 +124,20 @@ const done = logs.find(l => l[0] === 'sales.seed.done');
 check('it says what it did', Boolean(done), 'silent');
 
 const moves = await one(
-  `SELECT COUNT(*)::int AS n, COALESCE(SUM(-qty_change),0)::int AS pieces FROM stock_movements`);
+  `SELECT COUNT(*)::int AS n, COALESCE(SUM(-qty_change),0)::int AS pieces FROM stock_movements WHERE note = $1`, [V2_NOTE]);
 check(`all ${SHEET.sales.length} entries land`, moves.n === SHEET.sales.length, `${moves.n}`);
 check(`all ${pieces} pieces land`, moves.pieces === pieces, `${moves.pieces}`);
+
+console.log('\n  the first import is replaced, the hand-rung sale is not');
+const v1left = await one(`SELECT COUNT(*)::int AS n FROM stock_movements WHERE note = $1`, [V1_NOTE]);
+check('not one first-import entry is left', v1left.n === 0, `${v1left.n} left`);
+check('and the seeder says how many it replaced', done && done[1].replacedFirstImport === 2,
+  done ? String(done[1].replacedFirstImport) : '?');
+const manual = await one(`SELECT COUNT(*)::int AS n, MIN(qty_after)::int AS after FROM stock_movements WHERE NOT (${NOT_MANUAL})`);
+check('the sale rung up by hand is still there, untouched', manual.n === MANUAL && manual.after === 6, JSON.stringify(manual));
+const total = await one(`SELECT COUNT(*)::int AS n FROM stock_movements`);
+check('so the book holds the sheet plus the hand-rung sale and nothing else',
+  total.n === SHEET.sales.length + MANUAL, `${total.n}`);
 check('nothing was skipped', done && done[1].skippedPieces === 0,
   done ? String(done[1].skippedPieces) : '?');
 
@@ -131,13 +158,13 @@ check('and it is described, not left as a bare code',
 
 console.log('\n  what the entries say');
 const sample = await one(
-  `SELECT type, note, occurred_at, unit_price FROM stock_movements ORDER BY id LIMIT 1`);
+  `SELECT type, note, occurred_at, unit_price FROM stock_movements WHERE ${NOT_MANUAL} ORDER BY id LIMIT 1`);
 check('they are sales', sample.type === 'sale', sample.type);
 check('each one says it came from the sheet and has no day of its own',
   /sales sheet/.test(sample.note) && /no day/.test(sample.note), sample.note);
 const days = await db.query(
   `SELECT DISTINCT EXTRACT(DAY FROM (occurred_at AT TIME ZONE 'Asia/Makassar'))::int AS d
-     FROM stock_movements`);
+     FROM stock_movements WHERE ${NOT_MANUAL}`);
 check('every entry sits on the 15th of its month, locally',
   days.rows.length === 1 && days.rows[0].d === 15,
   days.rows.map(r => r.d).join(','));
@@ -147,7 +174,7 @@ check('sales of a garment with a known price are valued at it', priced.n > 0, '0
 
 const years = await db.query(
   `SELECT EXTRACT(YEAR FROM (occurred_at AT TIME ZONE 'Asia/Makassar'))::int AS y,
-          SUM(-qty_change)::int AS pieces FROM stock_movements GROUP BY 1 ORDER BY 1`);
+          SUM(-qty_change)::int AS pieces FROM stock_movements WHERE ${NOT_MANUAL} GROUP BY 1 ORDER BY 1`);
 const byYear = Object.fromEntries(years.rows.map(r => [r.y, r.pieces]));
 const wantYear = {};
 for (const s of SHEET.sales) wantYear[s[2]] = (wantYear[s[2]] || 0) + s[4];
@@ -158,7 +185,7 @@ check('the years add up to what the sheet says',
 
 const shops = await db.query(
   `SELECT sh.code, SUM(-m.qty_change)::int AS pieces
-     FROM stock_movements m JOIN shops sh ON sh.id = m.shop_id GROUP BY 1 ORDER BY 1`);
+     FROM stock_movements m JOIN shops sh ON sh.id = m.shop_id WHERE m.${NOT_MANUAL} GROUP BY 1 ORDER BY 1`);
 const byShop = Object.fromEntries(shops.rows.map(r => [r.code, r.pieces]));
 const wantShop = {};
 for (const s of SHEET.sales) wantShop[s[1]] = (wantShop[s[1]] || 0) + s[4];
@@ -178,7 +205,7 @@ check('no entry claims a shop went below zero', negative.n === 0, `${negative.n}
 const tail = await one(
   `SELECT m.qty_after, si.qty FROM stock_movements m
      JOIN stock_items si ON si.id = m.item_id
-    WHERE si.shop_id = 1 AND si.sku = $1
+    WHERE si.shop_id = 1 AND si.sku = $1 AND m.${NOT_MANUAL}
     ORDER BY m.occurred_at DESC, m.id DESC LIMIT 1`, [rgSkus[0]]);
 check('the last entry for a garment lands on the count it has today',
   Number(tail.qty_after) === Number(tail.qty), `${tail.qty_after} vs ${tail.qty}`);
@@ -187,13 +214,17 @@ console.log('\n  running it again');
 logs.length = 0;
 await seed();
 const twice = await one(`SELECT COUNT(*)::int AS n FROM stock_movements`);
-check('a second run adds nothing', twice.n === SHEET.sales.length, `${twice.n}`);
+check('a second run adds nothing', twice.n === SHEET.sales.length + MANUAL, `${twice.n}`);
 check('and it does not say it did anything',
   !logs.some(l => l[0] === 'sales.seed.done'), 'it ran again');
 
 console.log('\n  what the code guarantees');
 check('the guard is the note, so the marker cannot be edited loosely',
   /WHERE note = \$1 LIMIT 1/.test(src), 'no guard');
+check('the only DELETE in the seeder is of first-import entries, by their marker',
+  (grab('async function seedSalesHistory() {', '\n}').match(/DELETE FROM/g) || []).length === 1
+  && /DELETE FROM stock_movements WHERE note = \$1`, \[SALES_IMPORT_NOTE_V1\]/.test(src),
+  'a broader delete');
 check('no UPDATE of stock_items qty anywhere in the seeder',
   !/UPDATE stock_items[\s\S]{0,200}SET qty/.test(grab('async function seedSalesHistory() {', '\n}')),
   'the seeder changes a quantity');

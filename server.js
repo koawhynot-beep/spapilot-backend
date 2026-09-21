@@ -2742,6 +2742,15 @@ async function seedSalesHistory() {
 
     await client.query('BEGIN');
 
+    // The first import was taken from a less complete copy of the workbook.
+    // This one replaces it: the first round's entries go, in the same
+    // transaction that brings the second round in, so there is never a
+    // moment with both or neither. Sales rung up in the app carry no such
+    // note and are not touched.
+    const { rowCount: replaced } = await client.query(
+      `DELETE FROM stock_movements WHERE note = $1`, [SALES_IMPORT_NOTE_V1]
+    );
+
     // A price to value the sales at. Taken from whatever shop already lists
     // the code, so a garment that has never been on this shop's own system
     // is still counted at what it actually sells for.
@@ -2849,6 +2858,7 @@ async function seedSalesHistory() {
 
     await client.query('COMMIT');
     logger.warn('sales.seed.done', {
+      replacedFirstImport: replaced,
       entries: cols.itemId.length,
       pieces: cols.qty.reduce((n, q) => n - q, 0),
       itemsCreated: created,
@@ -2864,8 +2874,12 @@ async function seedSalesHistory() {
 
 // The marker that says an entry came from the workbook rather than from
 // somebody scanning a barcode. It is also the guard that stops this running
-// a second time, so it must not be changed once it has been used.
-const SALES_IMPORT_NOTE = 'from the 2025-2026 sales sheet (month only, no day recorded)';
+// a second time, so it must not be changed once it has been used. The first
+// round's marker is kept so its entries can be found and replaced, and so
+// anything that leaves sheet history out still recognises it.
+const SALES_IMPORT_NOTE_V1 = 'from the 2025-2026 sales sheet (month only, no day recorded)';
+const SALES_IMPORT_NOTE = 'from the 2025-2026 sales sheet, 2nd import (month only, no day recorded)';
+const SALES_IMPORT_NOTES = [SALES_IMPORT_NOTE_V1, SALES_IMPORT_NOTE];
 
 async function seedOfficeStock() {
   const client = await pool.connect();
@@ -3568,9 +3582,9 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
          FROM stock_movements m
          JOIN stock_items si ON si.id = m.item_id
          JOIN shops sh ON sh.id = m.shop_id
-         WHERE ${windowSql} AND COALESCE(m.note,'') <> $${all.length + 1}
+         WHERE ${windowSql} AND COALESCE(m.note,'') <> ALL($${all.length + 1}::text[])
          GROUP BY 1 ORDER BY 1`,
-        [...all, SALES_IMPORT_NOTE]
+        [...all, SALES_IMPORT_NOTES]
       ),
       // Everything on the shelf with when it last sold. Stock that has NEVER
       // sold is the point of the dead-stock report, so a null last_sold_at
