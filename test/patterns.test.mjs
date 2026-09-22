@@ -1,9 +1,8 @@
 // Which weekday sells and which garments, against REAL Postgres.
 //
-// The trap is the sheet history. Every one of those sales sits on the 15th,
-// so if they were counted, each month's whole trade would land on whatever
-// weekday the 15th fell on and the "best day" would be an accident of the
-// calendar. The first check below is that they are left out.
+// The trap is averaging: a weekday that happened to fall more often in the
+// window would look busier than it is unless trade is divided by the days
+// it actually traded on.
 import { PGlite } from '@electric-sql/pglite';
 import fs from 'fs';
 
@@ -50,10 +49,6 @@ const NET_UNITS_SQL = value('const NET_UNITS_SQL =', ';');
 // eslint-disable-next-line no-unused-vars
 const SALE_PRICE_SQL = value('const SALE_PRICE_SQL =', ';');
 const SALE_NET_SQL = value('const SALE_NET_SQL =', ';');
-const SALES_IMPORT_NOTE_V1 = value('const SALES_IMPORT_NOTE_V1 =', ';');
-const SALES_IMPORT_NOTE = value('const SALES_IMPORT_NOTE =', ';');
-const SALES_IMPORT_NOTE_V2 = value('const SALES_IMPORT_NOTE_V2 =', ';');
-const SALES_IMPORT_NOTES = [SALES_IMPORT_NOTE_V1, SALES_IMPORT_NOTE_V2, SALES_IMPORT_NOTE];
 const TZ = /const SHOP_TZ = process\.env\.SHOP_TZ \|\| '([^']+)'/.exec(src)[1];
 const LOCAL_AT_SQL = `(m.occurred_at AT TIME ZONE '${TZ}')`;
 
@@ -71,10 +66,6 @@ await db.query(`INSERT INTO stock_movements (item_id, shop_id, type, qty_change,
   (3,1,'sale',-1,'${at('2026-09-06')}',700000),
   (3,1,'sale',-1,'${at('2026-09-13')}',700000),
   (2,1,'sale',-2,'${at('2026-09-07')}',500000)`);
-// Sheet history, from both imports: huge sales on a 15th (2026-09-15 is a Tuesday).
-await db.query(`INSERT INTO stock_movements (item_id, shop_id, type, qty_change, occurred_at, unit_price, note) VALUES
-  (3,1,'sale',-500,'${at('2026-09-15')}',700000,$1),
-  (3,1,'sale',-500,'${at('2026-09-15')}',700000,$2)`, [SALES_IMPORT_NOTE, SALES_IMPORT_NOTE_V1]);
 
 const weekdays = async () => (await db.query(
   `SELECT EXTRACT(ISODOW FROM ${LOCAL_AT_SQL})::int AS dow,
@@ -82,14 +73,12 @@ const weekdays = async () => (await db.query(
           COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS pieces
      FROM stock_movements m
      JOIN stock_items si ON si.id = m.item_id
-    WHERE ${SALE_TYPES_SQL} AND COALESCE(m.note,'') <> ALL($1::text[])
-    GROUP BY 1 ORDER BY 1`, [SALES_IMPORT_NOTES]
+    WHERE ${SALE_TYPES_SQL}
+    GROUP BY 1 ORDER BY 1`
 )).rows.map(r => ({ ...r, perDay: r.pieces / r.days })).sort((a, b) => b.perDay - a.perDay);
 
 const days = await weekdays();
 console.log('  weekdays');
-check('the sheet history is left out — Tuesday does not appear at all',
-  !days.some(d => d.dow === 2), days.map(d => d.dow).join(','));
 check('Thursday is the best day', days[0].dow === 4, `dow ${days[0].dow}`);
 check('Thursday nets the return: (4+4+5-1)/3 = 4 a day', days[0].perDay === 4, String(days[0].perDay));
 check('Sunday is the worst day', days[days.length - 1].dow === 7, `dow ${days[days.length - 1].dow}`);
@@ -108,8 +97,8 @@ const top = (await db.query(
     WHERE ${SALE_TYPES_SQL} GROUP BY 1
     HAVING COALESCE(SUM(${NET_UNITS_SQL}),0) > 0
     ORDER BY COALESCE(SUM(${NET_UNITS_SQL}),0) DESC LIMIT 10`)).rows;
-check('the sheet history IS counted for the garment ranking — the day does not matter there',
-  top[0].sku === 'S-3' && top[0].pieces === 1002, `${top[0].sku} ${top[0].pieces}`);
+check('the garment ranking is by pieces: the dress (4+4+5) leads', top[0].sku === 'D-1' && top[0].pieces === 13,
+  `${top[0].sku} ${top[0].pieces}`);
 check('returns come off a garment’s total', top.find(x => x.sku === 'T-2').pieces === 6,
   String(top.find(x => x.sku === 'T-2').pieces));
 
@@ -137,8 +126,8 @@ check('for the owner it counts every shop, not the one on screen',
 console.log('\n  what the Best & worst endpoint enforces');
 const pep = grab("app.get('/api/analytics/summary'", '\n});');
 check('it is admin-only', /app\.get\('\/api\/analytics\/summary', auth, requireAdmin/.test(src), 'requireAdmin missing');
-check('both sheet-import notes are excluded from the weekday query',
-  /COALESCE\(m\.note,''\) <> ALL\(\$\$\{all\.length \+ 1\}::text\[\]\)/.test(pep) && /SALES_IMPORT_NOTES\]/.test(pep), 'the sheet sales are counted in the weekdays');
+check('the weekday query no longer filters by note — the sheet history is gone from the book',
+  !/m\.note/.test(pep), 'a stale note filter is still in the query');
 check('it refuses to name a best day on too little trade',
   /enoughDays: realDays >= 14/.test(pep), 'no minimum');
 check('ranking is by pieces per trading day, not by total',
