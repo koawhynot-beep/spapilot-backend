@@ -775,9 +775,8 @@ async function initDB() {
   // touches rows that are plainly wrong, so a later import cannot re-break it.
   await backfillFabrics();
 
-  // The workbook's sales history, once loaded, is taken back out. Only the
-  // sales rung up in the app stay.
-  await removeSheetSalesHistory();
+  // Two years of sales from the hand-kept workbook. Runs once.
+  await seedSalesHistory();
 
   // Office's opening stock. Not a migration — it is data, and it runs after
   // every table it touches exists. Once, and only into an empty shop.
@@ -2718,36 +2717,180 @@ async function backfillFabrics() {
   }
 }
 
-// Takes the workbook's sales history back out.
+// Loads two years of sales out of the workbook kept by hand.
 //
-// Three rounds of monthly figures were once loaded from the hand-kept sheet,
-// each entry marked in its note so it could be told from a sale rung up in
-// the app. The owner has asked for all of it to go. This removes exactly
-// those marked entries and nothing else: sales entered by hand carry no
-// such note and stay, and no quantity is touched — the history never
-// changed a count on the way in, so taking it out changes none either.
+// This is history, not trade: it writes the sale entries and does NOT touch
+// any quantity. The counts already on the shelves are the result of these
+// sales having happened, so subtracting them again would take every shop's
+// stock down twice.
 //
-// Runs on every boot. After the first time there is nothing left to find,
-// so it costs one index lookup.
-async function removeSheetSalesHistory() {
+// The sheet gives a month and a quantity and never a day, so every entry
+// lands on the 15th of its month with a note that says so. Inventing a day
+// would look like real detail, and detail that is invented is detail that
+// somebody eventually relies on.
+async function seedSalesHistory() {
+  const client = await pool.connect();
   try {
-    const { rowCount } = await pool.query(
-      `DELETE FROM stock_movements WHERE note = ANY($1::text[])`, [SALES_IMPORT_NOTES]
+    // Runs once, and the marker in the note is what says so. Running it
+    // twice would double two years of takings.
+    const { rows: already } = await client.query(
+      `SELECT 1 FROM stock_movements WHERE note = $1 LIMIT 1`, [SALES_IMPORT_NOTE]
     );
-    if (rowCount) logger.warn('sales.sheet.removed', { entries: rowCount });
+    if (already.length) return;
+
+    const { items, sales } = require('./sales-history.js');
+    const { rows: shops } = await client.query(
+      `SELECT id, code FROM shops WHERE code = ANY($1::text[])`, [['GD', 'RG', 'AT']]
+    );
+    const shopByCode = new Map(shops.map(r => [r.code, r.id]));
+    if (shopByCode.size === 0) {
+      logger.warn('sales.seed.skipped', { why: 'none of the shops exist yet' });
+      return;
+    }
+
+    await client.query('BEGIN');
+
+    // The owner asked for everything loaded from the workbook so far to go,
+    // and for this copy to be loaded in its place. The earlier rounds'
+    // entries go in the same transaction that brings this one in, so there
+    // is never a moment with both or neither. Sales rung up in the app carry
+    // no such note and are not touched.
+    const { rowCount: replaced } = await client.query(
+      `DELETE FROM stock_movements WHERE note = ANY($1::text[])`, [SALES_IMPORT_NOTES_OLD]
+    );
+
+    // A price to value the sales at. Taken from whatever shop already lists
+    // the code, so a garment that has never been on this shop's own system
+    // is still counted at what it actually sells for.
+    const { rows: priceRows } = await client.query(
+      `SELECT UPPER(sku) AS sku, MAX(price) AS price
+         FROM stock_items WHERE COALESCE(sku,'') <> '' GROUP BY 1`
+    );
+    const priceBySku = new Map(priceRows.map(r => [r.sku, Number(r.price) || 0]));
+
+    // The shops that sold these garments must have a row for each of them,
+    // or there is nothing for a sale to point at. Anything missing is created
+    // at zero: it is a garment this shop has sold, so it belongs on its list,
+    // and zero is the honest count for one that is not there now.
+    const wanted = new Map();          // `${shopCode}\u0000${sku}` -> true
+    for (const [sku, shopCode] of sales) wanted.set(shopCode + '\u0000' + sku, true);
+    const detail = new Map(items.map(i => [i.sku, i]));
+
+    let created = 0;
+    for (const [code, shopId] of shopByCode) {
+      const skus = [...wanted.keys()]
+        .filter(k => k.startsWith(code + '\u0000'))
+        .map(k => k.split('\u0000')[1]);
+      if (!skus.length) continue;
+      const { rows: have } = await client.query(
+        `SELECT UPPER(sku) AS sku FROM stock_items WHERE shop_id = $1 AND UPPER(sku) = ANY($2::text[])`,
+        [shopId, skus.map(x => x.toUpperCase())]
+      );
+      const haveSet = new Set(have.map(r => r.sku));
+      const missing = skus.filter(x => !haveSet.has(x.toUpperCase()));
+      for (const sku of missing) {
+        const d = detail.get(sku) || {};
+        const name = [d.style, d.color, d.size].filter(Boolean).join(' ') || sku;
+        await client.query(
+          `INSERT INTO stock_items
+             (shop_id, name, category, fabric, print, size, color, sku, brand,
+              qty, threshold, supplier, notes, position, image_url, price, cost)
+           VALUES ($1,$2,$3,$4,'',$5,$6,$7,'',0,0,'','',
+                   (SELECT COALESCE(MAX(position), -1) + 1 FROM stock_items WHERE shop_id = $1),
+                   '',$8,0)`,
+          [shopId, name, d.style || '', d.fabric || '', d.size || '', d.color || '', sku,
+           priceBySku.get(sku.toUpperCase()) || 0]
+        );
+        created++;
+      }
+    }
+
+    // Every code the shops now hold, so each sale can be pointed at a row.
+    const { rows: itemRows } = await client.query(
+      `SELECT id, shop_id, UPPER(sku) AS sku, qty FROM stock_items WHERE shop_id = ANY($1::int[])`,
+      [[...shopByCode.values()]]
+    );
+    const itemBy = new Map(itemRows.map(r => [r.shop_id + '\u0000' + r.sku, r]));
+
+    // qty_after is a running balance, not a guess. Today's count plus
+    // everything sold since is what was on the rail before the first of
+    // these sales, so counting down from there lands exactly on the count
+    // that is there now. It ignores deliveries in between, so the early
+    // figures read high — but it is derived from real numbers at both ends
+    // rather than invented in the middle.
+    const sold = new Map();
+    for (const [sku, shopCode, , , qty] of sales) {
+      const shopId = shopByCode.get(shopCode);
+      if (!shopId) continue;
+      const key = shopId + '\u0000' + sku.toUpperCase();
+      sold.set(key, (sold.get(key) || 0) + qty);
+    }
+    const running = new Map();
+    for (const [key, total] of sold) {
+      const item = itemBy.get(key);
+      running.set(key, (item ? item.qty : 0) + total);
+    }
+
+    // Oldest first, so the running balance walks forward through time.
+    const ordered = [...sales].sort((a, b) => (a[2] - b[2]) || (a[3] - b[3]));
+
+    const cols = { itemId: [], shopId: [], qty: [], after: [], at: [], price: [] };
+    let skipped = 0;
+    for (const [sku, shopCode, year, month, qty] of ordered) {
+      const shopId = shopByCode.get(shopCode);
+      if (!shopId) { skipped += qty; continue; }
+      const key = shopId + '\u0000' + sku.toUpperCase();
+      const item = itemBy.get(key);
+      if (!item) { skipped += qty; continue; }
+      const before = running.get(key);
+      const after = before - qty;
+      running.set(key, after);
+      cols.itemId.push(item.id);
+      cols.shopId.push(shopId);
+      cols.qty.push(-qty);
+      cols.after.push(after);
+      // Noon in the shop's own timezone on the 15th, so the day cannot drift
+      // either side of midnight when it is read back.
+      cols.at.push(`${year}-${String(month).padStart(2, '0')}-15T04:00:00Z`);
+      cols.price.push(priceBySku.get(sku.toUpperCase()) || 0);
+    }
+
+    await client.query(
+      `INSERT INTO stock_movements
+         (item_id, shop_id, type, qty_change, qty_after, occurred_at, unit_price, note)
+       SELECT UNNEST($1::int[]), UNNEST($2::int[]), 'sale',
+              UNNEST($3::int[]), UNNEST($4::int[]), UNNEST($5::timestamptz[]),
+              UNNEST($6::numeric[]), $7`,
+      [cols.itemId, cols.shopId, cols.qty, cols.after, cols.at, cols.price, SALES_IMPORT_NOTE]
+    );
+
+    await client.query('COMMIT');
+    logger.warn('sales.seed.done', {
+      replacedFirstImport: replaced,
+      entries: cols.itemId.length,
+      pieces: cols.qty.reduce((n, q) => n - q, 0),
+      itemsCreated: created,
+      skippedPieces: skipped,
+    });
   } catch (err) {
-    logger.error('sales.sheet.remove.error', { err: err.message });
+    try { await client.query('ROLLBACK'); } catch {}
+    logger.error('sales.seed.error', { err: err.message });
+  } finally {
+    client.release();
   }
 }
 
-// The markers the three sheet imports wrote into the note. They are what
-// tells a workbook entry from one somebody rang up, so they must read
-// exactly as they did when the entries were written.
-const SALES_IMPORT_NOTES = [
-  'from the 2025-2026 sales sheet (month only, no day recorded)',
-  'from the 2025-2026 sales sheet, 2nd import (month only, no day recorded)',
-  'from the 2025-2026 sales sheet, 3rd import (month only, no day recorded)',
-];
+// The marker that says an entry came from the workbook rather than from
+// somebody scanning a barcode. It is also the guard that stops this running
+// a second time, so it must not be changed once it has been used. The
+// earlier rounds' markers are kept so their entries can be found and taken
+// out, and so anything that leaves sheet history out still recognises them.
+const SALES_IMPORT_NOTE_V1 = 'from the 2025-2026 sales sheet (month only, no day recorded)';
+const SALES_IMPORT_NOTE_V2 = 'from the 2025-2026 sales sheet, 2nd import (month only, no day recorded)';
+const SALES_IMPORT_NOTE_V3 = 'from the 2025-2026 sales sheet, 3rd import (month only, no day recorded)';
+const SALES_IMPORT_NOTE = 'from the 2025-2026 sales sheet, 4th import (month only, no day recorded)';
+const SALES_IMPORT_NOTES_OLD = [SALES_IMPORT_NOTE_V1, SALES_IMPORT_NOTE_V2, SALES_IMPORT_NOTE_V3];
+const SALES_IMPORT_NOTES = [...SALES_IMPORT_NOTES_OLD, SALES_IMPORT_NOTE];
 
 async function seedOfficeStock() {
   const client = await pool.connect();
@@ -3437,6 +3580,11 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
       // Which weekday sells. Pieces per trading day, not totals: a shop open
       // on seven Saturdays and three Mondays in the period would otherwise
       // make Saturday look busier than it is.
+      //
+      // The sales loaded from the hand-kept sheet are left out here. They
+      // carry no real day — every one sits on the 15th — so counting them
+      // would land each month's trade on whatever weekday the 15th fell on.
+      // They stay in the garment rankings, where the day does not matter.
       pool.query(
         `SELECT EXTRACT(ISODOW FROM ${LOCAL_AT_SQL})::int AS dow,
                 COUNT(DISTINCT (${LOCAL_AT_SQL})::date)::int AS days,
@@ -3445,9 +3593,9 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
          FROM stock_movements m
          JOIN stock_items si ON si.id = m.item_id
          JOIN shops sh ON sh.id = m.shop_id
-         WHERE ${windowSql}
+         WHERE ${windowSql} AND COALESCE(m.note,'') <> ALL($${all.length + 1}::text[])
          GROUP BY 1 ORDER BY 1`,
-        all
+        [...all, SALES_IMPORT_NOTES]
       ),
       // Everything on the shelf with when it last sold. Stock that has NEVER
       // sold is the point of the dead-stock report, so a null last_sold_at
