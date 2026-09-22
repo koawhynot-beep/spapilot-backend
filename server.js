@@ -1979,9 +1979,11 @@ app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
           GROUP BY 1, 7`,
         stockParams
       ),
-      // What each garment sold in each year, every shop.
+      // What each garment sold in each year, every shop — per size, so the
+      // card can say which size actually moved, not just that the garment did.
       pool.query(
         `SELECT ${GARMENT_KEY_SQL} AS key,
+                COALESCE(si.size,'') AS size,
                 EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $2))::int AS year,
                 COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS sold
            FROM stock_movements m
@@ -1989,7 +1991,7 @@ app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
            JOIN shops sh ON sh.id = m.shop_id
           WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}
             AND EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $2)) >= $3
-          GROUP BY 1, 2`,
+          GROUP BY 1, 2, 3`,
         [businessId, SHOP_TZ, firstYear]
       ),
     ]);
@@ -2007,13 +2009,19 @@ app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
         });
       }
       const g = garments.get(r.key);
-      g.sizes.push({ size: r.size, qty: r.qty });
+      g.sizes.push({ size: r.size, qty: r.qty, sold: 0 });
       g.skus.push(...r.skus);
       g.stock += r.qty;
     }
     for (const r of sold) {
       const g = garments.get(r.key);
-      if (g) g.byYear[r.year] = (g.byYear[r.year] || 0) + r.sold;
+      if (!g) continue;
+      g.byYear[r.year] = (g.byYear[r.year] || 0) + r.sold;
+      // A size that has sold out everywhere and been taken off the list
+      // still sold — it gets a cell of its own, at zero on the rail.
+      let z = g.sizes.find(x => x.size === r.size);
+      if (!z) { z = { size: r.size, qty: 0, sold: 0 }; g.sizes.push(z); }
+      z.sold += r.sold;
     }
 
     const years = [];
@@ -2742,13 +2750,13 @@ async function seedSalesHistory() {
 
     await client.query('BEGIN');
 
-    // The first import was taken from a less complete copy of the workbook.
-    // This one replaces it: the first round's entries go, in the same
+    // Each import is taken from a fuller copy of the workbook than the last.
+    // This one replaces the earlier rounds: their entries go, in the same
     // transaction that brings the second round in, so there is never a
     // moment with both or neither. Sales rung up in the app carry no such
     // note and are not touched.
     const { rowCount: replaced } = await client.query(
-      `DELETE FROM stock_movements WHERE note = $1`, [SALES_IMPORT_NOTE_V1]
+      `DELETE FROM stock_movements WHERE note = ANY($1::text[])`, [SALES_IMPORT_NOTES_OLD]
     );
 
     // A price to value the sales at. Taken from whatever shop already lists
@@ -2878,8 +2886,10 @@ async function seedSalesHistory() {
 // round's marker is kept so its entries can be found and replaced, and so
 // anything that leaves sheet history out still recognises it.
 const SALES_IMPORT_NOTE_V1 = 'from the 2025-2026 sales sheet (month only, no day recorded)';
-const SALES_IMPORT_NOTE = 'from the 2025-2026 sales sheet, 2nd import (month only, no day recorded)';
-const SALES_IMPORT_NOTES = [SALES_IMPORT_NOTE_V1, SALES_IMPORT_NOTE];
+const SALES_IMPORT_NOTE_V2 = 'from the 2025-2026 sales sheet, 2nd import (month only, no day recorded)';
+const SALES_IMPORT_NOTE = 'from the 2025-2026 sales sheet, 3rd import (month only, no day recorded)';
+const SALES_IMPORT_NOTES_OLD = [SALES_IMPORT_NOTE_V1, SALES_IMPORT_NOTE_V2];
+const SALES_IMPORT_NOTES = [...SALES_IMPORT_NOTES_OLD, SALES_IMPORT_NOTE];
 
 async function seedOfficeStock() {
   const client = await pool.connect();

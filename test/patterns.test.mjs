@@ -52,7 +52,8 @@ const SALE_PRICE_SQL = value('const SALE_PRICE_SQL =', ';');
 const SALE_NET_SQL = value('const SALE_NET_SQL =', ';');
 const SALES_IMPORT_NOTE_V1 = value('const SALES_IMPORT_NOTE_V1 =', ';');
 const SALES_IMPORT_NOTE = value('const SALES_IMPORT_NOTE =', ';');
-const SALES_IMPORT_NOTES = [SALES_IMPORT_NOTE_V1, SALES_IMPORT_NOTE];
+const SALES_IMPORT_NOTE_V2 = value('const SALES_IMPORT_NOTE_V2 =', ';');
+const SALES_IMPORT_NOTES = [SALES_IMPORT_NOTE_V1, SALES_IMPORT_NOTE_V2, SALES_IMPORT_NOTE];
 const TZ = /const SHOP_TZ = process\.env\.SHOP_TZ \|\| '([^']+)'/.exec(src)[1];
 const LOCAL_AT_SQL = `(m.occurred_at AT TIME ZONE '${TZ}')`;
 

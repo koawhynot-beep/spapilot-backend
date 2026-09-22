@@ -86,6 +86,9 @@ check('every size along the Baby Blue line, in wearing order',
 check('stock per size adds both shops together: S/M 2+3, M/L 1',
   bb.sizes[0].qty === 5 && bb.sizes[1].qty === 1 && bb.stock === 6, JSON.stringify(bb.sizes));
 check('all its codes are listed', bb.skus.join(',') === 'WP-1001,WP-1002', bb.skus.join(','));
+check('what each SIZE sold, not just the garment: S/M 1+4 = 5, M/L 3-1 = 2',
+  bb.sizes[0].sold === 5 && bb.sizes[1].sold === 2, JSON.stringify(bb.sizes));
+check('the sizes add up to the garment', bb.sizes.reduce((n, z) => n + z.sold, 0) === bb.total, 'they do not');
 const y = (g, year) => g.byYear[all.years.indexOf(year)];
 check('sold per year: 2025 = 1 + 3 - 1 returned = 3', y(bb, 2025) === 3, String(y(bb, 2025)));
 check('sold per year: 2026 = 4', y(bb, 2026) === 4, String(y(bb, 2026)));
