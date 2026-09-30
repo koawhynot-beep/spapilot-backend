@@ -541,6 +541,13 @@ async function initDB() {
     -- discount" is a fact worth stating and it keeps the arithmetic below
     -- from having to guard every multiplication.
     ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS discount_pct NUMERIC(5,2) DEFAULT 0;
+
+    -- How much of this row was paid in cash, when the customer paid partly
+    -- in cash and partly on the card. Null on every other row, including the
+    -- plain cash ones: "all of it" is already said by payment = 'cash', and
+    -- a number repeated in two places is a number that can disagree with
+    -- itself. The card part is never stored — it is the rest of the row.
+    ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS cash_amount NUMERIC(14,2);
   `);
 
   // Reclassify transfers logged before the type split. They were written as
@@ -1716,11 +1723,17 @@ app.post('/api/shops/:shopId/sell', auth, scopedShop, async (req, res) => {
       `UPDATE stock_items SET qty=$1, last_sold_at=NOW(), updated_at=NOW() WHERE id=$2 RETURNING *`,
       [newQty, item.id]
     );
+    // One garment, one request, so the cash part is simply this sale's own
+    // — no allocating across lines the way the scan counter does.
+    const paidBy = cleanPayment(req.body.payment);
+    const paidCash = paidBy === 'split'
+      ? Math.min(cleanMoney(req.body.cashAmount), lineValue(item.price, 0, change))
+      : null;
     await client.query(
-      `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note, payment)
-       VALUES ($1,$2,$3,'sale',$4,$5,NOW(),$6,$7)`,
+      `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note, payment, cash_amount)
+       VALUES ($1,$2,$3,'sale',$4,$5,NOW(),$6,$7,$8)`,
       [item.id, item.shop_id, req.user.id, change, newQty,
-       manual ? 'manual sale' : 'barcode sale', cleanPayment(req.body.payment)]
+       manual ? 'manual sale' : 'barcode sale', paidBy, paidCash]
     );
     await client.query('COMMIT');
     // -change, not qtySold: asking for 5 when 3 are left sells the 3 there are.
@@ -1741,7 +1754,10 @@ app.post('/api/shops/:shopId/sell', auth, scopedShop, async (req, res) => {
 // The ways a customer can pay. A closed set, because this ends up in the
 // takings: a free-text field would give you "card", "Card", "kartu" and
 // "debit" as four different payment methods by the end of the month.
-const PAYMENT_METHODS = ['cash', 'card'];
+// 'split' is one customer paying partly in cash and partly on the card —
+// common enough that staff were doing it as two sales, which balanced the
+// drawer but sold the garment twice.
+const PAYMENT_METHODS = ['cash', 'card', 'split'];
 const cleanPayment = (v) => {
   // Only an actual string. JSON can carry ["cash"], and String() would
   // flatten that to "cash" — harmless here, but a normaliser that quietly
@@ -1760,6 +1776,20 @@ const cleanDiscount = (v) => {
   if (!Number.isFinite(n)) return 0;
   return Math.min(100, Math.max(0, Math.round(n)));
 };
+
+// An amount of money coming in from a screen. Whole rupiah, never negative:
+// the smallest note anyone here handles is larger than one, and a negative
+// cash part would take money out of the drawer on a sale.
+const cleanMoney = (v) => {
+  const n = typeof v === 'number' ? v : (typeof v === 'string' ? Number(v.trim()) : NaN);
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(1e12, Math.max(0, Math.round(n)));
+};
+
+// What one line of a sale is worth: what each piece was charged, times the
+// number of pieces. The cash part of a split can never exceed it.
+const lineValue = (price, discountPct, units) =>
+  Math.round((Number(price) || 0) * (1 - discountPct / 100)) * Math.abs(units);
 
 const SCAN_MODES = {
   sell:   { type: 'sale',    dir: -1, label: 'Sold' },
@@ -1785,6 +1815,16 @@ app.post('/api/shops/:shopId/scan', auth, scopedShop, async (req, res) => {
     const payment = type === 'sale' ? cleanPayment(req.body.payment) : '';
     // Same reasoning for the discount: nothing is discounted off a delivery.
     const discountPct = type === 'sale' ? cleanDiscount(req.body.discountPct) : 0;
+    // A split is paid for once but rung up a piece at a time, so the screen
+    // says how much of the customer's cash is still to be covered and each
+    // line takes what it can from that. Five pieces and one 500,000 note
+    // therefore split exactly 500,000 between them, and the rest goes on the
+    // card. Sent explicitly, so a split with no amount is a bug we hear
+    // about rather than a card sale wearing the wrong label.
+    if (payment === 'split' && req.body.cashRemaining === undefined) {
+      return res.status(400).json({ error: 'A part-cash sale needs the cash amount' });
+    }
+    const cashRemaining = cleanMoney(req.body.cashRemaining);
     const note = String(req.body.note || '').trim().slice(0, 500);
     if (!code && !Number.isInteger(itemId)) {
       return res.status(400).json({ error: 'No item or barcode provided' });
@@ -1833,14 +1873,19 @@ app.post('/api/shops/:shopId/scan', auth, scopedShop, async (req, res) => {
       ? `UPDATE stock_items SET qty=$1, last_sold_at=NOW(), updated_at=NOW() WHERE id=$2 RETURNING *`
       : `UPDATE stock_items SET qty=$1, updated_at=NOW() WHERE id=$2 RETURNING *`;
     const { rows: upd } = await client.query(sql, [newQty, item.id]);
+    // Never more than this line is worth: the piece after the cash runs out
+    // goes entirely on the card, which is what happened at the counter.
+    const cashAmount = payment === 'split'
+      ? Math.min(cashRemaining, lineValue(item.price, discountPct, change))
+      : null;
     await client.query(
       `INSERT INTO stock_movements
-         (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note, reason, staff_id, staff_name, payment, discount_pct)
-       VALUES ($1,$2,$3,$4,$5,$6,NOW(),$7,$8,$9,$10,$11,$12)`,
+         (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note, reason, staff_id, staff_name, payment, discount_pct, cash_amount)
+       VALUES ($1,$2,$3,$4,$5,$6,NOW(),$7,$8,$9,$10,$11,$12,$13)`,
       [
         item.id, item.shop_id, req.user.id, type, change, newQty,
         note || (Number.isInteger(itemId) ? 'manual' : 'barcode'),
-        reason, staff.id, staff.name, payment, discountPct,
+        reason, staff.id, staff.name, payment, discountPct, cashAmount,
       ]
     );
     await client.query('COMMIT');
@@ -1851,6 +1896,9 @@ app.post('/api/shops/:shopId/scan', auth, scopedShop, async (req, res) => {
       item: formatStock(upd[0]),
       qtyChanged: Math.abs(change),
       staffName: staff.name,
+      // What this line took out of the cash, so the screen can count down
+      // the rest of the customer's note as the next pieces are scanned.
+      cashApplied: cashAmount || 0,
     });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
@@ -2467,6 +2515,24 @@ const SALE_PRICE_SQL = 'COALESCE(m.unit_price, si.price, 0)';
 // somebody has to match against cash.
 const SALE_NET_SQL = `ROUND(${SALE_PRICE_SQL} * (1 - COALESCE(m.discount_pct, 0) / 100.0))`;
 
+// What the row is worth, signed: a sale adds, a refund takes away.
+const SALE_VALUE_SQL = `((-m.qty_change) * ${SALE_NET_SQL})`;
+
+// The same money, split the way the customer paid it — what went into the
+// drawer and what went through the machine. A part-cash row carries only its
+// cash half; the card half is whatever is left of the row, so the two always
+// add back up to the takings and can never quietly drift apart. The cash is
+// capped at the row's own value, so a stored figure that is somehow too big
+// cannot invent money in the drawer.
+const CASH_TAKEN_SQL = `(CASE m.payment
+    WHEN 'cash'  THEN ${SALE_VALUE_SQL}
+    WHEN 'split' THEN SIGN(${SALE_VALUE_SQL}) * LEAST(COALESCE(m.cash_amount, 0), ABS(${SALE_VALUE_SQL}))
+    ELSE 0 END)`;
+const CARD_TAKEN_SQL = `(CASE m.payment
+    WHEN 'card'  THEN ${SALE_VALUE_SQL}
+    WHEN 'split' THEN ${SALE_VALUE_SQL} - ${CASH_TAKEN_SQL}
+    ELSE 0 END)`;
+
 const SALE_SELECT = `
   SELECT m.id, m.type, m.qty_change, m.occurred_at, m.reason, m.note,
          COALESCE(NULLIF(m.staff_name,''), '(not recorded)') AS staff_name,
@@ -2474,7 +2540,7 @@ const SALE_SELECT = `
          si.fabric, ${SALE_PRICE_SQL} AS price, ${SALE_NET_SQL} AS net_price,
          COALESCE(m.discount_pct, 0) AS discount_pct, COALESCE(si.cost,0) AS cost,
          m.unit_price AS unit_price, m.item_id, m.qty_change AS raw_qty_change,
-         COALESCE(m.payment,'') AS payment,
+         COALESCE(m.payment,'') AS payment, m.cash_amount,
          m.shop_id, sh.name AS shop_name
   FROM stock_movements m
   JOIN stock_items si ON si.id = m.item_id
@@ -2516,9 +2582,24 @@ const shapeSale = (r) => {
     staffName: r.staff_name,
     reason: r.reason || '',
     payment: r.payment || '',
+    // Only a part-cash row has one. Null everywhere else, so a screen that
+    // reads it cannot mistake "paid entirely in cash" for "nothing in cash".
+    cashAmount: r.cash_amount === null || r.cash_amount === undefined ? null : Number(r.cash_amount),
     shopId: r.shop_id,
     shopName: r.shop_name || '',
   };
+};
+
+// A shaped sale, told apart into drawer and machine. The same arithmetic as
+// CASH_TAKEN_SQL, for the places that already hold the rows in memory: a
+// part-cash row carries its cash half and the card takes the rest, capped so
+// the two always add back up to what the row is worth.
+const splitOf = (r) => {
+  if (r.payment === 'cash') return { cash: r.value, card: 0 };
+  if (r.payment === 'card') return { cash: 0, card: r.value };
+  if (r.payment !== 'split') return { cash: 0, card: 0 };
+  const cash = Math.sign(r.value) * Math.min(Number(r.cashAmount) || 0, Math.abs(r.value));
+  return { cash, card: r.value - cash };
 };
 
 // Today's till roll. Staff can see this — they need it to balance the drawer
@@ -2549,6 +2630,12 @@ app.get('/api/sales/today', auth, async (req, res) => {
         revenue: items.reduce((n, i) => n + i.value, 0),
         margin: items.reduce((n, i) => n + i.margin, 0),
         transactions: items.length,
+        // What should be in the drawer at close, and what should have gone
+        // through the machine. Part-cash sales land in both. Anything sold
+        // without a method recorded is in the revenue above but in neither
+        // of these, which is the honest place for it.
+        cash: items.reduce((n, i) => n + splitOf(i).cash, 0),
+        card: items.reduce((n, i) => n + splitOf(i).card, 0),
       },
     });
   } catch (err) {
@@ -2990,6 +3077,8 @@ const saleEditSchema = z.object({
   staffId: z.coerce.number().int().positive().nullable().optional(),
   // '' clears it back to "not recorded".
   payment: z.string().trim().max(20).optional(),
+  // The cash half of a part-cash sale. Ignored unless the method is 'split'.
+  cashAmount: z.coerce.number().min(0).max(1e12).optional(),
   discountPct: z.coerce.number().min(0).max(100).optional(),
 });
 
@@ -3121,13 +3210,26 @@ app.patch('/api/sales/:id', auth, validate(saleEditSchema), async (req, res) => 
       occurredAt = when;
     }
 
+    // The cash half, and only on a part-cash sale: changing the method to
+    // anything else clears it, or a row would claim cash that its own method
+    // says was never handed over.
+    const cashAmount = payment !== 'split' ? null : Math.min(
+      req.body.cashAmount === undefined
+        ? cleanMoney(move.cash_amount)
+        : cleanMoney(req.body.cashAmount),
+      lineValue(unitPrice === null || unitPrice === undefined ? newItem.price : unitPrice,
+                discountPct, newQtyChange)
+    );
+
     const { rows: saved } = await client.query(
       `UPDATE stock_movements
           SET item_id = $1, qty_change = $2, qty_after = $3, unit_price = $4,
-              note = $5, occurred_at = $6, payment = $7, discount_pct = $8
-        WHERE id = $9
+              note = $5, occurred_at = $6, payment = $7, discount_pct = $8,
+              cash_amount = $9
+        WHERE id = $10
         RETURNING id`,
-      [newItemId, newQtyChange, qtyAfter, unitPrice, note, occurredAt, payment, discountPct, saleId]
+      [newItemId, newQtyChange, qtyAfter, unitPrice, note, occurredAt, payment, discountPct,
+       cashAmount, saleId]
     );
     await client.query('COMMIT');
 
@@ -3143,9 +3245,10 @@ app.patch('/api/sales/:id', auth, validate(saleEditSchema), async (req, res) => 
         itemId: oldItemId, qtyChange: move.qty_change,
         unitPrice: move.unit_price, note: move.note,
         occurredAt: move.occurred_at, payment: move.payment || '',
+        cashAmount: move.cash_amount === null ? null : Number(move.cash_amount),
         discountPct: Number(move.discount_pct) || 0,
       },
-      after: { itemId: newItemId, qtyChange: newQtyChange, unitPrice, note, occurredAt, payment, discountPct },
+      after: { itemId: newItemId, qtyChange: newQtyChange, unitPrice, note, occurredAt, payment, discountPct, cashAmount },
       // Names the person who made the correction, not just the role. On the
       // shop floor "staff" is several people sharing one code.
       staff: await resolveStaff(req.body.staffId, req.user.businessId),
@@ -3504,13 +3607,17 @@ app.get('/api/sales/history.csv', auth, requireAdmin, async (req, res) => {
     );
     const body = csvDoc(
       ['Date', 'Time', 'Shop', 'Type', 'SKU', 'Item', 'Colour', 'Size', 'Units',
-       'Price (IDR)', 'Discount %', 'Charged (IDR)', 'Value (IDR)', 'Staff', 'Paid by', 'Reason'],
+       'Price (IDR)', 'Discount %', 'Charged (IDR)', 'Value (IDR)', 'Staff', 'Paid by',
+       'In cash (IDR)', 'On card (IDR)', 'Reason'],
       rows.map(shapeSale).map(r => {
         const d = new Date(r.occurredAt);
+        // Whoever reconciles the till adds these two columns up, so they are
+        // filled in for every sale rather than only for the split ones.
+        const cash = splitOf(r).cash;
         return [d.toISOString().slice(0, 10), d.toISOString().slice(11, 19), r.shopName,
                 r.type, r.sku, r.itemName, r.color, r.size, r.units,
                 r.price, r.discountPct, r.netPrice, r.value,
-                r.staffName, r.payment, r.reason];
+                r.staffName, r.payment, cash, r.value - cash, r.reason];
       })
     );
     sendCsv(res, `sales-${new Date().toISOString().slice(0, 10)}.csv`, body);
