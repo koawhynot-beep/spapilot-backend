@@ -15,7 +15,8 @@ const db = new PGlite();
 await db.exec(`
   CREATE TABLE shops (id SERIAL PRIMARY KEY, business_id INT, name TEXT, code TEXT);
   CREATE TABLE stock_items (
-    id SERIAL PRIMARY KEY, shop_id INT, name TEXT, sku TEXT, color TEXT DEFAULT '',
+    id SERIAL PRIMARY KEY, shop_id INT, name TEXT, sku TEXT, fabric TEXT DEFAULT '',
+    color TEXT DEFAULT '',
     size TEXT DEFAULT '', qty INT DEFAULT 0, price NUMERIC(14,2) DEFAULT 0
   );
   CREATE TABLE stock_movements (
@@ -25,15 +26,15 @@ await db.exec(`
   );
   CREATE TABLE imported_sales (
     id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
-    source TEXT NOT NULL, sku TEXT NOT NULL, name TEXT DEFAULT '', color TEXT DEFAULT '',
-    size TEXT DEFAULT '', sold_on DATE NOT NULL, units INT NOT NULL,
+    source TEXT NOT NULL, sku TEXT NOT NULL, name TEXT DEFAULT '', fabric TEXT DEFAULT '',
+    color TEXT DEFAULT '', size TEXT DEFAULT '', sold_on DATE NOT NULL, units INT NOT NULL,
     value NUMERIC(14,2) NOT NULL DEFAULT 0,
     cash NUMERIC(14,2) NOT NULL DEFAULT 0, card NUMERIC(14,2) NOT NULL DEFAULT 0
   );
   INSERT INTO shops (business_id, name, code) VALUES (1,'Goldust','GD'), (1,'Atriq','AT');
-  INSERT INTO stock_items (shop_id, name, sku, color, qty, price) VALUES
-    (1,'NICOL DRESS BLACK','NI-1005','BLACK', 4, 895000),
-    (1,'GIPSY DRESS BULU KUDA','GI-2009','BULU KUDA LINEN', 2, 1200000);
+  INSERT INTO stock_items (shop_id, name, sku, fabric, color, qty, price) VALUES
+    (1,'NICOL DRESS BLACK','NI-1005','RAYON KRINKLE','BLACK', 4, 895000),
+    (1,'GIPSY DRESS BULU KUDA','GI-2009','','BULU KUDA LINEN', 2, 1200000);
 `);
 
 let failures = 0;
@@ -66,17 +67,21 @@ const sources = new Set();
 for (const b of BOOKS) {
   const book = (await import(new URL('../' + b.file.replace('./', ''), import.meta.url))).default;
   const rows = book.rows;
-  const pieces = rows.reduce((n, r) => n + r[5], 0);
-  const value = rows.reduce((n, r) => n + r[6], 0);
+  const pieces = rows.reduce((n, r) => n + r[6], 0);
+  const value = rows.reduce((n, r) => n + r[7], 0);
   console.log(`  ${b.shop}: ${rows.length} lines · ${pieces} pieces · ${value.toLocaleString('en-US')} IDR`);
   check(`${b.shop}: every line has a code, a day and at least one piece`,
-    rows.every(r => r[0] && /^\d{4}-\d{2}-\d{2}$/.test(r[4]) && r[5] > 0),
+    rows.every(r => r[0] && /^\d{4}-\d{2}-\d{2}$/.test(r[5]) && r[6] > 0),
     'a malformed line is in the file');
   check(`${b.shop}: every day falls inside the two years the book covers`,
-    rows.every(r => r[4] >= '2025-01-01' && r[4] <= '2026-12-31'), 'a line is dated outside the book');
-  check(`${b.shop}: no line is worth less than nothing`, rows.every(r => r[6] >= 0), 'a negative sale');
+    rows.every(r => r[5] >= '2025-01-01' && r[5] <= '2026-12-31'), 'a line is dated outside the book');
+  check(`${b.shop}: no line is worth less than nothing`, rows.every(r => r[7] >= 0), 'a negative sale');
   check(`${b.shop}: cash and card never come to more than the line`,
-    rows.every(r => r[7] + r[8] <= r[6]), 'a line claims more money than it took');
+    rows.every(r => r[8] + r[9] <= r[7]), 'a line claims more money than it took');
+  // Saroongs, bags and journals have no fabric and never did; garments do.
+  const withFabric = rows.filter(r => r[2]).length;
+  check(`${b.shop}: the fabric is there — ${Math.round((withFabric / rows.length) * 100)}% of lines carry one`,
+    withFabric / rows.length > 0.8, `only ${withFabric} of ${rows.length}`);
   check(`${b.shop}: alterations are not in it — they sell no garment`,
     !rows.some(r => r[0] === 'AL-2001'), 'the sewing service is counted as stock sold');
   check(`${b.shop}: the book is named, and named only once`,
@@ -89,9 +94,9 @@ for (const b of BOOKS) {
 const FIXTURE = {
   source: 'test ledger',
   rows: [
-    ['ni-1005', 'NICOL DRESS BLACK', 'BLACK', 'O/S', '2025-03-04', 3, 2400000, 2400000, 0],
-    ['GI-2009', 'GIPSY DRESS BULU KUDA', 'BULU KUDA LINEN', 'O/S', '2025-07-21', 1, 1200000, 0, 1200000],
-    ['OLD-999', 'DISCONTINUED KAFTAN', 'RUSH', 'O/S', '2026-02-10', 5, 3000000, 0, 3000000],
+    ['ni-1005', 'NICOL DRESS BLACK', 'RAYON KRINKLE', 'BLACK', 'O/S', '2025-03-04', 3, 2400000, 2400000, 0],
+    ['GI-2009', 'GIPSY DRESS BULU KUDA', 'RAYON LINEN', 'BULU KUDA LINEN', 'O/S', '2025-07-21', 1, 1200000, 0, 1200000],
+    ['OLD-999', 'DISCONTINUED KAFTAN', 'RAMIE', 'RUSH', 'O/S', '2026-02-10', 5, 3000000, 0, 3000000],
   ],
 };
 const logs = [];
@@ -156,6 +161,12 @@ check('and takes its name from the book, since no shelf has one',
   by['OLD-999'].name === 'DISCONTINUED KAFTAN', by['OLD-999'].name);
 check('a garment still on the shelf keeps the shelf\'s name, not the book\'s',
   by['GI-2009'].name === 'GIPSY DRESS BULU KUDA', by['GI-2009'].name);
+check('the fabric comes through, which is the whole point of this copy',
+  by['OLD-999'].fabric === 'RAMIE', JSON.stringify(by['OLD-999']));
+check('the shelf\'s fabric wins when it has one',
+  by['NI-1005'].fabric === 'RAYON KRINKLE', by['NI-1005'].fabric);
+check('and the book fills it in when the shelf does not know it',
+  by['GI-2009'].fabric === 'RAYON LINEN', by['GI-2009'].fabric);
 check('the list is ordered by pieces, most first',
   ranked.every((r, i) => i === 0 || ranked[i - 1].units >= r.units),
   ranked.map(r => `${r.sku}:${r.units}`).join(', '));
@@ -168,13 +179,39 @@ const b25 = Object.fromEntries(y2025.map(r => [r.sku, r]));
 check('the book obeys the year asked for', !b25['OLD-999'], 'a 2026 line answered a 2025 question');
 check('2025 shows the book\'s three Nicols', b25['NI-1005'].units === 3 + 1, JSON.stringify(b25['NI-1005']));
 
+// ── A newer copy of a book replaces the old one ──────────────────────────
+// The shops send a fuller copy every few weeks. Two copies of one book in
+// the table would double every ranking, so the sweep runs before the load.
+console.log('\n  a newer copy replaces the old');
+await db.query(
+  `INSERT INTO imported_sales (shop_id, source, sku, name, fabric, color, size, sold_on, units, value)
+   VALUES (1, 'an older copy', 'NI-1005', 'NICOL DRESS BLACK', '', 'BLACK', 'O/S', '2025-01-05', 9, 9000000)`
+);
+const sweep = new Function('pool', 'logger', 'require', 'seedOneBook', `
+  ${grab('const IMPORTED_BOOKS = [', '];')}
+  ${grab('async function seedImportedSales() {', '\n}')}
+  return seedImportedSales;
+`)({ query: (t, p) => db.query(t, p) }, logger, () => FIXTURE, async () => {});
+logs.length = 0;
+await sweep();
+check('the older copy is swept out',
+  (await one(`SELECT COUNT(*)::int AS n FROM imported_sales WHERE source = 'an older copy'`)).n === 0,
+  'it is still there, and every ranking now counts it twice');
+check('the current book is left alone',
+  (await one(`SELECT COUNT(*)::int AS n FROM imported_sales WHERE source = $1`, [FIXTURE.source])).n === 3,
+  'the sweep took the book it was meant to keep');
+check('and it says what it removed',
+  logs.some(l => l[0] === 'ledger.superseded' && l[1].removed === 1), JSON.stringify(logs));
+
 // ── What the code guarantees ─────────────────────────────────────────────
 console.log('\n  the promise: the rankings and nothing else');
 const blocks = [
   grab('    -- The shop\'s own sales book, from before the app', 'card NUMERIC(14,2) NOT NULL DEFAULT 0\n    );'),
+  grab('  await pool.query(`ALTER TABLE imported_sales ', ';'),
   grab('  await pool.query(`CREATE INDEX IF NOT EXISTS idx_imported_sales ', ';'),
   grab('  await pool.query(`CREATE INDEX IF NOT EXISTS idx_imported_sales_on ', ';'),
   grab("// The shops' own sales books, as they were kept by hand", '\n}'),
+  grab('async function seedImportedSales() {', '\n}'),
   grab('async function seedOneBook({ shop, file }) {', '\n}'),
   grab("app.get('/api/analytics/summary'", '\n});'),
 ];
@@ -183,9 +220,14 @@ for (const b of blocks) rest = rest.split(b).join('');
 check('outside the table, the loader and the rankings, nothing names the ledger at all',
   !rest.includes('imported_sales'),
   'something else reads it: ' + (rest.split('imported_sales').length - 1) + ' other mentions');
-check('the loader is the only thing that writes to it',
-  (src.match(/INSERT INTO imported_sales/g) || []).length === 1
-  && !/UPDATE imported_sales|DELETE FROM imported_sales/.test(src), 'something else writes to it');
+check('one INSERT, and it is the loader\'s',
+  (src.match(/INSERT INTO imported_sales/g) || []).length === 1, 'something else writes to it');
+check('one DELETE, and it only ever takes books that are no longer listed',
+  (src.match(/DELETE FROM imported_sales/g) || []).length === 1
+  && /DELETE FROM imported_sales WHERE source <> ALL\(\$1::text\[\]\)/.test(src),
+  'a delete could take a book that is still wanted');
+check('nothing ever edits a line of a book in place',
+  !/UPDATE imported_sales/.test(src), 'a ledger line can be rewritten');
 check('it cannot move stock: the loader touches no other table',
   !/stock_items|stock_movements/.test(grab('async function seedImportedSales() {', '\n}')),
   'the loader reaches into the stock');

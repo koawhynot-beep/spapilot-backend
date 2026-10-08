@@ -557,6 +557,10 @@ async function initDB() {
       source TEXT NOT NULL,
       sku TEXT NOT NULL,
       name TEXT DEFAULT '',
+      -- The fabric the garment is cut from. The shop thinks in fabric first
+      -- — linen, ramie, satin — so a ranking that cannot say it is a ranking
+      -- she has to translate in her head.
+      fabric TEXT DEFAULT '',
       color TEXT DEFAULT '',
       size TEXT DEFAULT '',
       sold_on DATE NOT NULL,
@@ -804,6 +808,7 @@ async function initDB() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_transfers_pending ON stock_transfers(business_id, status)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_transfer_lines ON stock_transfer_lines(transfer_id)`);
+  await pool.query(`ALTER TABLE imported_sales ADD COLUMN IF NOT EXISTS fabric TEXT DEFAULT ''`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_imported_sales ON imported_sales(shop_id, sku)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_imported_sales_on ON imported_sales(sold_on)`);
 
@@ -2909,6 +2914,9 @@ const IMPORTED_BOOKS = [
   // run from January 2025. A book covers whatever its shop has traded.
   { shop: 'AT', file: './atriq-history.js' },
 ];
+// Replacing a book means pointing one of these at a newer file. Its rows
+// carry a new source name, the old copy's rows are swept out before the new
+// ones go in, and nothing else has to be remembered.
 
 // Loads those books into the rankings.
 //
@@ -2924,6 +2932,20 @@ const IMPORTED_BOOKS = [
 // book failing to load leaves the others alone: they are separate histories
 // of separate shops and there is no sense in which they are all-or-nothing.
 async function seedImportedSales() {
+  // The table holds exactly the books in the list above and nothing else.
+  // When a shop sends a fuller copy of its book it arrives under a new name,
+  // and the copy it replaces goes — otherwise the two would be counted on
+  // top of one another and every ranking would read double.
+  try {
+    const wanted = IMPORTED_BOOKS.map(b => require(b.file).source);
+    const { rowCount } = await pool.query(
+      `DELETE FROM imported_sales WHERE source <> ALL($1::text[])`, [wanted]
+    );
+    if (rowCount) logger.warn('ledger.superseded', { removed: rowCount, keeping: wanted });
+  } catch (err) {
+    logger.error('ledger.sweep.error', { err: err.message });
+    return;     // Better no load at all than a second copy on top of the first.
+  }
   for (const book of IMPORTED_BOOKS) {
     await seedOneBook(book);
   }
@@ -2946,10 +2968,11 @@ async function seedOneBook({ shop, file }) {
     );
     if (already.length) return;
 
-    const col = { sku: [], name: [], color: [], size: [], on: [], units: [], value: [], cash: [], card: [] };
-    for (const [sku, name, color, size, on, units, value, cash, card] of rows) {
+    const col = { sku: [], name: [], fabric: [], color: [], size: [], on: [], units: [], value: [], cash: [], card: [] };
+    for (const [sku, name, fabric, color, size, on, units, value, cash, card] of rows) {
       col.sku.push(sku.toUpperCase());
       col.name.push(name);
+      col.fabric.push(fabric);
       col.color.push(color);
       col.size.push(size);
       col.on.push(on);
@@ -2960,11 +2983,11 @@ async function seedOneBook({ shop, file }) {
     }
     await client.query('BEGIN');
     await client.query(
-      `INSERT INTO imported_sales (shop_id, source, sku, name, color, size, sold_on, units, value, cash, card)
+      `INSERT INTO imported_sales (shop_id, source, sku, name, fabric, color, size, sold_on, units, value, cash, card)
        SELECT $1, $2, UNNEST($3::text[]), UNNEST($4::text[]), UNNEST($5::text[]),
-              UNNEST($6::text[]), UNNEST($7::date[]), UNNEST($8::int[]),
-              UNNEST($9::numeric[]), UNNEST($10::numeric[]), UNNEST($11::numeric[])`,
-      [shopId, source, col.sku, col.name, col.color, col.size, col.on,
+              UNNEST($6::text[]), UNNEST($7::text[]), UNNEST($8::date[]), UNNEST($9::int[]),
+              UNNEST($10::numeric[]), UNNEST($11::numeric[]), UNNEST($12::numeric[])`,
+      [shopId, source, col.sku, col.name, col.fabric, col.color, col.size, col.on,
        col.units, col.value, col.cash, col.card]
     );
     await client.query('COMMIT');
@@ -3688,7 +3711,8 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
       // only for codes the shop no longer carries.
       pool.query(
         `WITH counted AS (
-           SELECT si.sku AS sku, si.name AS name, si.color AS color, 1 AS shelf,
+           SELECT si.sku AS sku, si.name AS name, si.fabric AS fabric, si.color AS color,
+                  1 AS shelf,
                   ${NET_UNITS_SQL} AS units,
                   ${NET_UNITS_SQL} * ${SALE_NET_SQL} AS revenue
              FROM stock_movements m
@@ -3696,7 +3720,7 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
              JOIN shops sh ON sh.id = m.shop_id
             WHERE ${windowSql} AND COALESCE(si.sku,'') <> ''
            UNION ALL
-           SELECT UPPER(i.sku), i.name, i.color, 0,
+           SELECT UPPER(i.sku), i.name, i.fabric, i.color, 0,
                   i.units, i.value
              FROM imported_sales i
              JOIN shops sh ON sh.id = i.shop_id
@@ -3704,6 +3728,10 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
          )
          SELECT sku,
                 COALESCE(MIN(name) FILTER (WHERE shelf = 1), MIN(name)) AS name,
+                -- The shelf first, the book second, and whichever of the two
+                -- actually knows the fabric before either of their blanks.
+                COALESCE(NULLIF(MIN(fabric) FILTER (WHERE shelf = 1), ''),
+                         NULLIF(MIN(fabric) FILTER (WHERE shelf = 0), ''), '') AS fabric,
                 COALESCE(MIN(color) FILTER (WHERE shelf = 1), MIN(color)) AS color,
                 COALESCE(SUM(units),0)::int AS units,
                 COALESCE(SUM(revenue),0)::numeric AS revenue
@@ -3760,7 +3788,7 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
     ]);
 
     const ranked = sellers.rows.map(r => ({
-      sku: r.sku, name: r.name, color: r.color || '',
+      sku: r.sku, name: r.name, fabric: r.fabric || '', color: r.color || '',
       units: r.units, revenue: Number(r.revenue),
     }));
     const byRevenue = [...ranked].sort((a, b) => b.revenue - a.revenue);
