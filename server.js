@@ -2905,6 +2905,9 @@ async function removeSheetSalesHistory() {
 const IMPORTED_BOOKS = [
   { shop: 'GD', file: './goldust-history.js' },
   { shop: 'RG', file: './rosegold-history.js' },
+  // Atriq's book starts in June 2026, when the shop opened; the other two
+  // run from January 2025. A book covers whatever its shop has traded.
+  { shop: 'AT', file: './atriq-history.js' },
 ];
 
 // Loads those books into the rankings.
