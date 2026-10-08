@@ -1,8 +1,8 @@
 // ═══════════════════════════════════════════════════════════
 // GOLD DUST'S OWN SALES LEDGER  ·  2025 and 2026
 // ═══════════════════════════════════════════════════════════
-// Every sale the shop wrote in its book, from 1 January 2025 to 28 September
-// 2026: 9646 lines, 9868 pieces, 7,390,525,000 rupiah.
+// Every sale the shop wrote in its book, from 2025-01-01 to 2026-09-27:
+// 9646 lines, 9868 pieces, 7,390,525,000 rupiah.
 //
 // Unlike the monthly sheets this replaced, each line here is a real
 // transaction with the day it happened and the price actually charged, so
@@ -26,7 +26,7 @@
 //
 // rows: [sku, name, colour, size, date, units, value, cash, card]
 module.exports = {
-  source: 'goldust ledger 2025-2026',
+  source: "goldust ledger 2025-2026",
   rows: [
     ["BA-2001", "BAG OVALE GOLDUST LARGE", "LARGE", "", "2025-01-01", 1, 350000, 0, 350000],
     ["BO-1001", "BOOBTUBE PITA NATURAL O/S", "NATURAL", "O/S", "2025-01-01", 1, 295000, 0, 295000],

@@ -815,8 +815,8 @@ async function initDB() {
   // sales rung up in the app are left. The stock is not touched.
   await removeSheetSalesHistory();
 
-  // Gold Dust's own sales book, for the seller rankings. Its own table, read
-  // by nothing else. Runs once. Not stock, and not takings.
+  // The shops' own sales books, for the seller rankings. Their own table,
+  // read by nothing else. Each runs once. Not stock, and not takings.
   await seedImportedSales();
 
   // Office's opening stock. Not a migration — it is data, and it runs after
@@ -2900,9 +2900,16 @@ async function removeSheetSalesHistory() {
   }
 }
 
-// Loads a shop's own sales book into the rankings.
+// The shops' own sales books, as they were kept by hand before the app.
+// Each is loaded once, under its own name, into the shop whose book it is.
+const IMPORTED_BOOKS = [
+  { shop: 'GD', file: './goldust-history.js' },
+  { shop: 'RG', file: './rosegold-history.js' },
+];
+
+// Loads those books into the rankings.
 //
-// Gold Dust kept every sale by hand for two years: the day, the code, the
+// Each shop kept every sale by hand for two years: the day, the code, the
 // price actually charged. That is far better than the monthly summaries this
 // replaced — nothing is averaged or reconstructed — but it is still history
 // the shop wrote, not trade this app watched. So it goes into imported_sales
@@ -2910,19 +2917,27 @@ async function removeSheetSalesHistory() {
 // anyone, or turn up in a day's takings, because nothing but the seller
 // rankings ever reads that table.
 //
-// Runs once, and the source name in the row is what says so.
+// Each book runs once, and the source name in its rows is what says so. One
+// book failing to load leaves the others alone: they are separate histories
+// of separate shops and there is no sense in which they are all-or-nothing.
 async function seedImportedSales() {
+  for (const book of IMPORTED_BOOKS) {
+    await seedOneBook(book);
+  }
+}
+
+async function seedOneBook({ shop, file }) {
   const client = await pool.connect();
   try {
     const { rows: shops } = await client.query(
-      `SELECT id FROM shops WHERE code = $1 LIMIT 1`, ['GD']
+      `SELECT id FROM shops WHERE code = $1 LIMIT 1`, [shop]
     );
     if (!shops.length) {
-      logger.warn('ledger.seed.skipped', { why: 'Gold Dust does not exist yet' });
+      logger.warn('ledger.seed.skipped', { why: 'that shop does not exist yet', shop });
       return;
     }
     const shopId = shops[0].id;
-    const { source, rows } = require('./goldust-history.js');
+    const { source, rows } = require(file);
     const { rows: already } = await client.query(
       `SELECT 1 FROM imported_sales WHERE source = $1 LIMIT 1`, [source]
     );
@@ -2952,12 +2967,13 @@ async function seedImportedSales() {
     await client.query('COMMIT');
     logger.warn('ledger.seed.done', {
       source,
+      shop,
       lines: rows.length,
       pieces: col.units.reduce((n, q) => n + q, 0),
     });
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch {}
-    logger.error('ledger.seed.error', { err: err.message });
+    logger.error('ledger.seed.error', { err: err.message, shop });
   } finally {
     client.release();
   }

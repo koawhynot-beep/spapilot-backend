@@ -51,23 +51,39 @@ const grab = (decl, end) => {
 
 console.log('\nReal Postgres · the shop\'s own sales book\n');
 
-// ── The file that ships ──────────────────────────────────────────────────
-console.log('  the ledger as it ships');
-const LEDGER = (await import(new URL('../goldust-history.js', import.meta.url))).default;
-const pieces = LEDGER.rows.reduce((n, r) => n + r[5], 0);
-const value = LEDGER.rows.reduce((n, r) => n + r[6], 0);
-console.log(`  ${LEDGER.rows.length} lines · ${pieces} pieces · ${value.toLocaleString('en-US')} IDR`);
-check('every line has a code, a day and at least one piece',
-  LEDGER.rows.every(r => r[0] && /^\d{4}-\d{2}-\d{2}$/.test(r[4]) && r[5] > 0),
-  'a malformed line is in the file');
-check('every day falls inside the two years the book covers',
-  LEDGER.rows.every(r => r[4] >= '2025-01-01' && r[4] <= '2026-12-31'),
-  'a line is dated outside the book');
-check('no line is worth less than nothing', LEDGER.rows.every(r => r[6] >= 0), 'a negative sale');
-check('cash and card never come to more than the line',
-  LEDGER.rows.every(r => r[7] + r[8] <= r[6]), 'a line claims more money than it took');
-check('alterations are not in it — they sell no garment',
-  !LEDGER.rows.some(r => r[0] === 'AL-2001'), 'the sewing service is counted as stock sold');
+// ── The books that ship ──────────────────────────────────────────────────
+// Every shop's book is held to the same standard, so a new one cannot be
+// added to the list with a shape nobody checked.
+// eslint-disable-next-line no-eval
+const BOOKS = eval(grab('const IMPORTED_BOOKS = [', '];').slice('const IMPORTED_BOOKS = '.length));
+console.log('  the books as they ship');
+check('each book names a shop and a file', BOOKS.length >= 1
+  && BOOKS.every(b => /^[A-Z]{2}$/.test(b.shop) && b.file.startsWith('./')), JSON.stringify(BOOKS));
+check('no shop is loaded twice', new Set(BOOKS.map(b => b.shop)).size === BOOKS.length,
+  BOOKS.map(b => b.shop).join(','));
+
+const sources = new Set();
+for (const b of BOOKS) {
+  const book = (await import(new URL('../' + b.file.replace('./', ''), import.meta.url))).default;
+  const rows = book.rows;
+  const pieces = rows.reduce((n, r) => n + r[5], 0);
+  const value = rows.reduce((n, r) => n + r[6], 0);
+  console.log(`  ${b.shop}: ${rows.length} lines · ${pieces} pieces · ${value.toLocaleString('en-US')} IDR`);
+  check(`${b.shop}: every line has a code, a day and at least one piece`,
+    rows.every(r => r[0] && /^\d{4}-\d{2}-\d{2}$/.test(r[4]) && r[5] > 0),
+    'a malformed line is in the file');
+  check(`${b.shop}: every day falls inside the two years the book covers`,
+    rows.every(r => r[4] >= '2025-01-01' && r[4] <= '2026-12-31'), 'a line is dated outside the book');
+  check(`${b.shop}: no line is worth less than nothing`, rows.every(r => r[6] >= 0), 'a negative sale');
+  check(`${b.shop}: cash and card never come to more than the line`,
+    rows.every(r => r[7] + r[8] <= r[6]), 'a line claims more money than it took');
+  check(`${b.shop}: alterations are not in it — they sell no garment`,
+    !rows.some(r => r[0] === 'AL-2001'), 'the sewing service is counted as stock sold');
+  check(`${b.shop}: the book is named, and named only once`,
+    typeof book.source === 'string' && book.source.length > 0 && !sources.has(book.source),
+    `source "${book.source}" is missing or shared with another book`);
+  sources.add(book.source);
+}
 
 // ── The loader, run as it ships ──────────────────────────────────────────
 const FIXTURE = {
@@ -81,10 +97,14 @@ const FIXTURE = {
 const logs = [];
 const logger = { info: (k, v) => logs.push([k, v]), warn: (k, v) => logs.push([k, v]), error: (k, v) => logs.push([k, v]) };
 const pool = { connect: async () => ({ query: (t, p) => db.query(t, p), release() {} }) };
-const seed = new Function('pool', 'logger', 'require', `
-  ${grab('async function seedImportedSales() {', '\n}')}
-  return seedImportedSales;
+const seedOne = new Function('pool', 'logger', 'require', `
+  ${grab('async function seedOneBook({ shop, file }) {', '\n}')}
+  return seedOneBook;
 `)(pool, logger, () => FIXTURE);
+const seed = () => seedOne({ shop: 'GD', file: './fixture.js' });
+check('the loader walks every book in the list',
+  /for \(const book of IMPORTED_BOOKS\) {\s*await seedOneBook\(book\);/.test(src),
+  'a book in the list would never be loaded');
 
 console.log('\n  the first run');
 await seed();
@@ -154,7 +174,8 @@ const blocks = [
   grab('    -- The shop\'s own sales book, from before the app', 'card NUMERIC(14,2) NOT NULL DEFAULT 0\n    );'),
   grab('  await pool.query(`CREATE INDEX IF NOT EXISTS idx_imported_sales ', ';'),
   grab('  await pool.query(`CREATE INDEX IF NOT EXISTS idx_imported_sales_on ', ';'),
-  grab("// Loads a shop's own sales book into the rankings.", '\n}'),
+  grab("// The shops' own sales books, as they were kept by hand", '\n}'),
+  grab('async function seedOneBook({ shop, file }) {', '\n}'),
   grab("app.get('/api/analytics/summary'", '\n});'),
 ];
 let rest = src;
