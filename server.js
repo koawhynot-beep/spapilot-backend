@@ -542,36 +542,13 @@ async function initDB() {
     -- from having to guard every multiplication.
     ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS discount_pct NUMERIC(5,2) DEFAULT 0;
 
-    -- The shop's own sales book, from before the app: what sold, on what day,
-    -- for how much. It is kept in its own table and NOT among the movements
-    -- on purpose. A row here is history the owner wants counted in the
-    -- rankings and nowhere else, and a separate table is the only way to
-    -- promise that — a marker on a movement would have to be remembered by
-    -- every query ever written, and one day it would not be.
-    --
-    -- Nothing writes to it but the loader, and nothing reads it but the
-    -- best- and worst-seller lists.
-    CREATE TABLE IF NOT EXISTS imported_sales (
-      id SERIAL PRIMARY KEY,
-      shop_id INT NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
-      source TEXT NOT NULL,
-      sku TEXT NOT NULL,
-      name TEXT DEFAULT '',
-      -- The fabric the garment is cut from. The shop thinks in fabric first
-      -- — linen, ramie, satin — so a ranking that cannot say it is a ranking
-      -- she has to translate in her head.
-      fabric TEXT DEFAULT '',
-      color TEXT DEFAULT '',
-      size TEXT DEFAULT '',
-      sold_on DATE NOT NULL,
-      units INT NOT NULL,
-      value NUMERIC(14,2) NOT NULL DEFAULT 0,
-      -- What the book says went in the drawer and what went through the
-      -- machine. Recorded so the split is not lost on the way in; no screen
-      -- reads it yet.
-      cash NUMERIC(14,2) NOT NULL DEFAULT 0,
-      card NUMERIC(14,2) NOT NULL DEFAULT 0
-    );
+    -- There is no table here for sales imported from a spreadsheet, and
+    -- that is deliberate. Copies of the shops' own books were loaded and
+    -- taken out again three times over, each wrong in a way nobody could see
+    -- from inside the app. The owner's instruction is that none of it comes
+    -- back, so the table is dropped rather than left empty: an empty table
+    -- is an invitation, and the next person to find it would fill it.
+    DROP TABLE IF EXISTS imported_sales;
 
     -- How much of this row was paid in cash, when the customer paid partly
     -- in cash and partly on the card. Null on every other row, including the
@@ -808,9 +785,6 @@ async function initDB() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_transfers_pending ON stock_transfers(business_id, status)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_transfer_lines ON stock_transfer_lines(transfer_id)`);
-  await pool.query(`ALTER TABLE imported_sales ADD COLUMN IF NOT EXISTS fabric TEXT DEFAULT ''`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_imported_sales ON imported_sales(shop_id, sku)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_imported_sales_on ON imported_sales(sold_on)`);
 
   // Real material names in the fabric block. Runs on every boot, and only
   // touches rows that are plainly wrong, so a later import cannot re-break it.
@@ -820,9 +794,6 @@ async function initDB() {
   // sales rung up in the app are left. The stock is not touched.
   await removeSheetSalesHistory();
 
-  // The shops' own sales books, for the seller rankings. Their own table,
-  // read by nothing else. Each runs once. Not stock, and not takings.
-  await seedImportedSales();
 
   // Office's opening stock. Not a migration — it is data, and it runs after
   // every table it touches exists. Once, and only into an empty shop.
@@ -2716,44 +2687,6 @@ const PERIOD_PARTS = [
   ['day',   (v) => v >= 1 && v <= 31,      `EXTRACT(DAY FROM ${LOCAL_AT_SQL})`],
 ];
 
-// The same questions asked of the imported ledger, whose rows carry their
-// own date, code and colour rather than a movement's. Only the filters that
-// can honestly be answered are applied: a ledger line records no person, so
-// asking for one person's sales excludes the ledger entirely rather than
-// pretending its rows belong to nobody in particular.
-const LEDGER_PARTS = [
-  ['year',  (v) => v >= 2000 && v <= 2100, `EXTRACT(YEAR FROM i.sold_on)`],
-  ['month', (v) => v >= 1 && v <= 12,      `EXTRACT(MONTH FROM i.sold_on)`],
-  ['week',  (v) => v >= 1 && v <= 5,       `LEAST(5, FLOOR((EXTRACT(DAY FROM i.sold_on) - 1) / 7) + 1)::int`],
-  ['day',   (v) => v >= 1 && v <= 31,      `EXTRACT(DAY FROM i.sold_on)`],
-];
-
-async function ledgerFilter(req, startParamIndex) {
-  const params = [];
-  let where = '';
-  const push = (v) => { params.push(v); return startParamIndex + params.length - 1; };
-
-  if (Number.isInteger(parseInt(req.query.staffId, 10))) return { where: ' AND FALSE', params };
-
-  const shopIds = await scopeShopIds(req);
-  if (shopIds) where += ` AND i.shop_id = ANY($${push(shopIds)}::int[])`;
-  if (req.query.from) where += ` AND i.sold_on >= $${push(new Date(req.query.from))}`;
-  if (req.query.to) where += ` AND i.sold_on <= $${push(new Date(req.query.to))}`;
-  if (req.query.color) where += ` AND i.color ILIKE $${push(req.query.color)}`;
-  if (req.query.sku) where += ` AND i.sku ILIKE $${push(req.query.sku)}`;
-  const q = String(req.query.q || '').trim();
-  if (q) {
-    const n = push('%' + q + '%');
-    where += ` AND (i.sku ILIKE $${n} OR i.name ILIKE $${n} OR i.color ILIKE $${n})`;
-  }
-  for (const [name, valid, expr] of LEDGER_PARTS) {
-    const n = parseInt(req.query[name], 10);
-    if (!Number.isInteger(n) || !valid(n)) continue;
-    where += ` AND ${expr} = $${push(n)}`;
-  }
-  return { where, params };
-}
-
 async function salesFilter(req, startParamIndex, skip) {
   const params = [];
   let where = '';
@@ -2902,106 +2835,6 @@ async function removeSheetSalesHistory() {
     if (rowCount) logger.warn('sales.sheet.removed', { entries: rowCount });
   } catch (err) {
     logger.error('sales.sheet.remove.error', { err: err.message });
-  }
-}
-
-// The shops' own sales books, as they were kept by hand before the app.
-// Each is loaded once, under its own name, into the shop whose book it is.
-const IMPORTED_BOOKS = [
-  { shop: 'GD', file: './goldust-history.js' },
-  { shop: 'RG', file: './rosegold-history.js' },
-  // Atriq's book starts in June 2026, when the shop opened; the other two
-  // run from January 2025. A book covers whatever its shop has traded.
-  { shop: 'AT', file: './atriq-history.js' },
-];
-// Replacing a book means pointing one of these at a newer file. Its rows
-// carry a new source name, the old copy's rows are swept out before the new
-// ones go in, and nothing else has to be remembered.
-
-// Loads those books into the rankings.
-//
-// Each shop kept every sale by hand for two years: the day, the code, the
-// price actually charged. That is far better than the monthly summaries this
-// replaced — nothing is averaged or reconstructed — but it is still history
-// the shop wrote, not trade this app watched. So it goes into imported_sales
-// and stays there. It cannot move a quantity, reach the till, be credited to
-// anyone, or turn up in a day's takings, because nothing but the seller
-// rankings ever reads that table.
-//
-// Each book runs once, and the source name in its rows is what says so. One
-// book failing to load leaves the others alone: they are separate histories
-// of separate shops and there is no sense in which they are all-or-nothing.
-async function seedImportedSales() {
-  // The table holds exactly the books in the list above and nothing else.
-  // When a shop sends a fuller copy of its book it arrives under a new name,
-  // and the copy it replaces goes — otherwise the two would be counted on
-  // top of one another and every ranking would read double.
-  try {
-    const wanted = IMPORTED_BOOKS.map(b => require(b.file).source);
-    const { rowCount } = await pool.query(
-      `DELETE FROM imported_sales WHERE source <> ALL($1::text[])`, [wanted]
-    );
-    if (rowCount) logger.warn('ledger.superseded', { removed: rowCount, keeping: wanted });
-  } catch (err) {
-    logger.error('ledger.sweep.error', { err: err.message });
-    return;     // Better no load at all than a second copy on top of the first.
-  }
-  for (const book of IMPORTED_BOOKS) {
-    await seedOneBook(book);
-  }
-}
-
-async function seedOneBook({ shop, file }) {
-  const client = await pool.connect();
-  try {
-    const { rows: shops } = await client.query(
-      `SELECT id FROM shops WHERE code = $1 LIMIT 1`, [shop]
-    );
-    if (!shops.length) {
-      logger.warn('ledger.seed.skipped', { why: 'that shop does not exist yet', shop });
-      return;
-    }
-    const shopId = shops[0].id;
-    const { source, rows } = require(file);
-    const { rows: already } = await client.query(
-      `SELECT 1 FROM imported_sales WHERE source = $1 LIMIT 1`, [source]
-    );
-    if (already.length) return;
-
-    const col = { sku: [], name: [], fabric: [], color: [], size: [], on: [], units: [], value: [], cash: [], card: [] };
-    for (const [sku, name, fabric, color, size, on, units, value, cash, card] of rows) {
-      col.sku.push(sku.toUpperCase());
-      col.name.push(name);
-      col.fabric.push(fabric);
-      col.color.push(color);
-      col.size.push(size);
-      col.on.push(on);
-      col.units.push(units);
-      col.value.push(value);
-      col.cash.push(cash);
-      col.card.push(card);
-    }
-    await client.query('BEGIN');
-    await client.query(
-      `INSERT INTO imported_sales (shop_id, source, sku, name, fabric, color, size, sold_on, units, value, cash, card)
-       SELECT $1, $2, UNNEST($3::text[]), UNNEST($4::text[]), UNNEST($5::text[]),
-              UNNEST($6::text[]), UNNEST($7::text[]), UNNEST($8::date[]), UNNEST($9::int[]),
-              UNNEST($10::numeric[]), UNNEST($11::numeric[]), UNNEST($12::numeric[])`,
-      [shopId, source, col.sku, col.name, col.fabric, col.color, col.size, col.on,
-       col.units, col.value, col.cash, col.card]
-    );
-    await client.query('COMMIT');
-    logger.warn('ledger.seed.done', {
-      source,
-      shop,
-      lines: rows.length,
-      pieces: col.units.reduce((n, q) => n + q, 0),
-    });
-  } catch (err) {
-    try { await client.query('ROLLBACK'); } catch {}
-    logger.error('ledger.seed.error', { err: err.message, shop });
-  } finally {
-    client.release();
   }
 }
 
@@ -3694,15 +3527,6 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
     // whole catalogue.
     const LIMIT = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 200);
 
-    // The rankings, and only the rankings, also count the shop's own sales
-    // book from before the app — two years of real transactions that would
-    // otherwise be invisible here. Everything else on this page stays on the
-    // movements alone: what the app watched happen is a different claim from
-    // what the shop wrote down, and mixing them into a day's takings or a
-    // person's commission would be the wrong kind of helpful.
-    const ledger = await ledgerFilter(req, all.length + 1);
-    const rankParams = [...all, ...ledger.params];
-
     // Order matters: the queries below are destructured by position.
     const [sellers, trend, dow, shelf] = await Promise.all([
       // Ranked by units and by value, because the fastest-moving garment and
@@ -3710,35 +3534,18 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
       // is taken from the shelf when it is still stocked, and from the book
       // only for codes the shop no longer carries.
       pool.query(
-        `WITH counted AS (
-           SELECT si.sku AS sku, si.name AS name, si.fabric AS fabric, si.color AS color,
-                  1 AS shelf,
-                  ${NET_UNITS_SQL} AS units,
-                  ${NET_UNITS_SQL} * ${SALE_NET_SQL} AS revenue
-             FROM stock_movements m
-             JOIN stock_items si ON si.id = m.item_id
-             JOIN shops sh ON sh.id = m.shop_id
-            WHERE ${windowSql} AND COALESCE(si.sku,'') <> ''
-           UNION ALL
-           SELECT UPPER(i.sku), i.name, i.fabric, i.color, 0,
-                  i.units, i.value
-             FROM imported_sales i
-             JOIN shops sh ON sh.id = i.shop_id
-            WHERE sh.business_id = $1${ledger.where}
-         )
-         SELECT sku,
-                COALESCE(MIN(name) FILTER (WHERE shelf = 1), MIN(name)) AS name,
-                -- The shelf first, the book second, and whichever of the two
-                -- actually knows the fabric before either of their blanks.
-                COALESCE(NULLIF(MIN(fabric) FILTER (WHERE shelf = 1), ''),
-                         NULLIF(MIN(fabric) FILTER (WHERE shelf = 0), ''), '') AS fabric,
-                COALESCE(MIN(color) FILTER (WHERE shelf = 1), MIN(color)) AS color,
-                COALESCE(SUM(units),0)::int AS units,
-                COALESCE(SUM(revenue),0)::numeric AS revenue
-           FROM counted
-          GROUP BY sku HAVING SUM(units) <> 0
+        `SELECT si.sku AS sku, MIN(si.name) AS name,
+                COALESCE(MIN(NULLIF(si.fabric,'')),'') AS fabric,
+                MIN(si.color) AS color,
+                COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units,
+                COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_NET_SQL}),0)::numeric AS revenue
+           FROM stock_movements m
+           JOIN stock_items si ON si.id = m.item_id
+           JOIN shops sh ON sh.id = m.shop_id
+          WHERE ${windowSql} AND COALESCE(si.sku,'') <> ''
+          GROUP BY si.sku HAVING SUM(${NET_UNITS_SQL}) <> 0
           ORDER BY units DESC`,
-        rankParams
+        all
       ),
       pool.query(
         `SELECT to_char(date_trunc('month', m.occurred_at), 'YYYY-MM') AS month,
@@ -3832,17 +3639,12 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
         (a.daysSinceSold === null ? neverSold : a.daysSinceSold));
 
     // Which years there is anything to show, so the screen can offer them
-    // rather than guess. Both books, because the picker drives the rankings.
+    // rather than guess.
     const { rows: yearRows } = await pool.query(
-      `SELECT DISTINCT y FROM (
-         SELECT EXTRACT(YEAR FROM ${LOCAL_AT_SQL})::int AS y
-           FROM stock_movements m JOIN shops sh ON sh.id = m.shop_id
-          WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}
-         UNION ALL
-         SELECT EXTRACT(YEAR FROM i.sold_on)::int
-           FROM imported_sales i JOIN shops sh ON sh.id = i.shop_id
-          WHERE sh.business_id = $1
-       ) x ORDER BY y DESC`,
+      `SELECT DISTINCT EXTRACT(YEAR FROM ${LOCAL_AT_SQL})::int AS y
+         FROM stock_movements m JOIN shops sh ON sh.id = m.shop_id
+        WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}
+        ORDER BY y DESC`,
       [req.user.businessId]
     );
 
