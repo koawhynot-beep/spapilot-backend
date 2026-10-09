@@ -140,14 +140,16 @@ check('and it is capped, so a typo cannot ask for the whole catalogue',
 check('best and worst both use it',
   /bestByUnits: ranked\.slice\(0, LIMIT\)/.test(pep) && /slice\(-LIMIT\)/.test(pep), 'a list ignores it');
 check('the old separate patterns endpoint is gone', !src.includes("'/api/sales/patterns'"), 'still there');
-// The four queries are destructured by position. The weekday query sits
-// third in the array, so it must be third in the names — getting this wrong
-// once put 8,140 stock rows on screen as "weekday.undefined".
+// The queries are destructured by position. The weekday query sits third in
+// the array, so it must be third in the names — getting this wrong once put
+// 8,140 stock rows on screen as "weekday.undefined". The per-year split sits
+// between the weekdays and the shelf.
 const arr = pep.slice(pep.indexOf('await Promise.all(['), pep.indexOf(']);', pep.indexOf('await Promise.all([')));
-const order = ['SELECT si.sku AS sku, MIN(si.name)', "to_char(date_trunc('month'", 'EXTRACT(ISODOW', 'si.last_sold_at, si.created_at']
+const order = ['SELECT si.sku AS sku, MIN(si.name)', "to_char(date_trunc('month'", 'EXTRACT(ISODOW',
+               'GROUP BY 1, 2 HAVING', 'si.last_sold_at, si.created_at']
   .map(k => arr.indexOf(k));
-check('the queries run in the order the names expect: sellers, trend, weekdays, shelf',
-  /const \[sellers, trend, dow, shelf\] = await Promise\.all/.test(pep)
+check('the queries run in the order the names expect: sellers, trend, weekdays, per-year, shelf',
+  /const \[sellers, trend, dow, perYear, shelf\] = await Promise\.all/.test(pep)
   && order.every((v, i) => v >= 0 && (i === 0 || v > order[i - 1])),
   `positions ${order.join(',')}`);
 // Every one of them reads the movements and nothing else. Sales imported

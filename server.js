@@ -1203,7 +1203,26 @@ app.get('/api/shops/:shopId/stock', auth, scopedShop, async (req, res) => {
     const orderBy = ORDERS[req.query.sort] || ORDERS['fabric-color'];
     sql += ` ORDER BY ${orderBy} LIMIT 5000`;
     const { rows } = await pool.query(sql, params);
-    res.json(rows.map(formatStock));
+
+    // What each of them has sold, year by year. One query for the whole
+    // list rather than one per row: the shop carries a couple of thousand
+    // garments and the screen asks for all of them at once.
+    const { rows: years } = await pool.query(
+      `SELECT m.item_id,
+              EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $2))::int AS year,
+              COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units
+         FROM stock_movements m
+        WHERE m.shop_id = $1 AND ${SALE_TYPES_SQL}
+        GROUP BY 1, 2 HAVING SUM(${NET_UNITS_SQL}) <> 0
+        ORDER BY 2 DESC`,
+      [req.params.shopId, SHOP_TZ]
+    );
+    const byItem = new Map();
+    for (const r of years) {
+      if (!byItem.has(r.item_id)) byItem.set(r.item_id, []);
+      byItem.get(r.item_id).push({ year: r.year, units: r.units });
+    }
+    res.json(rows.map(r => ({ ...formatStock(r), byYear: byItem.get(r.id) || [] })));
   } catch (err) {
     logger.error('stock.list.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
@@ -1502,30 +1521,35 @@ app.get('/api/business/sku-history', auth, requireAdmin, async (req, res) => {
   }
 });
 
-// Business-wide facet values — union of distinct fabric/color/size across all shops.
-app.get('/api/business/facets', auth, requireAdmin, async (req, res) => {
+// The values the filter dropdowns offer: every distinct style, fabric,
+// colour and size, across the shops in view.
+//
+// Open to staff as well as the owner. There is nothing to protect here — a
+// list of fabric names is not a secret, and a filter bar that only works for
+// one person is a filter bar that gets reported as broken. It is still
+// scoped: a staff member sees the values in their own shop, and the owner
+// who has picked one shop sees that shop's.
+app.get('/api/business/facets', auth, async (req, res) => {
   try {
     const businessId = req.user.businessId;
     if (!businessId) return res.status(400).json({ error: 'No business associated with user' });
+    const params = [businessId];
+    let scope = '';
+    const ids = await scopeShopIds(req);
+    if (ids) {
+      params.push(ids);
+      scope = ` AND si.shop_id = ANY($${params.length}::int[])`;
+    }
+    const facet = (col) => `COALESCE(ARRAY(
+           SELECT DISTINCT ${col} FROM stock_items si JOIN shops s ON s.id = si.shop_id
+            WHERE s.business_id = $1 AND ${col} <> ''${scope} ORDER BY ${col}
+         ), '{}')`;
     const { rows } = await pool.query(
-      `SELECT
-         COALESCE(ARRAY(
-           SELECT DISTINCT fabric FROM stock_items si JOIN shops s ON s.id=si.shop_id
-           WHERE s.business_id=$1 AND fabric <> '' ORDER BY fabric
-         ), '{}') AS fabrics,
-         COALESCE(ARRAY(
-           SELECT DISTINCT color  FROM stock_items si JOIN shops s ON s.id=si.shop_id
-           WHERE s.business_id=$1 AND color  <> '' ORDER BY color
-         ), '{}') AS colors,
-         COALESCE(ARRAY(
-           SELECT DISTINCT size   FROM stock_items si JOIN shops s ON s.id=si.shop_id
-           WHERE s.business_id=$1 AND size   <> '' ORDER BY size
-         ), '{}') AS sizes,
-         COALESCE(ARRAY(
-           SELECT DISTINCT category FROM stock_items si JOIN shops s ON s.id=si.shop_id
-           WHERE s.business_id=$1 AND category <> '' ORDER BY category
-         ), '{}') AS styles`,
-      [businessId]
+      `SELECT ${facet('fabric')} AS fabrics,
+              ${facet('color')} AS colors,
+              ${facet('size')} AS sizes,
+              ${facet('category')} AS styles`,
+      params
     );
     const r = rows[0] || { fabrics: [], colors: [], sizes: [], styles: [] };
     res.json({ fabrics: r.fabrics, colors: r.colors, sizes: r.sizes, styles: r.styles });
@@ -2704,7 +2728,13 @@ async function salesFilter(req, startParamIndex, skip) {
   }
   const staffId = parseInt(req.query.staffId, 10);
   if (Number.isInteger(staffId)) where += ` AND m.staff_id = $${push(staffId)}`;
-  if (req.query.color) where += ` AND si.color ILIKE $${push(req.query.color)}`;
+  // The same four the stock list filters by, asked of the garment a sale
+  // points at. Exact rather than fuzzy: they come from the dropdowns, which
+  // are built from the values that actually exist.
+  if (req.query.color) where += ` AND si.color = $${push(req.query.color)}`;
+  if (req.query.fabric) where += ` AND si.fabric = $${push(req.query.fabric)}`;
+  if (req.query.size) where += ` AND si.size = $${push(req.query.size)}`;
+  if (req.query.style) where += ` AND si.category = $${push(req.query.style)}`;
   if (req.query.sku) where += ` AND si.sku ILIKE $${push(req.query.sku)}`;
   const q = String(req.query.q || '').trim();
   if (q) {
@@ -3528,7 +3558,7 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
     const LIMIT = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 200);
 
     // Order matters: the queries below are destructured by position.
-    const [sellers, trend, dow, shelf] = await Promise.all([
+    const [sellers, trend, dow, perYear, shelf] = await Promise.all([
       // Ranked by units and by value, because the fastest-moving garment and
       // the most profitable one are rarely the same garment. A garment's name
       // is taken from the shelf when it is still stocked, and from the book
@@ -3573,6 +3603,21 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
          GROUP BY 1 ORDER BY 1`,
         all
       ),
+      // The same ranking, split by year. Twenty-four pieces means one thing
+      // if they went in a month and another if they trickled over two years,
+      // and the lists above cannot tell those apart on their own.
+      pool.query(
+        `SELECT si.sku AS sku,
+                EXTRACT(YEAR FROM ${LOCAL_AT_SQL})::int AS year,
+                COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units
+           FROM stock_movements m
+           JOIN stock_items si ON si.id = m.item_id
+           JOIN shops sh ON sh.id = m.shop_id
+          WHERE ${windowSql} AND COALESCE(si.sku,'') <> ''
+          GROUP BY 1, 2 HAVING SUM(${NET_UNITS_SQL}) <> 0
+          ORDER BY 2 DESC`,
+        all
+      ),
       // Everything on the shelf with when it last sold. Stock that has NEVER
       // sold is the point of the dead-stock report, so a null last_sold_at
       // has to survive — hence the left join onto sales rather than an inner.
@@ -3594,9 +3639,16 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
       ),
     ]);
 
+    // Newest year first, so a row reads "24 — 18 in 2026, 6 in 2025".
+    const yearsBySku = new Map();
+    for (const r of perYear.rows) {
+      if (!yearsBySku.has(r.sku)) yearsBySku.set(r.sku, []);
+      yearsBySku.get(r.sku).push({ year: r.year, units: r.units });
+    }
     const ranked = sellers.rows.map(r => ({
       sku: r.sku, name: r.name, fabric: r.fabric || '', color: r.color || '',
       units: r.units, revenue: Number(r.revenue),
+      byYear: yearsBySku.get(r.sku) || [],
     }));
     const byRevenue = [...ranked].sort((a, b) => b.revenue - a.revenue);
 
