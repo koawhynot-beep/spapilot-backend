@@ -145,17 +145,18 @@ check('the old separate patterns endpoint is gone', !src.includes("'/api/sales/p
 // 8,140 stock rows on screen as "weekday.undefined". The per-year split sits
 // between the weekdays and the shelf.
 const arr = pep.slice(pep.indexOf('await Promise.all(['), pep.indexOf(']);', pep.indexOf('await Promise.all([')));
-const order = ['SELECT si.sku AS sku, MIN(si.name)', "to_char(date_trunc('month'", 'EXTRACT(ISODOW',
-               'GROUP BY 1, 2 HAVING', 'si.last_sold_at, si.created_at']
+const order = ['WITH counted AS (', "to_char(date_trunc('month'", 'EXTRACT(ISODOW',
+               'SELECT sku, year, SUM(units)', 'SELECT sku, shop, SUM(units)',
+               'si.last_sold_at, si.created_at']
   .map(k => arr.indexOf(k));
-check('the queries run in the order the names expect: sellers, trend, weekdays, per-year, shelf',
-  /const \[sellers, trend, dow, perYear, shelf\] = await Promise\.all/.test(pep)
+check('the queries run in the order the names expect: sellers, trend, weekdays, per-year, per-shop, shelf',
+  /const \[sellers, trend, dow, perYear, perShop, shelf\] = await Promise\.all/.test(pep)
   && order.every((v, i) => v >= 0 && (i === 0 || v > order[i - 1])),
   `positions ${order.join(',')}`);
-// Every one of them reads the movements and nothing else. Sales imported
-// from a spreadsheet were counted here once; test/no-imports keeps them out.
-check('no query on this page reads anything but what the app recorded',
-  !/imported_sales/.test(arr), 'another source is stitched into the page');
+// The three ranking queries also count the shops' own books; the trend,
+// the weekdays and the shelf do not. test/ledger holds that line.
+check('the ranking lists count the books the shops kept',
+  /FROM imported_sales/.test(arr), 'the books are not counted');
 
 console.log(failures === 0 ? '\nall checks passed' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

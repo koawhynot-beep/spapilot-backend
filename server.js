@@ -542,13 +542,39 @@ async function initDB() {
     -- from having to guard every multiplication.
     ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS discount_pct NUMERIC(5,2) DEFAULT 0;
 
-    -- There is no table here for sales imported from a spreadsheet, and
-    -- that is deliberate. Copies of the shops' own books were loaded and
-    -- taken out again three times over, each wrong in a way nobody could see
-    -- from inside the app. The owner's instruction is that none of it comes
-    -- back, so the table is dropped rather than left empty: an empty table
-    -- is an invitation, and the next person to find it would fill it.
-    DROP TABLE IF EXISTS imported_sales;
+    -- What each shop sold before the app, out of the book it kept by hand.
+    --
+    -- It is kept apart from the movements on purpose. A movement is a thing
+    -- this app watched happen; a row here is a thing the shop wrote down.
+    -- The two answer different questions, and only some screens should put
+    -- them together: the stock list, Quick check and the seller rankings do,
+    -- because the question there is "what sells". The till, the takings, the
+    -- commission and the sales log do not, because the question there is
+    -- "what did we do today", and the book cannot answer it.
+    --
+    -- A separate table is what makes that promise keepable. A marker on a
+    -- movement would have to be remembered by every query ever written.
+    CREATE TABLE IF NOT EXISTS imported_sales (
+      id SERIAL PRIMARY KEY,
+      shop_id INT NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+      source TEXT NOT NULL,
+      sku TEXT NOT NULL,
+      name TEXT DEFAULT '',
+      -- Style, fabric and colour are how a garment is identified on the
+      -- Quick check card, for the codes the shops no longer stock and so
+      -- cannot be looked up on a shelf.
+      style TEXT DEFAULT '',
+      fabric TEXT DEFAULT '',
+      color TEXT DEFAULT '',
+      size TEXT DEFAULT '',
+      sold_on DATE NOT NULL,
+      units INT NOT NULL,
+      value NUMERIC(14,2) NOT NULL DEFAULT 0,
+      -- What the book says went in the drawer and what went through the
+      -- machine. Kept so the split is not lost; no screen reads it yet.
+      cash NUMERIC(14,2) NOT NULL DEFAULT 0,
+      card NUMERIC(14,2) NOT NULL DEFAULT 0
+    );
 
     -- How much of this row was paid in cash, when the customer paid partly
     -- in cash and partly on the card. Null on every other row, including the
@@ -785,14 +811,20 @@ async function initDB() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_transfers_pending ON stock_transfers(business_id, status)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_transfer_lines ON stock_transfer_lines(transfer_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_imported_sales ON imported_sales(shop_id, sku)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_imported_sales_on ON imported_sales(sold_on)`);
 
   // Real material names in the fabric block. Runs on every boot, and only
   // touches rows that are plainly wrong, so a later import cannot re-break it.
   await backfillFabrics();
 
-  // The workbook's sales history, once loaded, is taken back out. Only the
-  // sales rung up in the app are left. The stock is not touched.
+  // The workbook's monthly summaries, once loaded, are taken back out. Only
+  // the sales rung up in the app are left. The stock is not touched.
   await removeSheetSalesHistory();
+
+  // The shops' own till books, for the three screens that ask what sells.
+  // Their own table; not stock, not takings, not anybody's sales figures.
+  await seedImportedSales();
 
 
   // Office's opening stock. Not a migration — it is data, and it runs after
@@ -1207,22 +1239,35 @@ app.get('/api/shops/:shopId/stock', auth, scopedShop, async (req, res) => {
     // What each of them has sold, year by year. One query for the whole
     // list rather than one per row: the shop carries a couple of thousand
     // garments and the screen asks for all of them at once.
+    // Both books, by code: what the app rang up here and what this shop's
+    // own ledger says it sold before that. Matched on the code rather than
+    // the row id, because the book knows codes, not rows.
     const { rows: years } = await pool.query(
-      `SELECT m.item_id,
-              EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $2))::int AS year,
-              COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units
-         FROM stock_movements m
-        WHERE m.shop_id = $1 AND ${SALE_TYPES_SQL}
-        GROUP BY 1, 2 HAVING SUM(${NET_UNITS_SQL}) <> 0
+      `SELECT sku, year, SUM(units)::int AS units FROM (
+         SELECT UPPER(si.sku) AS sku,
+                EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $2))::int AS year,
+                ${NET_UNITS_SQL} AS units
+           FROM stock_movements m
+           JOIN stock_items si ON si.id = m.item_id
+          WHERE m.shop_id = $1 AND ${SALE_TYPES_SQL}
+         UNION ALL
+         SELECT i.sku, EXTRACT(YEAR FROM i.sold_on)::int, i.units
+           FROM imported_sales i
+          WHERE i.shop_id = $1
+       ) x
+        GROUP BY 1, 2 HAVING SUM(units) <> 0
         ORDER BY 2 DESC`,
       [req.params.shopId, SHOP_TZ]
     );
-    const byItem = new Map();
+    const byCode = new Map();
     for (const r of years) {
-      if (!byItem.has(r.item_id)) byItem.set(r.item_id, []);
-      byItem.get(r.item_id).push({ year: r.year, units: r.units });
+      if (!byCode.has(r.sku)) byCode.set(r.sku, []);
+      byCode.get(r.sku).push({ year: r.year, units: r.units });
     }
-    res.json(rows.map(r => ({ ...formatStock(r), byYear: byItem.get(r.id) || [] })));
+    res.json(rows.map(r => ({
+      ...formatStock(r),
+      byYear: byCode.get(String(r.sku || '').toUpperCase()) || [],
+    })));
   } catch (err) {
     logger.error('stock.list.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
@@ -2034,6 +2079,27 @@ const GARMENT_KEY_SQL = `
        ELSE 'N|' || UPPER(REGEXP_REPLACE(COALESCE(si.name,''), ${SIZE_TAIL_SQL}, '', 'i'))
   END`;
 
+// A ledger line belongs on the same Quick check card as the garment it
+// names, and under the same code in the rankings. The shelf decides that:
+// the line is matched to a code the shops stock and takes its key. Only
+// when no shop has ever carried the code does the book describe the
+// garment itself, by the same rule the shelf uses.
+//
+// $1 must be the business id wherever these are used.
+const LEDGER_KEYS_CTE = `
+  keys AS (
+    SELECT UPPER(si.sku) AS sku, MIN(${GARMENT_KEY_SQL}) AS key
+      FROM stock_items si JOIN shops sh ON sh.id = si.shop_id
+     WHERE sh.business_id = $1 AND COALESCE(si.sku,'') <> ''
+     GROUP BY 1
+  )`;
+const LEDGER_KEY_SQL = `
+  COALESCE(k.key,
+    CASE WHEN COALESCE(i.style,'') <> '' AND COALESCE(i.color,'') <> ''
+         THEN UPPER(i.style) || '|' || UPPER(COALESCE(i.fabric,'')) || '|' || UPPER(i.color)
+         ELSE 'N|' || UPPER(COALESCE(i.name,''))
+    END)`;
+
 app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
   try {
     const businessId = req.user.businessId;
@@ -2045,7 +2111,13 @@ app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
     const thisYear = new Date().getFullYear();
     const firstYear = thisYear - (QUICK_YEARS - 1);
 
-    const [{ rows: items }, { rows: sold }] = await Promise.all([
+    // Sales are never scoped on this screen, the book's included: the stock
+    // shown is this shop's, but "what sells" is a question about the whole
+    // business, and the by-shop line below answers where.
+    const ledgerParams = [businessId, firstYear];
+
+    const [{ rows: items }, { rows: sold }, { rows: ledgerSold }, { rows: byShop }] =
+      await Promise.all([
       // Every size of every garment in scope, with its count and its codes.
       pool.query(
         `SELECT ${GARMENT_KEY_SQL} AS key,
@@ -2076,6 +2148,45 @@ app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
           GROUP BY 1, 2, 3`,
         [businessId, SHOP_TZ, firstYear]
       ),
+      // The same question asked of the shops' own books, which reach back
+      // further than the app does.
+      pool.query(
+        `WITH ${LEDGER_KEYS_CTE}
+         SELECT ${LEDGER_KEY_SQL} AS key,
+                COALESCE(i.size,'') AS size,
+                EXTRACT(YEAR FROM i.sold_on)::int AS year,
+                COALESCE(SUM(i.units),0)::int AS sold,
+                MIN(i.name) AS name, MIN(i.style) AS style,
+                MIN(i.fabric) AS fabric, MIN(i.color) AS color
+           FROM imported_sales i
+           JOIN shops sh ON sh.id = i.shop_id
+           LEFT JOIN keys k ON k.sku = i.sku
+          WHERE sh.business_id = $1 AND EXTRACT(YEAR FROM i.sold_on) >= $2
+          GROUP BY 1, 2, 3`,
+        ledgerParams
+      ),
+      // Which shop sells it. Both books at once: a garment moves wherever
+      // it was sold, app or no app.
+      pool.query(
+        `WITH ${LEDGER_KEYS_CTE}
+         SELECT key, shop, SUM(sold)::int AS sold FROM (
+           SELECT ${GARMENT_KEY_SQL} AS key, sh.name AS shop, ${NET_UNITS_SQL} AS sold
+             FROM stock_movements m
+             JOIN stock_items si ON si.id = m.item_id
+             JOIN shops sh ON sh.id = m.shop_id
+            WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}
+              AND EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $3)) >= $2
+           UNION ALL
+           SELECT ${LEDGER_KEY_SQL}, sh.name, i.units
+             FROM imported_sales i
+             JOIN shops sh ON sh.id = i.shop_id
+             LEFT JOIN keys k ON k.sku = i.sku
+            WHERE sh.business_id = $1 AND EXTRACT(YEAR FROM i.sold_on) >= $2
+         ) x
+          GROUP BY 1, 2 HAVING SUM(sold) <> 0
+          ORDER BY 3 DESC`,
+        [businessId, firstYear, SHOP_TZ]
+      ),
     ]);
 
     // Sizes in wearing order, not alphabetical.
@@ -2087,7 +2198,7 @@ app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
       if (!garments.has(r.key)) {
         garments.set(r.key, {
           key: r.key, name: r.name, style: r.style || '', fabric: r.fabric || '', color: r.color || '',
-          price: Number(r.price) || 0, sizes: [], skus: [], stock: 0, byYear: {},
+          price: Number(r.price) || 0, sizes: [], skus: [], stock: 0, byYear: {}, byShop: [],
         });
       }
       const g = garments.get(r.key);
@@ -2095,7 +2206,19 @@ app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
       g.skus.push(...r.skus);
       g.stock += r.qty;
     }
-    for (const r of sold) {
+    // A garment the shops have stopped carrying has no shelf to be read
+    // off, but the book still remembers selling it. It gets a card of its
+    // own, at zero stock, described by the book.
+    for (const r of ledgerSold) {
+      if (garments.has(r.key)) continue;
+      garments.set(r.key, {
+        key: r.key, name: r.name || '', style: r.style || '',
+        fabric: r.fabric || '', color: r.color || '', price: 0,
+        sizes: [], skus: [], stock: 0, byYear: {}, byShop: [],
+      });
+    }
+
+    for (const r of [...sold, ...ledgerSold]) {
       const g = garments.get(r.key);
       if (!g) continue;
       g.byYear[r.year] = (g.byYear[r.year] || 0) + r.sold;
@@ -2104,6 +2227,11 @@ app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
       let z = g.sizes.find(x => x.size === r.size);
       if (!z) { z = { size: r.size, qty: 0, sold: 0 }; g.sizes.push(z); }
       z.sold += r.sold;
+    }
+
+    for (const r of byShop) {
+      const g = garments.get(r.key);
+      if (g) g.byShop.push({ shop: r.shop, sold: r.sold });
     }
 
     const years = [];
@@ -2711,6 +2839,46 @@ const PERIOD_PARTS = [
   ['day',   (v) => v >= 1 && v <= 31,      `EXTRACT(DAY FROM ${LOCAL_AT_SQL})`],
 ];
 
+// The same questions asked of the book, whose rows carry their own date,
+// code and colour rather than a movement's. Only the filters it can answer
+// honestly are applied: a ledger line records no salesperson, so asking for
+// one person's sales drops the book entirely rather than pretending.
+const LEDGER_PARTS = [
+  ['year',  (v) => v >= 2000 && v <= 2100, `EXTRACT(YEAR FROM i.sold_on)`],
+  ['month', (v) => v >= 1 && v <= 12,      `EXTRACT(MONTH FROM i.sold_on)`],
+  ['week',  (v) => v >= 1 && v <= 5,       `LEAST(5, FLOOR((EXTRACT(DAY FROM i.sold_on) - 1) / 7) + 1)::int`],
+  ['day',   (v) => v >= 1 && v <= 31,      `EXTRACT(DAY FROM i.sold_on)`],
+];
+
+async function ledgerFilter(req, startParamIndex) {
+  const params = [];
+  let where = '';
+  const push = (v) => { params.push(v); return startParamIndex + params.length - 1; };
+
+  if (Number.isInteger(parseInt(req.query.staffId, 10))) return { where: ' AND FALSE', params };
+
+  const shopIds = await scopeShopIds(req);
+  if (shopIds) where += ` AND i.shop_id = ANY($${push(shopIds)}::int[])`;
+  if (req.query.from) where += ` AND i.sold_on >= $${push(new Date(req.query.from))}`;
+  if (req.query.to) where += ` AND i.sold_on <= $${push(new Date(req.query.to))}`;
+  if (req.query.color) where += ` AND i.color = $${push(req.query.color)}`;
+  if (req.query.fabric) where += ` AND i.fabric = $${push(req.query.fabric)}`;
+  if (req.query.size) where += ` AND i.size = $${push(req.query.size)}`;
+  if (req.query.style) where += ` AND i.style = $${push(req.query.style)}`;
+  if (req.query.sku) where += ` AND i.sku ILIKE $${push(req.query.sku)}`;
+  const q = String(req.query.q || '').trim();
+  if (q) {
+    const n = push('%' + q + '%');
+    where += ` AND (i.sku ILIKE $${n} OR i.name ILIKE $${n} OR i.color ILIKE $${n})`;
+  }
+  for (const [name, valid, expr] of LEDGER_PARTS) {
+    const n = parseInt(req.query[name], 10);
+    if (!Number.isInteger(n) || !valid(n)) continue;
+    where += ` AND ${expr} = $${push(n)}`;
+  }
+  return { where, params };
+}
+
 async function salesFilter(req, startParamIndex, skip) {
   const params = [];
   let where = '';
@@ -2865,6 +3033,91 @@ async function removeSheetSalesHistory() {
     if (rowCount) logger.warn('sales.sheet.removed', { entries: rowCount });
   } catch (err) {
     logger.error('sales.sheet.remove.error', { err: err.message });
+  }
+}
+
+// The shops' own sales books. Each is loaded once, under its own name,
+// into the shop whose book it is. Replacing one means pointing it at a
+// newer file: the rows carry a new source name, the copy they supersede is
+// swept out first, and nothing else has to be remembered.
+const IMPORTED_BOOKS = [
+  { shop: 'GD', file: './goldust-history.js' },
+  { shop: 'RG', file: './rosegold-history.js' },
+  // Atriq's book starts in June 2026, when the shop opened.
+  { shop: 'AT', file: './atriq-history.js' },
+];
+
+async function seedImportedSales() {
+  // The table holds exactly the books in the list above and nothing else.
+  // Two copies of one book would double every figure that reads it.
+  try {
+    const wanted = IMPORTED_BOOKS.map(b => require(b.file).source);
+    const { rowCount } = await pool.query(
+      `DELETE FROM imported_sales WHERE source <> ALL($1::text[])`, [wanted]
+    );
+    if (rowCount) logger.warn('ledger.superseded', { removed: rowCount, keeping: wanted });
+  } catch (err) {
+    logger.error('ledger.sweep.error', { err: err.message });
+    return;     // Better no load at all than a second copy on top of the first.
+  }
+  for (const book of IMPORTED_BOOKS) {
+    await seedOneBook(book);
+  }
+}
+
+async function seedOneBook({ shop, file }) {
+  const client = await pool.connect();
+  try {
+    const { rows: shops } = await client.query(
+      `SELECT id FROM shops WHERE code = $1 LIMIT 1`, [shop]
+    );
+    if (!shops.length) {
+      logger.warn('ledger.seed.skipped', { why: 'that shop does not exist yet', shop });
+      return;
+    }
+    const shopId = shops[0].id;
+    const { source, rows } = require(file);
+    const { rows: already } = await client.query(
+      `SELECT 1 FROM imported_sales WHERE source = $1 LIMIT 1`, [source]
+    );
+    if (already.length) return;
+
+    const col = { sku: [], name: [], style: [], fabric: [], color: [], size: [],
+                  on: [], units: [], value: [], cash: [], card: [] };
+    for (const [sku, name, style, fabric, color, size, on, units, value, cash, card] of rows) {
+      col.sku.push(sku.toUpperCase());
+      col.name.push(name);
+      col.style.push(style);
+      col.fabric.push(fabric);
+      col.color.push(color);
+      col.size.push(size);
+      col.on.push(on);
+      col.units.push(units);
+      col.value.push(value);
+      col.cash.push(cash);
+      col.card.push(card);
+    }
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO imported_sales
+         (shop_id, source, sku, name, style, fabric, color, size, sold_on, units, value, cash, card)
+       SELECT $1, $2, UNNEST($3::text[]), UNNEST($4::text[]), UNNEST($5::text[]),
+              UNNEST($6::text[]), UNNEST($7::text[]), UNNEST($8::text[]),
+              UNNEST($9::date[]), UNNEST($10::int[]),
+              UNNEST($11::numeric[]), UNNEST($12::numeric[]), UNNEST($13::numeric[])`,
+      [shopId, source, col.sku, col.name, col.style, col.fabric, col.color, col.size,
+       col.on, col.units, col.value, col.cash, col.card]
+    );
+    await client.query('COMMIT');
+    logger.warn('ledger.seed.done', {
+      source, shop, lines: rows.length,
+      pieces: col.units.reduce((n, q) => n + q, 0),
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    logger.error('ledger.seed.error', { err: err.message, shop });
+  } finally {
+    client.release();
   }
 }
 
@@ -3557,25 +3810,51 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
     // whole catalogue.
     const LIMIT = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 200);
 
+    // The books the shops kept by hand reach back further than the app, so
+    // the three ranking lists count them too. The rest of this page does
+    // not: a day's trade and a weekday average are claims about what the
+    // app watched, and the book cannot support them.
+    //
+    // $1 is the business id in all three, which is what the ledger's own
+    // filter and key lookup assume.
+    const ledger = await ledgerFilter(req, all.length + 1);
+    const rankParams = [...all, ...ledger.params];
+
     // Order matters: the queries below are destructured by position.
-    const [sellers, trend, dow, perYear, shelf] = await Promise.all([
+    const [sellers, trend, dow, perYear, perShop, shelf] = await Promise.all([
       // Ranked by units and by value, because the fastest-moving garment and
       // the most profitable one are rarely the same garment. A garment's name
       // is taken from the shelf when it is still stocked, and from the book
       // only for codes the shop no longer carries.
       pool.query(
-        `SELECT si.sku AS sku, MIN(si.name) AS name,
-                COALESCE(MIN(NULLIF(si.fabric,'')),'') AS fabric,
-                MIN(si.color) AS color,
-                COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units,
-                COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_NET_SQL}),0)::numeric AS revenue
-           FROM stock_movements m
-           JOIN stock_items si ON si.id = m.item_id
-           JOIN shops sh ON sh.id = m.shop_id
-          WHERE ${windowSql} AND COALESCE(si.sku,'') <> ''
-          GROUP BY si.sku HAVING SUM(${NET_UNITS_SQL}) <> 0
+        `WITH counted AS (
+           SELECT si.sku AS sku, si.name AS name, si.fabric AS fabric, si.color AS color,
+                  1 AS shelf,
+                  ${NET_UNITS_SQL} AS units,
+                  ${NET_UNITS_SQL} * ${SALE_NET_SQL} AS revenue
+             FROM stock_movements m
+             JOIN stock_items si ON si.id = m.item_id
+             JOIN shops sh ON sh.id = m.shop_id
+            WHERE ${windowSql} AND COALESCE(si.sku,'') <> ''
+           UNION ALL
+           SELECT i.sku, i.name, i.fabric, i.color, 0, i.units, i.value
+             FROM imported_sales i
+             JOIN shops sh ON sh.id = i.shop_id
+            WHERE sh.business_id = $1${ledger.where}
+         )
+         SELECT sku,
+                COALESCE(MIN(name) FILTER (WHERE shelf = 1), MIN(name)) AS name,
+                -- The shelf first, the book second, and whichever of them
+                -- actually knows the fabric before either of their blanks.
+                COALESCE(NULLIF(MIN(fabric) FILTER (WHERE shelf = 1), ''),
+                         NULLIF(MIN(fabric) FILTER (WHERE shelf = 0), ''), '') AS fabric,
+                COALESCE(MIN(color) FILTER (WHERE shelf = 1), MIN(color)) AS color,
+                COALESCE(SUM(units),0)::int AS units,
+                COALESCE(SUM(revenue),0)::numeric AS revenue
+           FROM counted
+          GROUP BY sku HAVING SUM(units) <> 0
           ORDER BY units DESC`,
-        all
+        rankParams
       ),
       pool.query(
         `SELECT to_char(date_trunc('month', m.occurred_at), 'YYYY-MM') AS month,
@@ -3607,16 +3886,42 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
       // if they went in a month and another if they trickled over two years,
       // and the lists above cannot tell those apart on their own.
       pool.query(
-        `SELECT si.sku AS sku,
-                EXTRACT(YEAR FROM ${LOCAL_AT_SQL})::int AS year,
-                COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units
-           FROM stock_movements m
-           JOIN stock_items si ON si.id = m.item_id
-           JOIN shops sh ON sh.id = m.shop_id
-          WHERE ${windowSql} AND COALESCE(si.sku,'') <> ''
-          GROUP BY 1, 2 HAVING SUM(${NET_UNITS_SQL}) <> 0
+        `SELECT sku, year, SUM(units)::int AS units FROM (
+           SELECT si.sku AS sku,
+                  EXTRACT(YEAR FROM ${LOCAL_AT_SQL})::int AS year,
+                  ${NET_UNITS_SQL} AS units
+             FROM stock_movements m
+             JOIN stock_items si ON si.id = m.item_id
+             JOIN shops sh ON sh.id = m.shop_id
+            WHERE ${windowSql} AND COALESCE(si.sku,'') <> ''
+           UNION ALL
+           SELECT i.sku, EXTRACT(YEAR FROM i.sold_on)::int, i.units
+             FROM imported_sales i
+             JOIN shops sh ON sh.id = i.shop_id
+            WHERE sh.business_id = $1${ledger.where}
+         ) x
+          GROUP BY 1, 2 HAVING SUM(units) <> 0
           ORDER BY 2 DESC`,
-        all
+        rankParams
+      ),
+      // And which shop sold them, so a garment that only moves in one place
+      // can be seen to.
+      pool.query(
+        `SELECT sku, shop, SUM(units)::int AS units FROM (
+           SELECT si.sku AS sku, sh.name AS shop, ${NET_UNITS_SQL} AS units
+             FROM stock_movements m
+             JOIN stock_items si ON si.id = m.item_id
+             JOIN shops sh ON sh.id = m.shop_id
+            WHERE ${windowSql} AND COALESCE(si.sku,'') <> ''
+           UNION ALL
+           SELECT i.sku, sh.name, i.units
+             FROM imported_sales i
+             JOIN shops sh ON sh.id = i.shop_id
+            WHERE sh.business_id = $1${ledger.where}
+         ) x
+          GROUP BY 1, 2 HAVING SUM(units) <> 0
+          ORDER BY 3 DESC`,
+        rankParams
       ),
       // Everything on the shelf with when it last sold. Stock that has NEVER
       // sold is the point of the dead-stock report, so a null last_sold_at
@@ -3645,10 +3950,16 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
       if (!yearsBySku.has(r.sku)) yearsBySku.set(r.sku, []);
       yearsBySku.get(r.sku).push({ year: r.year, units: r.units });
     }
+    const shopsBySku = new Map();
+    for (const r of perShop.rows) {
+      if (!shopsBySku.has(r.sku)) shopsBySku.set(r.sku, []);
+      shopsBySku.get(r.sku).push({ shop: r.shop, sold: r.units });
+    }
     const ranked = sellers.rows.map(r => ({
       sku: r.sku, name: r.name, fabric: r.fabric || '', color: r.color || '',
       units: r.units, revenue: Number(r.revenue),
       byYear: yearsBySku.get(r.sku) || [],
+      byShop: shopsBySku.get(r.sku) || [],
     }));
     const byRevenue = [...ranked].sort((a, b) => b.revenue - a.revenue);
 
@@ -3693,10 +4004,15 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
     // Which years there is anything to show, so the screen can offer them
     // rather than guess.
     const { rows: yearRows } = await pool.query(
-      `SELECT DISTINCT EXTRACT(YEAR FROM ${LOCAL_AT_SQL})::int AS y
-         FROM stock_movements m JOIN shops sh ON sh.id = m.shop_id
-        WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}
-        ORDER BY y DESC`,
+      `SELECT DISTINCT y FROM (
+         SELECT EXTRACT(YEAR FROM ${LOCAL_AT_SQL})::int AS y
+           FROM stock_movements m JOIN shops sh ON sh.id = m.shop_id
+          WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}
+         UNION ALL
+         SELECT EXTRACT(YEAR FROM i.sold_on)::int
+           FROM imported_sales i JOIN shops sh ON sh.id = i.shop_id
+          WHERE sh.business_id = $1
+       ) x ORDER BY y DESC`,
       [req.user.businessId]
     );
 

@@ -23,6 +23,12 @@ await db.exec(`
     qty_change INT, qty_after INT DEFAULT 0, occurred_at TIMESTAMPTZ,
     unit_price NUMERIC(14,2), discount_pct NUMERIC(5,2) DEFAULT 0, note TEXT DEFAULT ''
   );
+  CREATE TABLE imported_sales (
+    id SERIAL PRIMARY KEY, shop_id INT NOT NULL, source TEXT NOT NULL, sku TEXT NOT NULL,
+    name TEXT DEFAULT '', style TEXT DEFAULT '', fabric TEXT DEFAULT '', color TEXT DEFAULT '',
+    size TEXT DEFAULT '', sold_on DATE NOT NULL, units INT NOT NULL,
+    value NUMERIC(14,2) DEFAULT 0, cash NUMERIC(14,2) DEFAULT 0, card NUMERIC(14,2) DEFAULT 0
+  );
   INSERT INTO shops (business_id, name, code) VALUES (1,'Goldust','GD'), (1,'Rose Gold','RG');
   INSERT INTO stock_items (shop_id, name, category, fabric, color, size, sku, qty, price) VALUES
     (1,'WHITE PANT LINEN BABY BLUE S/M','WHITE PANT','LINEN','BABY BLUE','S/M','WP-1001', 2, 900000),
@@ -59,12 +65,18 @@ const SALE_TYPES_SQL = value('const SALE_TYPES_SQL =', ';');
 const NET_UNITS_SQL = value('const NET_UNITS_SQL =', ';');
 const SHOP_TZ = /const SHOP_TZ = process\.env\.SHOP_TZ \|\| '([^']+)'/.exec(src)[1];
 
-const consts = grab('const QUICK_YEARS =', ';') + '\n' + grab('const SIZE_TAIL_SQL =', ';') + '\n' + grab('const GARMENT_KEY_SQL =', '`;');
+const consts = [
+  grab('const QUICK_YEARS =', ';'),
+  grab('const SIZE_TAIL_SQL =', ';'),
+  grab('const GARMENT_KEY_SQL =', '`;'),
+  grab('const LEDGER_KEYS_CTE =', '`;'),
+  grab('const LEDGER_KEY_SQL =', '`;'),
+].join('\n');
 const body = grab("app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {", '\n});');
 const make = (ids) => new Function('pool', 'logger', 'scopeShopIds', 'NET_UNITS_SQL', 'SALE_TYPES_SQL', 'SHOP_TZ', `
   ${consts}
   return ${body.replace(/^app\.get\([^,]+,\s*auth,\s*requireAdmin,\s*/, '(')}
-`)({ query: (t, p) => db.query(t, p) }, { error: (k, v) => console.log(k, v) }, async () => ids, NET_UNITS_SQL, SALE_TYPES_SQL, SHOP_TZ);
+`)({ query: (t, p) => db.query(t, p) }, { error: (k, v) => console.log(k, v, v && v.err) }, async () => ids, NET_UNITS_SQL, SALE_TYPES_SQL, SHOP_TZ);
 const call = (ids) => new Promise((resolve) => {
   const res = { status(c) { this.code = c; return this; }, json(v) { resolve({ code: this.code || 200, ...v }); } };
   make(ids)({ query: {}, user: { businessId: 1 } }, res);
@@ -114,6 +126,42 @@ check('it is admin-only',
 check('the sales query is NOT scoped by shop', !/stockScope/.test(body.slice(body.indexOf('What each garment sold'))), 'sales are scoped');
 check('fabric first, then style, then colour — the way she reads the rail',
   /localeCompare\(b\.fabric/.test(body) && /a\.style\.localeCompare\(b\.style\)/.test(body), 'a different order');
+
+// ── The shop's own book ──────────────────────────────────────────────────
+// Sales from before the app, read onto the same cards. A line is matched to
+// the garment by its code; a code no shop carries any more describes itself.
+console.log('\n  the books the shops kept by hand');
+await db.query(`INSERT INTO imported_sales (shop_id, source, sku, name, style, fabric, color, size, sold_on, units, value) VALUES
+  (1,'book','WP-1001','WHITE PANT LINEN BABY BLUE S/M','WHITE PANT','LINEN','BABY BLUE','S/M','2025-04-02', 7, 6300000),
+  (2,'book','WP-1001','WHITE PANT LINEN BABY BLUE S/M','WHITE PANT','LINEN','BABY BLUE','S/M','2025-04-03', 2, 1800000),
+  (1,'book','GONE-1','OLD KAFTAN RAMIE RUSH O/S','OLD KAFTAN','RAMIE','RUSH','O/S','2025-05-05', 4, 2000000)`);
+
+const withBook = await call(null);
+const bb2 = withBook.garments.find(g => g.skus.includes('WP-1001'));
+check('the book is counted on the garment it names: 7 rung up + 9 in the book',
+  bb2.total === 7 + 9, `${bb2.total}`);
+check('and under the right size — both book lines are S/M',
+  bb2.sizes.find(z => z.size === 'S/M').sold === 5 + 9, JSON.stringify(bb2.sizes));
+check('and in the year the book says, not the year it was loaded: 3 + 9',
+  bb2.byYear[withBook.years.indexOf(2025)] === 12, JSON.stringify(bb2.byYear));
+const gone = withBook.garments.find(g => (g.style || '') === 'OLD KAFTAN');
+check('a code no shop stocks any more still gets a card of its own',
+  Boolean(gone) && gone.total === 4, gone ? String(gone.total) : 'missing');
+check('it is on the shelf at zero, because it is not on any shelf',
+  Boolean(gone) && gone.stock === 0, gone ? String(gone.stock) : '-');
+
+console.log('\n  where it sold');
+const shops = Object.fromEntries((bb2.byShop || []).map(r => [r.shop, r.sold]));
+check('each shop is named with what it sold, both books together',
+  shops.Goldust === 3 + 7 && shops['Rose Gold'] === 4 + 2, JSON.stringify(bb2.byShop));
+check('the shops add up to the garment total',
+  (bb2.byShop || []).reduce((n, r) => n + r.sold, 0) === bb2.total, JSON.stringify(bb2.byShop));
+
+console.log('\n  one shop on its own');
+const gdOnly = await call([1]);
+const bbGD = gdOnly.garments.find(g => g.skus.includes('WP-1001'));
+check('the book follows the movements: sales are every shop\'s, stock is this one\'s',
+  bbGD.total === 16 && bbGD.sizes[0].qty === 2, `${bbGD.total} sold, ${bbGD.sizes[0].qty} on the rail`);
 
 console.log(failures === 0 ? '\nall checks passed' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);
