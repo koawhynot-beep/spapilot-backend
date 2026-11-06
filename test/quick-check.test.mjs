@@ -128,7 +128,9 @@ console.log('\n  what the endpoint enforces');
 check('it is admin-only',
   /app\.get\('\/api\/quick-check', auth, requireAdmin, async/.test(src), 'staff can reach it');
 check('the sales query is scoped by shop, like everything else here',
-  /soldScope/.test(body.slice(body.indexOf('What each garment sold'))), 'sales ignore the tab');
+  /stock_movements[\s\S]*?\$\{soldScope\}/.test(body), 'sales ignore the tab');
+check('and the book is scoped with it',
+  /imported_sales[\s\S]*?\$\{bookScope\}/.test(body), 'the book ignores the tab');
 check('fabric first, then style, then colour — the way she reads the rail',
   /localeCompare\(b\.fabric/.test(body) && /a\.style\.localeCompare\(b\.style\)/.test(body), 'a different order');
 

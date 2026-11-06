@@ -2148,9 +2148,6 @@ app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
   try {
     const businessId = req.user.businessId;
     const ids = await scopeShopIds(req);
-    const stockParams = [businessId];
-    let stockScope = '';
-    if (ids) { stockParams.push(ids); stockScope = ` AND si.shop_id = ANY($${stockParams.length}::int[])`; }
 
     const thisYear = new Date().getFullYear();
     const firstYear = thisYear - (QUICK_YEARS - 1);
@@ -2159,36 +2156,34 @@ app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
     // stock and sales alike. Rose Gold's sales on a card you opened from the
     // Goldust tab are not an extra detail, they are the wrong answer; the
     // All shops tab is where the three are put side by side.
+    const stockScope = ids ? ` AND si.shop_id = ANY($2::int[])` : '';
+    const stockParams = ids ? [businessId, ids] : [businessId];
     const soldScope = ids ? ` AND m.shop_id = ANY($4::int[])` : '';
-    const bookScope = ids ? ` AND i.shop_id = ANY($3::int[])` : '';
     const soldParams = ids ? [businessId, SHOP_TZ, firstYear, ids] : [businessId, SHOP_TZ, firstYear];
-    const byShopScope = ids ? ` AND m.shop_id = ANY($4::int[])` : '';
-    const byShopBookScope = ids ? ` AND i.shop_id = ANY($4::int[])` : '';
-    const byShopParams = ids ? [businessId, firstYear, SHOP_TZ, ids] : [businessId, firstYear, SHOP_TZ];
+    const bookScope = ids ? ` AND i.shop_id = ANY($3::int[])` : '';
     const ledgerParams = ids ? [businessId, firstYear, ids] : [businessId, firstYear];
 
-    const [{ rows: items }, { rows: sold }, { rows: ledgerSold }, { rows: byShop },
-           { rows: shelves }, { rows: shopRows }] =
+    // Three questions, each asked per shop, because the card is now read
+    // shop by shop: what is on this shop's rail, what this shop rang up,
+    // and what this shop's own book says it sold before the app existed.
+    const [{ rows: items }, { rows: sold }, { rows: ledgerSold }, { rows: shopRows }] =
       await Promise.all([
-      // Every size of every garment in scope, with its count and its codes.
       pool.query(
-        `SELECT ${GARMENT_KEY_SQL} AS key,
+        `SELECT ${GARMENT_KEY_SQL} AS key, sh.name AS shop,
+                COALESCE(si.size,'') AS size,
                 MIN(si.name) AS name, MIN(si.category) AS style,
                 MIN(COALESCE(si.fabric,'')) AS fabric, MIN(COALESCE(si.color,'')) AS color,
                 MAX(si.price) AS price,
-                COALESCE(si.size,'') AS size,
                 SUM(si.qty)::int AS qty,
                 ARRAY_AGG(DISTINCT si.sku) FILTER (WHERE COALESCE(si.sku,'') <> '') AS skus
            FROM stock_items si
            JOIN shops sh ON sh.id = si.shop_id
           WHERE sh.business_id = $1${stockScope}
-          GROUP BY 1, 7`,
+          GROUP BY ${GARMENT_KEY_SQL}, sh.name, COALESCE(si.size,'')`,
         stockParams
       ),
-      // What each garment sold in each year, every shop — per size, so the
-      // card can say which size actually moved, not just that the garment did.
       pool.query(
-        `SELECT ${GARMENT_KEY_SQL} AS key,
+        `SELECT ${GARMENT_KEY_SQL} AS key, sh.name AS shop,
                 COALESCE(si.size,'') AS size,
                 EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $2))::int AS year,
                 COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS sold
@@ -2197,14 +2192,13 @@ app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
            JOIN shops sh ON sh.id = m.shop_id
           WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}
             AND EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $2)) >= $3${soldScope}
-          GROUP BY 1, 2, 3`,
+          GROUP BY ${GARMENT_KEY_SQL}, sh.name, COALESCE(si.size,''),
+                   EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $2))`,
         soldParams
       ),
-      // The same question asked of the shops' own books, which reach back
-      // further than the app does.
       pool.query(
         `WITH ${LEDGER_KEYS_CTE}
-         SELECT ${LEDGER_KEY_SQL} AS key,
+         SELECT ${LEDGER_KEY_SQL} AS key, sh.name AS shop,
                 COALESCE(i.size,'') AS size,
                 EXTRACT(YEAR FROM i.sold_on)::int AS year,
                 COALESCE(SUM(i.units),0)::int AS sold,
@@ -2214,41 +2208,9 @@ app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
            JOIN shops sh ON sh.id = i.shop_id
            LEFT JOIN keys k ON k.sku = i.sku
           WHERE sh.business_id = $1 AND EXTRACT(YEAR FROM i.sold_on) >= $2${bookScope}
-          GROUP BY 1, 2, 3`,
+          GROUP BY ${LEDGER_KEY_SQL}, sh.name, COALESCE(i.size,''),
+                   EXTRACT(YEAR FROM i.sold_on)`,
         ledgerParams
-      ),
-      // Which shop sells it. Both books at once: a garment moves wherever
-      // it was sold, app or no app.
-      pool.query(
-        `WITH ${LEDGER_KEYS_CTE}
-         SELECT key, shop, SUM(sold)::int AS sold FROM (
-           SELECT ${GARMENT_KEY_SQL} AS key, sh.name AS shop, ${NET_UNITS_SQL} AS sold
-             FROM stock_movements m
-             JOIN stock_items si ON si.id = m.item_id
-             JOIN shops sh ON sh.id = m.shop_id
-            WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}
-              AND EXTRACT(YEAR FROM (m.occurred_at AT TIME ZONE $3)) >= $2${byShopScope}
-           UNION ALL
-           SELECT ${LEDGER_KEY_SQL}, sh.name, i.units
-             FROM imported_sales i
-             JOIN shops sh ON sh.id = i.shop_id
-             LEFT JOIN keys k ON k.sku = i.sku
-            WHERE sh.business_id = $1 AND EXTRACT(YEAR FROM i.sold_on) >= $2${byShopBookScope}
-         ) x
-          GROUP BY 1, 2
-          ORDER BY 3 DESC`,
-        byShopParams
-      ),
-      // Where it is right now, shop by shop. Deliberately not scoped: the
-      // question this answers is "we are out — has anyone else got one?",
-      // and scoping it to the shop you are standing in answers nothing.
-      pool.query(
-        `SELECT ${GARMENT_KEY_SQL} AS key, sh.name AS shop, SUM(si.qty)::int AS qty
-           FROM stock_items si
-           JOIN shops sh ON sh.id = si.shop_id
-          WHERE sh.business_id = $1${stockScope}
-          GROUP BY 1, 2`,
-        stockParams
       ),
       pool.query(
         `SELECT name FROM shops WHERE business_id = $1${ids ? ' AND id = ANY($2::int[])' : ''} ORDER BY name`,
@@ -2261,73 +2223,89 @@ app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
     const ORDER = ['X/S', 'XS', 'S', 'S/M', 'M', 'M/L', 'L', 'L/XL', 'X/L', 'XL', 'XXL', 'O/S'];
     const rank = (sz) => { const i = ORDER.indexOf(String(sz).toUpperCase()); return i < 0 ? 99 : i; };
 
-    const garments = new Map();
-    for (const r of items) {
-      if (!garments.has(r.key)) {
-        garments.set(r.key, {
-          key: r.key, name: r.name, style: r.style || '', fabric: r.fabric || '', color: r.color || '',
-          price: Number(r.price) || 0, sizes: [], skus: [], stock: 0, byYear: {}, byShop: [], soldAt: {}, heldAt: {},
-        });
-      }
-      const g = garments.get(r.key);
-      g.sizes.push({ size: r.size, qty: r.qty, sold: 0 });
-      // A garment with no code yet contributes no code to the card.
-      g.skus.push(...(r.skus || []));
-      g.stock += r.qty;
-    }
-    // A garment the shops have stopped carrying has no shelf to be read
-    // off, but the book still remembers selling it. It gets a card of its
-    // own, at zero stock, described by the book.
-    for (const r of ledgerSold) {
-      if (garments.has(r.key)) continue;
-      garments.set(r.key, {
-        key: r.key, name: r.name || '', style: r.style || '',
-        fabric: r.fabric || '', color: r.color || '', price: 0,
-        sizes: [], skus: [], stock: 0, byYear: {}, byShop: [], soldAt: {}, heldAt: {},
-      });
-    }
-
-    for (const r of [...sold, ...ledgerSold]) {
-      const g = garments.get(r.key);
-      if (!g) continue;
-      g.byYear[r.year] = (g.byYear[r.year] || 0) + r.sold;
-      // A size that has sold out everywhere and been taken off the list
-      // still sold — it gets a cell of its own, at zero on the rail.
-      let z = g.sizes.find(x => x.size === r.size);
-      if (!z) { z = { size: r.size, qty: 0, sold: 0 }; g.sizes.push(z); }
-      z.sold += r.sold;
-    }
-
-    for (const r of byShop) {
-      const g = garments.get(r.key);
-      if (g) g.soldAt[r.shop] = (g.soldAt[r.shop] || 0) + r.sold;
-    }
-
-    for (const r of shelves) {
-      const g = garments.get(r.key);
-      if (g) g.heldAt[r.shop] = (g.heldAt[r.shop] || 0) + r.qty;
-    }
-
     const years = [];
     for (let y = firstYear; y <= thisYear; y++) years.push(y);
 
-    // A shop with none of it, and a shop that has never sold it, are both
-     // answers — so every shop is listed every time, at zero if that is what
-     // it is. A gap in the row would read as "not asked" rather than "none".
-    const everyShop = (at) => shopNames.map(name => [name, at[name] || 0]);
+    const garments = new Map();
+    const blank = (key, from) => ({
+      key, name: from.name || '', style: from.style || '', fabric: from.fabric || '',
+      color: from.color || '', price: Number(from.price) || 0,
+      skus: [], shops: new Map(),
+    });
+    // Every shop named on every card, whether or not it has the garment: a
+    // shop missing from the card reads as "not asked", and "Rose Gold, none"
+    // is the answer someone at the counter is waiting for.
+    const shopOf = (g, name) => {
+      if (!g.shops.has(name)) g.shops.set(name, { shop: name, sizes: new Map(), byYear: {} });
+      return g.shops.get(name);
+    };
+    const sizeOf = (shop, size) => {
+      if (!shop.sizes.has(size)) shop.sizes.set(size, { size, qty: 0, sold: 0 });
+      return shop.sizes.get(size);
+    };
+
+    for (const r of items) {
+      if (!garments.has(r.key)) garments.set(r.key, blank(r.key, r));
+      const g = garments.get(r.key);
+      // A garment with no code yet contributes no code to the card.
+      g.skus.push(...(r.skus || []));
+      if (!g.price) g.price = Number(r.price) || 0;
+      sizeOf(shopOf(g, r.shop), r.size).qty += r.qty;
+    }
+
+    // A garment the shops have stopped carrying has no shelf to be read
+    // off, but the book still remembers selling it. It gets a card of its
+    // own, at zero stock, described by the book.
+    for (const r of [...sold, ...ledgerSold]) {
+      if (!garments.has(r.key)) garments.set(r.key, blank(r.key, r));
+      const g = garments.get(r.key);
+      const shop = shopOf(g, r.shop);
+      shop.byYear[r.year] = (shop.byYear[r.year] || 0) + r.sold;
+      // A size that has sold out everywhere and been taken off the list
+      // still sold — it gets a cell of its own, at zero on the rail.
+      sizeOf(shop, r.size).sold += r.sold;
+    }
+
+    const sortSizes = (a, b) => rank(a.size) - rank(b.size) || a.size.localeCompare(b.size);
 
     res.json({
       years,
       shops: shopNames,
-      garments: [...garments.values()].map(({ soldAt, heldAt, ...g }) => ({
-        ...g,
-        inShops: everyShop(heldAt).map(([shop, qty]) => ({ shop, qty })),
-        byShop: everyShop(soldAt).map(([shop, sold]) => ({ shop, sold })),
-        sizes: g.sizes.sort((a, b) => rank(a.size) - rank(b.size) || a.size.localeCompare(b.size)),
-        skus: [...new Set(g.skus)].sort(),
-        byYear: years.map(y => g.byYear[y] || 0),
-        total: years.reduce((n, y) => n + (g.byYear[y] || 0), 0),
-      })).sort((a, b) =>
+      garments: [...garments.values()].map(g => {
+        const perShop = shopNames.map(name => {
+          const held = g.shops.get(name) || { sizes: new Map(), byYear: {} };
+          const sizes = [...held.sizes.values()].sort(sortSizes);
+          return {
+            shop: name,
+            sizes,
+            byYear: years.map(y => held.byYear[y] || 0),
+            stock: sizes.reduce((n, z) => n + z.qty, 0),
+            sold: sizes.reduce((n, z) => n + z.sold, 0),
+          };
+        });
+        // The card's own totals, and the flat rows the older screens read.
+        const sizes = [];
+        for (const line of perShop) {
+          for (const z of line.sizes) {
+            let into = sizes.find(x => x.size === z.size);
+            if (!into) { into = { size: z.size, qty: 0, sold: 0 }; sizes.push(into); }
+            into.qty += z.qty;
+            into.sold += z.sold;
+          }
+        }
+        return {
+          key: g.key, name: g.name, style: g.style, fabric: g.fabric, color: g.color,
+          price: g.price,
+          skus: [...new Set(g.skus)].sort(),
+          sizes: sizes.sort(sortSizes),
+          perShop,
+          inShops: perShop.map(x => ({ shop: x.shop, qty: x.stock })),
+          byShop: perShop.map(x => ({ shop: x.shop, sold: x.sold })),
+          byYear: years.map((_, i) => perShop.reduce((n, x) => n + x.byYear[i], 0)),
+          stock: perShop.reduce((n, x) => n + x.stock, 0),
+          total: perShop.reduce((n, x) => n + x.sold, 0),
+        };
+      }).sort((a, b) =>
         (a.fabric || '\uffff').localeCompare(b.fabric || '\uffff')
         || a.style.localeCompare(b.style)
         || a.color.localeCompare(b.color)),
