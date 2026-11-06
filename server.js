@@ -582,6 +582,13 @@ async function initDB() {
     -- a number repeated in two places is a number that can disagree with
     -- itself. The card part is never stored — it is the rest of the row.
     ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS cash_amount NUMERIC(14,2);
+
+    -- Which machine took the card. Three banks' terminals sit on the
+    -- counter and the owner reconciles each one separately, so "card" on
+    -- its own leaves her adding up statements by hand. Empty on a cash sale
+    -- and on every card sale rung up before this column existed — there is
+    -- no honest way to guess which one it went through.
+    ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS bank TEXT DEFAULT '';
   `);
 
   // Reclassify transfers logged before the type split. They were written as
@@ -814,6 +821,7 @@ async function initDB() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_transfers_pending ON stock_transfers(business_id, status)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_transfer_lines ON stock_transfer_lines(transfer_id)`);
+  await pool.query(`ALTER TABLE imported_sales ADD COLUMN IF NOT EXISTS bank TEXT DEFAULT ''`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_imported_sales ON imported_sales(shop_id, sku)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_imported_sales_on ON imported_sales(sold_on)`);
 
@@ -1870,6 +1878,18 @@ const cleanDiscount = (v) => {
   return Math.min(100, Math.max(0, Math.round(n)));
 };
 
+// The machines on the counter. A closed set, for the same reason the
+// payment methods are one: each of these settles into its own statement and
+// is reconciled separately, and free text would give you "bca", "BCA " and
+// "B C A" as three banks to reconcile by the end of the month. A new
+// terminal on the counter means a new line here.
+const BANKS = ['BNI', 'BCA', 'PAYPAL'];
+const cleanBank = (v) => {
+  if (typeof v !== 'string') return '';
+  const t = v.trim().toUpperCase();
+  return BANKS.includes(t) ? t : '';
+};
+
 // An amount of money coming in from a screen. Whole rupiah, never negative:
 // the smallest note anyone here handles is larger than one, and a negative
 // cash part would take money out of the drawer on a sale.
@@ -1918,6 +1938,9 @@ app.post('/api/shops/:shopId/scan', auth, scopedShop, async (req, res) => {
       return res.status(400).json({ error: 'A part-cash sale needs the cash amount' });
     }
     const cashRemaining = cleanMoney(req.body.cashRemaining);
+    // Only a card has a bank behind it. A cash sale that carried one would
+    // put money in a statement that never saw it.
+    const bank = (payment === 'card' || payment === 'split') ? cleanBank(req.body.bank) : '';
     const note = String(req.body.note || '').trim().slice(0, 500);
     if (!code && !Number.isInteger(itemId)) {
       return res.status(400).json({ error: 'No item or barcode provided' });
@@ -1973,12 +1996,12 @@ app.post('/api/shops/:shopId/scan', auth, scopedShop, async (req, res) => {
       : null;
     await client.query(
       `INSERT INTO stock_movements
-         (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note, reason, staff_id, staff_name, payment, discount_pct, cash_amount)
-       VALUES ($1,$2,$3,$4,$5,$6,NOW(),$7,$8,$9,$10,$11,$12,$13)`,
+         (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note, reason, staff_id, staff_name, payment, discount_pct, cash_amount, bank)
+       VALUES ($1,$2,$3,$4,$5,$6,NOW(),$7,$8,$9,$10,$11,$12,$13,$14)`,
       [
         item.id, item.shop_id, req.user.id, type, change, newQty,
         note || (Number.isInteger(itemId) ? 'manual' : 'barcode'),
-        reason, staff.id, staff.name, payment, discountPct, cashAmount,
+        reason, staff.id, staff.name, payment, discountPct, cashAmount, bank,
       ]
     );
     await client.query('COMMIT');
@@ -2717,7 +2740,7 @@ const SALE_SELECT = `
          si.fabric, ${SALE_PRICE_SQL} AS price, ${SALE_NET_SQL} AS net_price,
          COALESCE(m.discount_pct, 0) AS discount_pct, COALESCE(si.cost,0) AS cost,
          m.unit_price AS unit_price, m.item_id, m.qty_change AS raw_qty_change,
-         COALESCE(m.payment,'') AS payment, m.cash_amount,
+         COALESCE(m.payment,'') AS payment, m.cash_amount, COALESCE(m.bank,'') AS bank,
          m.shop_id, sh.name AS shop_name, FALSE AS from_book
   FROM stock_movements m
   JOIN stock_items si ON si.id = m.item_id
@@ -2747,6 +2770,7 @@ const LEDGER_SELECT = `
               WHEN i.card > 0 THEN 'card'
               ELSE '' END AS payment,
          CASE WHEN i.cash > 0 AND i.card > 0 THEN i.cash ELSE NULL::numeric END AS cash_amount,
+         COALESCE(i.bank,'') AS bank,
          i.shop_id, sh.name AS shop_name, TRUE AS from_book
   FROM imported_sales i
   JOIN shops sh ON sh.id = i.shop_id
@@ -2811,6 +2835,7 @@ const shapeSale = (r) => {
     // Only a part-cash row has one. Null everywhere else, so a screen that
     // reads it cannot mistake "paid entirely in cash" for "nothing in cash".
     cashAmount: r.cash_amount === null || r.cash_amount === undefined ? null : Number(r.cash_amount),
+    bank: r.bank || '',
     shopId: r.shop_id,
     shopName: r.shop_name || '',
   };
@@ -3045,13 +3070,27 @@ app.get('/api/sales/history', auth, async (req, res) => {
        FROM ${both}`,
       bothParams
     );
+    // The card half, per bank. Card sales nobody named a bank on are
+    // gathered under one unnamed row rather than hidden, so the banks and
+    // that row always come to the card total beside them.
+    const { rows: banks } = await pool.query(
+      `SELECT COALESCE(NULLIF(s.bank,''), '') AS bank,
+              COALESCE(SUM(${ROW_CARD_SQL}),0)::numeric AS amount
+         FROM ${both}
+        GROUP BY 1 HAVING COALESCE(SUM(${ROW_CARD_SQL}),0) <> 0
+        ORDER BY 2 DESC`,
+      bothParams
+    );
     res.json({
       total: agg[0].n, limit, offset, windowMonths: HISTORY_MONTHS,
       totals: {
         units: agg[0].units, revenue: Number(agg[0].revenue),
         // What of it came in each way, so a day on screen can be counted
-        // against the drawer without exporting it first.
+        // against the drawer without exporting it first — and, for the card
+        // half, which machine it went through, because each bank settles
+        // separately and is reconciled against its own statement.
         cash: Number(agg[0].cash), card: Number(agg[0].card),
+        byBank: banks.map(b => ({ bank: b.bank, amount: Number(b.amount) })),
       },
       items: rows.map(shapeSale),
     });
@@ -3176,8 +3215,8 @@ async function seedOneBook({ shop, file }) {
     if (already.length) return;
 
     const col = { sku: [], name: [], style: [], fabric: [], color: [], size: [],
-                  on: [], units: [], value: [], cash: [], card: [] };
-    for (const [sku, name, style, fabric, color, size, on, units, value, cash, card] of rows) {
+                  on: [], units: [], value: [], cash: [], card: [], bank: [] };
+    for (const [sku, name, style, fabric, color, size, on, units, value, cash, card, bank] of rows) {
       col.sku.push(sku.toUpperCase());
       col.name.push(name);
       col.style.push(style);
@@ -3189,17 +3228,19 @@ async function seedOneBook({ shop, file }) {
       col.value.push(value);
       col.cash.push(cash);
       col.card.push(card);
+      col.bank.push(bank || '');
     }
     await client.query('BEGIN');
     await client.query(
       `INSERT INTO imported_sales
-         (shop_id, source, sku, name, style, fabric, color, size, sold_on, units, value, cash, card)
+         (shop_id, source, sku, name, style, fabric, color, size, sold_on, units, value, cash, card, bank)
        SELECT $1, $2, UNNEST($3::text[]), UNNEST($4::text[]), UNNEST($5::text[]),
               UNNEST($6::text[]), UNNEST($7::text[]), UNNEST($8::text[]),
               UNNEST($9::date[]), UNNEST($10::int[]),
-              UNNEST($11::numeric[]), UNNEST($12::numeric[]), UNNEST($13::numeric[])`,
+              UNNEST($11::numeric[]), UNNEST($12::numeric[]), UNNEST($13::numeric[]),
+              UNNEST($14::text[])`,
       [shopId, source, col.sku, col.name, col.style, col.fabric, col.color, col.size,
-       col.on, col.units, col.value, col.cash, col.card]
+       col.on, col.units, col.value, col.cash, col.card, col.bank]
     );
     await client.query('COMMIT');
     logger.warn('ledger.seed.done', {
@@ -3339,6 +3380,8 @@ const saleEditSchema = z.object({
   payment: z.string().trim().max(20).optional(),
   // The cash half of a part-cash sale. Ignored unless the method is 'split'.
   cashAmount: z.coerce.number().min(0).max(1e12).optional(),
+  // Which bank's machine. Ignored unless a card was involved.
+  bank: z.string().trim().max(20).optional(),
   discountPct: z.coerce.number().min(0).max(100).optional(),
 });
 
@@ -3481,15 +3524,19 @@ app.patch('/api/sales/:id', auth, validate(saleEditSchema), async (req, res) => 
                 discountPct, newQtyChange)
     );
 
+    const bank = (payment === 'card' || payment === 'split')
+      ? (req.body.bank === undefined ? (move.bank || '') : cleanBank(req.body.bank))
+      : '';
+
     const { rows: saved } = await client.query(
       `UPDATE stock_movements
           SET item_id = $1, qty_change = $2, qty_after = $3, unit_price = $4,
               note = $5, occurred_at = $6, payment = $7, discount_pct = $8,
-              cash_amount = $9
-        WHERE id = $10
+              cash_amount = $9, bank = $10
+        WHERE id = $11
         RETURNING id`,
       [newItemId, newQtyChange, qtyAfter, unitPrice, note, occurredAt, payment, discountPct,
-       cashAmount, saleId]
+       cashAmount, bank, saleId]
     );
     await client.query('COMMIT');
 
@@ -3888,7 +3935,7 @@ app.get('/api/sales/history.csv', auth, requireAdmin, async (req, res) => {
     const body = csvDoc(
       ['Date', 'Time', 'Shop', 'Type', 'SKU', 'Item', 'Colour', 'Size', 'Units',
        'Price (IDR)', 'Discount %', 'Charged (IDR)', 'Value (IDR)', 'Staff', 'Paid by',
-       'In cash (IDR)', 'On card (IDR)', 'Reason', 'Source'],
+       'In cash (IDR)', 'On card (IDR)', 'Bank', 'Reason', 'Source'],
       rows.map(shapeSale).map(r => {
         const d = new Date(r.occurredAt);
         // Whoever reconciles the till adds these two columns up, so they are
@@ -3897,7 +3944,7 @@ app.get('/api/sales/history.csv', auth, requireAdmin, async (req, res) => {
         return [d.toISOString().slice(0, 10), d.toISOString().slice(11, 19), r.shopName,
                 r.type, r.sku, r.itemName, r.color, r.size, r.units,
                 r.price, r.discountPct, r.netPrice, r.value,
-                r.staffName, r.payment, cash, r.value - cash, r.reason,
+                r.staffName, r.payment, cash, r.value - cash, r.bank, r.reason,
                 r.fromBook ? 'shop book' : 'app'];
       })
     );

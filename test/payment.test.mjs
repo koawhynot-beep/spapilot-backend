@@ -102,7 +102,7 @@ check('the sale query selects it', /COALESCE\(m\.payment,''\) AS payment/.test(s
 check('the shape the screens read exposes it', /payment: r\.payment \|\| '',/.test(src), 'not in shapeSale');
 check('the CSV has a column for it', /'Paid by'/.test(src), 'not in the CSV header');
 check('the CSV writes the value',
-  /r\.staffName, r\.payment, cash, r\.value - cash, r\.reason/.test(src), 'not in the CSV row');
+  /r\.staffName, r\.payment, cash, r\.value - cash, r\.bank, r\.reason/.test(src), 'not in the CSV row');
 check('with a column each for the drawer and the machine',
   /'In cash \(IDR\)', 'On card \(IDR\)'/.test(src),
   'the CSV cannot be reconciled against a till');
@@ -249,6 +249,20 @@ check('the log totals report cash and card, not just revenue',
 check('and the card half is the rest of the row, never stored twice',
   /WHEN 'split' THEN \$\{ROW_VALUE_SQL} - \$\{ROW_CASH_SQL}/.test(src),
   'the two halves can drift apart');
+
+console.log('\n  which machine took the card');
+const cleanBank = new Function(`${grab('const BANKS =', '\n};')} return cleanBank;`)();
+check('the three machines on the counter are accepted',
+  ['BNI', 'BCA', 'PAYPAL'].every(b => cleanBank(b) === b), 'a machine is rejected');
+check('case and padding are normalised', cleanBank('  bca ') === 'BCA', cleanBank('  bca '));
+check('anything else is not a bank', cleanBank('Mandiri') === '', cleanBank('Mandiri'));
+check('an object cannot be smuggled in', cleanBank({ toString: () => 'BNI' }) === '', 'an object was accepted');
+check('only a card has a machine behind it',
+  /const bank = \(payment === 'card' \|\| payment === 'split'\) \? cleanBank/.test(src),
+  'a cash sale could carry a bank');
+check('the card total is broken down by machine',
+  /COALESCE\(NULLIF\(s\.bank,''\), ''\) AS bank/.test(src)
+  && /byBank: banks\.map/.test(src), 'the statements still have to be matched by hand');
 
 console.log(failures === 0 ? '\nall checks passed' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

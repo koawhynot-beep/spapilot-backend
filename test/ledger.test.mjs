@@ -40,7 +40,8 @@ await db.exec(`
     source TEXT NOT NULL, sku TEXT NOT NULL, name TEXT DEFAULT '', style TEXT DEFAULT '',
     fabric TEXT DEFAULT '', color TEXT DEFAULT '', size TEXT DEFAULT '',
     sold_on DATE NOT NULL, units INT NOT NULL, value NUMERIC(14,2) NOT NULL DEFAULT 0,
-    cash NUMERIC(14,2) NOT NULL DEFAULT 0, card NUMERIC(14,2) NOT NULL DEFAULT 0
+    cash NUMERIC(14,2) NOT NULL DEFAULT 0, card NUMERIC(14,2) NOT NULL DEFAULT 0,
+    bank TEXT DEFAULT ''
   );
   INSERT INTO shops (business_id, name, code) VALUES (1,'Goldust','GD'), (1,'Atriq','AT');
 `);
@@ -76,8 +77,8 @@ check('the book is named', typeof book.source === 'string' && book.source.length
 const FIXTURE = {
   source: 'test book',
   rows: [
-    ['ni-1005', 'NICOL DRESS BLACK', 'NICOL DRESS', 'RAYON KRINKLE', 'BLACK', 'O/S', '2025-03-04', 3, 2400000, 2400000, 0],
-    ['GI-2009', 'GIPSY DRESS', 'GIPSY DRESS', 'RAYON LINEN', 'OFF WHITE', 'O/S', '2026-02-10', 1, 1200000, 0, 1200000],
+    ['ni-1005', 'NICOL DRESS BLACK', 'NICOL DRESS', 'RAYON KRINKLE', 'BLACK', 'O/S', '2025-03-04', 3, 2400000, 2400000, 0, ''],
+    ['GI-2009', 'GIPSY DRESS', 'GIPSY DRESS', 'RAYON LINEN', 'OFF WHITE', 'O/S', '2026-02-10', 1, 1200000, 0, 1200000, 'BCA'],
   ],
 };
 const logs = [];
@@ -122,6 +123,7 @@ check('and it says what it removed',
 console.log('\n  where the book may be read, and where it may not');
 const BLOCKS = {
   'the table itself': grab("    -- What each shop sold before the app", 'card NUMERIC(14,2) NOT NULL DEFAULT 0\n    );'),
+  'its bank column': grab('  await pool.query(`ALTER TABLE imported_sales ', ';'),
   'its indexes': grab('  await pool.query(`CREATE INDEX IF NOT EXISTS idx_imported_sales ', 'idx_imported_sales_on ON imported_sales(sold_on)`);'),
   'the loader': grab("// The shops' own sales books. Each is loaded once", '\n}'),
   'the clean slate': grab('async function startFresh() {', '\n}'),
