@@ -3181,6 +3181,7 @@ async function removeSheetSalesHistory() {
 // swapping one in or out.
 const IMPORTED_BOOKS = [
   { shop: 'GD', file: './goldust-history.js' },
+  { shop: 'RG', file: './rosegold-history.js' },
 ];
 
 async function seedImportedSales() {

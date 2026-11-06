@@ -52,31 +52,39 @@ console.log('\nReal Postgres · the shops\' own sales books\n');
 // ── The books that ship ──────────────────────────────────────────────────
 // eslint-disable-next-line no-eval
 const BOOKS = eval(grab('const IMPORTED_BOOKS = [', '];').slice('const IMPORTED_BOOKS = '.length));
-console.log('  the book as it ships');
-check('one book is listed, and it names a shop and a file',
-  BOOKS.length === 1 && /^[A-Z]{2}$/.test(BOOKS[0].shop) && BOOKS[0].file.startsWith('./'),
+console.log('  the books as they ship');
+check('every book names a shop and a file',
+  BOOKS.length >= 1 && BOOKS.every(x => /^[A-Z]{2}$/.test(x.shop) && x.file.startsWith('./')),
   JSON.stringify(BOOKS));
+check('no shop is listed twice', new Set(BOOKS.map(x => x.shop)).size === BOOKS.length,
+  BOOKS.map(x => x.shop).join(','));
 
-const book = (await import(new URL('../' + BOOKS[0].file.replace('./', ''), import.meta.url))).default;
-const pieces = book.rows.reduce((n, r) => n + r[7], 0);
-const value = book.rows.reduce((n, r) => n + r[8], 0);
-console.log(`  ${BOOKS[0].shop}: ${book.rows.length} lines · ${pieces} pieces · ${value.toLocaleString('en-US')} IDR`);
-check('every line has a code, a day and at least one piece',
-  book.rows.every(r => r[0] && /^\d{4}-\d{2}-\d{2}$/.test(r[6]) && r[7] > 0), 'a malformed line');
-check('no line is worth less than nothing', book.rows.every(r => r[8] >= 0), 'a negative sale');
-check('cash and card never come to more than the line',
-  book.rows.every(r => r[9] + r[10] <= r[8]), 'a line claims more money than it took');
-check('alterations are not in it — they sell no garment',
-  !book.rows.some(r => r[0] === 'AL-2001'), 'the sewing service is counted as stock sold');
-const described = book.rows.filter(r => r[2] || r[3]).length;
-check(`the garments are described — ${Math.round((described / book.rows.length) * 100)}% carry a style or fabric`,
-  described / book.rows.length > 0.8, `only ${described} of ${book.rows.length}`);
-check('the book is named', typeof book.source === 'string' && book.source.length > 0, 'no source');
-// The name ends in a fingerprint of the lines, so a file that changes is a
-// book the loader has not seen and therefore reloads. Without it, adding a
-// column to the data file left the loaded copy silently one version behind.
-check('and its name follows its contents, so a changed file is reloaded',
-  / · [0-9a-f]{8}$/.test(book.source), book.source);
+const seen = new Set();
+for (const entry of BOOKS) {
+  const book = (await import(new URL('../' + entry.file.replace('./', ''), import.meta.url))).default;
+  const rows = book.rows;
+  const pieces = rows.reduce((n, r) => n + r[7], 0);
+  const value = rows.reduce((n, r) => n + r[8], 0);
+  console.log(`  ${entry.shop}: ${rows.length} lines · ${pieces} pieces · ${value.toLocaleString('en-US')} IDR`);
+  check(`${entry.shop}: every line has a code, a day and at least one piece`,
+    rows.every(r => r[0] && /^\d{4}-\d{2}-\d{2}$/.test(r[6]) && r[7] > 0), 'a malformed line');
+  check(`${entry.shop}: no line is worth less than nothing`, rows.every(r => r[8] >= 0), 'a negative sale');
+  check(`${entry.shop}: cash and card never come to more than the line`,
+    rows.every(r => r[9] + r[10] <= r[8]), 'a line claims more money than it took');
+  check(`${entry.shop}: a bank is named only where a card was used`,
+    rows.every(r => (r[11] ? r[10] > 0 : true)), 'a cash line names a machine');
+  check(`${entry.shop}: alterations are not in it — they sell no garment`,
+    !rows.some(r => r[0] === 'AL-2001'), 'the sewing service is counted as stock sold');
+  const described = rows.filter(r => r[2] || r[3]).length;
+  check(`${entry.shop}: the garments are described — ${Math.round((described / rows.length) * 100)}% carry a style or fabric`,
+    described / rows.length > 0.8, `only ${described} of ${rows.length}`);
+  // The name ends in a fingerprint of the lines, so a file that changes is a
+  // book the loader has not seen and therefore reloads. Without it, adding a
+  // column to the data file left the loaded copy silently one version behind.
+  check(`${entry.shop}: its name follows its contents, and is its own`,
+    / · [0-9a-f]{8}$/.test(book.source) && !seen.has(book.source), book.source);
+  seen.add(book.source);
+}
 
 // ── The loader ───────────────────────────────────────────────────────────
 const FIXTURE = {

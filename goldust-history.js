@@ -1,13 +1,13 @@
 // ═══════════════════════════════════════════════════════════
-// GOLD DUST'S OWN SALES LEDGER  ·  2025 and 2026
+// GOLD DUST'S OWN SALES LEDGER
 // ═══════════════════════════════════════════════════════════
 // Every sale the shop wrote in its book, from 2025-01-01 to 2026-11-05:
 // 10267 lines, 10496 pieces, 8,010,715,000 rupiah.
 //
-// Read out of the master workbook's "sales ug" sheet, which is the running
-// log the counter keeps: one line per garment, with the day it went, the
-// price actually charged and how it was paid. The garment's style, fabric
-// and colour come from the workbook's own ALL STOCK catalogue.
+// Read out of the master workbook's "sales ug" sheet, which is the running log
+// the counter keeps: one line per garment, with the day it went, the price
+// actually charged and which machine took the card. The garment's style,
+// fabric and colour come from the workbook's own ALL STOCK catalogue.
 //
 // What is NOT in it, because none of it is a garment being sold:
 //   · ALTERATION (AL-2001) — a sewing service, no stock moves;
@@ -20,9 +20,13 @@
 // nowhere that reports what happened today or what anyone is owed: it moves
 // no stock, rings no till and earns no commission.
 //
+// The source name ends in a fingerprint of the lines below. Change the file
+// and the name changes, so the server treats it as a book it has not seen
+// and loads it in place of the copy it supersedes.
+//
 // rows: [sku, name, style, fabric, colour, size, date, units, value, cash, card, bank]
 module.exports = {
-  source: "gold dust ledger to 5 Nov 2026 \u00b7 c7133951",
+  source: "gold dust ledger to 2026-11-05 \u00b7 c7133951",
   rows: [
     ["BA-2001", "BAG OVALE GOLDUST LARGE", "BAG OVALE GOLDUST", "", "LARGE", "", "2025-01-01", 1, 350000, 0, 350000, "BNI"],
     ["BO-1001", "BOOBTUBE PITA NATURAL O/S", "BOOBTUBE PITA", "RAMIE", "NATURAL", "O/S", "2025-01-01", 1, 295000, 0, 295000, "BNI"],
