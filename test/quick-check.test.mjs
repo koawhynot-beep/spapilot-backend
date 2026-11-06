@@ -118,12 +118,17 @@ console.log('\n  one shop on screen');
 const gd = await call([1]);
 const bb1 = gd.garments.find(g => g.color === 'BABY BLUE');
 check('stock is that shop’s: S/M 2, not 5', bb1.sizes[0].qty === 2, String(bb1.sizes[0].qty));
-check('but sales are still every shop’s: 2026 = 4 was Rose Gold’s sale', y(bb1, 2026) === 4, String(y(bb1, 2026)));
+// The tab you are standing on is the question being asked. Rose Gold's
+// sale has no business appearing on a card opened from the Goldust tab.
+check('and so are the sales: 2026 = 0, that four was Rose Gold’s',
+  y(bb1, 2026) === 0, String(y(bb1, 2026)));
+check('the shops named are the shops in scope', gd.shops.join(',') === 'Goldust', gd.shops.join(','));
 
 console.log('\n  what the endpoint enforces');
 check('it is admin-only',
   /app\.get\('\/api\/quick-check', auth, requireAdmin, async/.test(src), 'staff can reach it');
-check('the sales query is NOT scoped by shop', !/stockScope/.test(body.slice(body.indexOf('What each garment sold'))), 'sales are scoped');
+check('the sales query is scoped by shop, like everything else here',
+  /soldScope/.test(body.slice(body.indexOf('What each garment sold'))), 'sales ignore the tab');
 check('fabric first, then style, then colour — the way she reads the rail',
   /localeCompare\(b\.fabric/.test(body) && /a\.style\.localeCompare\(b\.style\)/.test(body), 'a different order');
 
@@ -160,8 +165,17 @@ check('the shops add up to the garment total',
 console.log('\n  one shop on its own');
 const gdOnly = await call([1]);
 const bbGD = gdOnly.garments.find(g => g.skus.includes('WP-1001'));
-check('the book follows the movements: sales are every shop\'s, stock is this one\'s',
-  bbGD.total === 16 && bbGD.sizes[0].qty === 2, `${bbGD.total} sold, ${bbGD.sizes[0].qty} on the rail`);
+check('the book follows the movements: both are this shop\'s alone',
+  bbGD.total === 3 + 7 && bbGD.sizes[0].qty === 2, `${bbGD.total} sold, ${bbGD.sizes[0].qty} on the rail`);
+
+console.log('\n  which shop has one');
+const held = Object.fromEntries((bb2.inShops || []).map(r => [r.shop, r.qty]));
+check('every shop is named with what it holds',
+  Object.keys(held).length === 2, JSON.stringify(bb2.inShops));
+check('a shop with none of it says zero rather than going missing',
+  (bb2.inShops || []).every(r => typeof r.qty === 'number'), JSON.stringify(bb2.inShops));
+check('and the shops add up to the stock on the card',
+  (bb2.inShops || []).reduce((n, r) => n + r.qty, 0) === bb2.stock, JSON.stringify(bb2.inShops));
 
 console.log(failures === 0 ? '\nall checks passed' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);
