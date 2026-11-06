@@ -34,7 +34,7 @@ await db.exec(`
   CREATE TABLE stock_movements (id SERIAL PRIMARY KEY, item_id INT, shop_id INT, type TEXT, qty_change INT);
   CREATE TABLE item_groups (id SERIAL PRIMARY KEY, shop_id INT, name TEXT);
   CREATE TABLE imported_sales (id SERIAL PRIMARY KEY, shop_id INT, source TEXT, sku TEXT,
-    sold_on DATE, units INT);
+    sold_on DATE, units INT, staff TEXT DEFAULT '');
   CREATE TABLE stock_check_marks (id SERIAL PRIMARY KEY, shop_id INT, item_id INT);
   CREATE TABLE stock_check_rounds (id SERIAL PRIMARY KEY, shop_id INT, started_at TIMESTAMPTZ DEFAULT NOW());
   CREATE TABLE stock_transfers (id SERIAL PRIMARY KEY, business_id INT, status TEXT);

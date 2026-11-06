@@ -41,7 +41,7 @@ await db.exec(`
     fabric TEXT DEFAULT '', color TEXT DEFAULT '', size TEXT DEFAULT '',
     sold_on DATE NOT NULL, units INT NOT NULL, value NUMERIC(14,2) NOT NULL DEFAULT 0,
     cash NUMERIC(14,2) NOT NULL DEFAULT 0, card NUMERIC(14,2) NOT NULL DEFAULT 0,
-    bank TEXT DEFAULT ''
+    bank TEXT DEFAULT '', staff TEXT DEFAULT ''
   );
   INSERT INTO shops (business_id, name, code) VALUES (1,'Goldust','GD'), (1,'Atriq','AT');
 `);
@@ -137,6 +137,7 @@ console.log('\n  where the book may be read, and where it may not');
 const BLOCKS = {
   'the table itself': grab("    -- What each shop sold before the app", 'card NUMERIC(14,2) NOT NULL DEFAULT 0\n    );'),
   'its bank column': grab('  await pool.query(`ALTER TABLE imported_sales ', ';'),
+  'its staff column': grab('  // The books name the assistant who served', ';'),
   'its indexes': grab('  await pool.query(`CREATE INDEX IF NOT EXISTS idx_imported_sales ', 'idx_imported_sales_on ON imported_sales(sold_on)`);'),
   'the loader': grab("// The shops' own sales books. Each is loaded once", '\n}'),
   'the clean slate': grab('async function startFresh() {', '\n}'),
@@ -183,8 +184,15 @@ check('the till roll counts only what the app rang up',
 check('and so does the commission',
   !/imported_sales|LEDGER_SELECT/.test(grab('const COMMISSION_SQL = `', '`;')),
   'somebody would be paid commission on the book');
-check('the book records no salesperson, so it can never be credited to one',
-  /''::text AS staff_name, NULL::int AS staff_id/.test(src), 'it names a person');
+// The book writes down who served, and the sales log shows it — "which of
+// us sold that?" is a question about two years of trade, not about today.
+// What it must never carry is a staff id: an id is what commission, the
+// per-seller figures and the till roll are paid and counted against, and
+// the book is none of those. A name on a line is a record; an id is a claim.
+check('a book line names who served',
+  /COALESCE\(i\.staff, ''\)::text AS staff_name/.test(src), 'the name is dropped');
+check('but it carries no staff id, so it can never be credited or paid',
+  /AS staff_name, NULL::int AS staff_id/.test(src), 'it could be credited');
 
 check('the loader is the only thing that adds to it',
   (src.match(/INSERT INTO imported_sales/g) || []).length === 1, 'something else adds rows');

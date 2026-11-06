@@ -27,7 +27,7 @@ await db.exec(`
     id SERIAL PRIMARY KEY, shop_id INT NOT NULL, source TEXT NOT NULL, sku TEXT NOT NULL,
     name TEXT DEFAULT '', style TEXT DEFAULT '', fabric TEXT DEFAULT '', color TEXT DEFAULT '',
     size TEXT DEFAULT '', sold_on DATE NOT NULL, units INT NOT NULL,
-    value NUMERIC(14,2) DEFAULT 0, cash NUMERIC(14,2) DEFAULT 0, card NUMERIC(14,2) DEFAULT 0
+    value NUMERIC(14,2) DEFAULT 0, cash NUMERIC(14,2) DEFAULT 0, card NUMERIC(14,2) DEFAULT 0, staff TEXT DEFAULT ''
   );
   INSERT INTO shops (business_id, name, code) VALUES (1,'Goldust','GD'), (1,'Rose Gold','RG');
   INSERT INTO stock_items (shop_id, name, category, fabric, color, size, sku, qty, price) VALUES

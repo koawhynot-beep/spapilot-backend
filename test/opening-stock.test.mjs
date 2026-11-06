@@ -44,7 +44,7 @@ await db.exec(`
     id SERIAL PRIMARY KEY, shop_id INT, source TEXT, sku TEXT, name TEXT DEFAULT '',
     style TEXT DEFAULT '', fabric TEXT DEFAULT '', color TEXT DEFAULT '', size TEXT DEFAULT '',
     sold_on DATE, units INT, value NUMERIC(14,2) DEFAULT 0,
-    cash NUMERIC(14,2) DEFAULT 0, card NUMERIC(14,2) DEFAULT 0, bank TEXT DEFAULT ''
+    cash NUMERIC(14,2) DEFAULT 0, card NUMERIC(14,2) DEFAULT 0, bank TEXT DEFAULT '', staff TEXT DEFAULT ''
   );
   CREATE UNIQUE INDEX idx_stock_shop_sku ON stock_items (shop_id, UPPER(sku)) WHERE COALESCE(sku,'') <> '';
   CREATE TABLE stock_movements (id SERIAL PRIMARY KEY, item_id INT, shop_id INT);

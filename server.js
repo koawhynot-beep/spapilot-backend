@@ -822,6 +822,8 @@ async function initDB() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_transfers_pending ON stock_transfers(business_id, status)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_transfer_lines ON stock_transfer_lines(transfer_id)`);
   await pool.query(`ALTER TABLE imported_sales ADD COLUMN IF NOT EXISTS bank TEXT DEFAULT ''`);
+  // The books name the assistant who served, in their NAMA SPG column.
+  await pool.query(`ALTER TABLE imported_sales ADD COLUMN IF NOT EXISTS staff TEXT DEFAULT ''`);
   // The sales log matches a book line to the shelf by code, across shops,
   // which the per-shop unique index cannot answer.
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_stock_sku_upper ON stock_items (UPPER(sku))`);
@@ -2799,7 +2801,7 @@ const LEDGER_PRICE_SQL = `ROUND(i.value / NULLIF(i.units, 0))`;
 const LEDGER_SELECT = `
   SELECT (-i.id) AS id, 'sale'::text AS type, (-i.units) AS qty_change,
          i.sold_on::timestamptz AS occurred_at, ''::text AS reason, ''::text AS note,
-         ''::text AS staff_name, NULL::int AS staff_id,
+         COALESCE(i.staff, '')::text AS staff_name, NULL::int AS staff_id,
          i.sku,
          COALESCE(NULLIF(shelf.name,''), i.name) AS item_name,
          COALESCE(NULLIF(shelf.color,''), i.color) AS color,
@@ -3381,8 +3383,8 @@ async function seedOneBook({ shop, file }) {
     if (already.length) return;
 
     const col = { sku: [], name: [], style: [], fabric: [], color: [], size: [],
-                  on: [], units: [], value: [], cash: [], card: [], bank: [] };
-    for (const [sku, name, style, fabric, color, size, on, units, value, cash, card, bank] of rows) {
+                  on: [], units: [], value: [], cash: [], card: [], bank: [], staff: [] };
+    for (const [sku, name, style, fabric, color, size, on, units, value, cash, card, bank, staff] of rows) {
       col.sku.push(sku.toUpperCase());
       col.name.push(name);
       col.style.push(style);
@@ -3395,18 +3397,19 @@ async function seedOneBook({ shop, file }) {
       col.cash.push(cash);
       col.card.push(card);
       col.bank.push(bank || '');
+      col.staff.push(staff || '');
     }
     await client.query('BEGIN');
     await client.query(
       `INSERT INTO imported_sales
-         (shop_id, source, sku, name, style, fabric, color, size, sold_on, units, value, cash, card, bank)
+         (shop_id, source, sku, name, style, fabric, color, size, sold_on, units, value, cash, card, bank, staff)
        SELECT $1, $2, UNNEST($3::text[]), UNNEST($4::text[]), UNNEST($5::text[]),
               UNNEST($6::text[]), UNNEST($7::text[]), UNNEST($8::text[]),
               UNNEST($9::date[]), UNNEST($10::int[]),
               UNNEST($11::numeric[]), UNNEST($12::numeric[]), UNNEST($13::numeric[]),
-              UNNEST($14::text[])`,
+              UNNEST($14::text[]), UNNEST($15::text[])`,
       [shopId, source, col.sku, col.name, col.style, col.fabric, col.color, col.size,
-       col.on, col.units, col.value, col.cash, col.card, col.bank]
+       col.on, col.units, col.value, col.cash, col.card, col.bank, col.staff]
     );
     await client.query('COMMIT');
     logger.warn('ledger.seed.done', {
