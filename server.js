@@ -3914,6 +3914,213 @@ const sendCsv = (res, name, body) => {
   res.send('﻿' + body);
 };
 
+// ── The report the shop files ─────────────────────────────
+// A month or a year of one shop's sales, as a spreadsheet laid out the way
+// the shop already writes it by hand: a line per garment sold, the day's
+// takings totalled under each day, and the whole period summarised at the
+// top. It is what gets printed and handed over at tax time, so the columns
+// are theirs — TANGGAL, NO., KODE BARANG and the rest — rather than this
+// app's names for the same things.
+//
+// Per shop, because that is how the shop is run and how the report is
+// filed. "All shops" is still allowed and names every shop in a column of
+// its own, but the ordinary use is one shop at a time.
+const REPORT_COLUMNS = [
+  ['TANGGAL', 13], ['NO.', 12], ['KODE BARANG', 14], ['JENIS BARANG', 42],
+  ['UNIT', 7], ['HARGA PER UNIT', 15], ['DISKON', 11], ['TOTAL HARGA', 15],
+  ['CASH', 14], ['BNI', 14], ['BCA', 14], ['PAYPALL', 13], ['SPG', 12],
+];
+const MONTH_NAMES = ['JANUARI', 'FEBRUARI', 'MARET', 'APRIL', 'MEI', 'JUNI',
+  'JULI', 'AGUSTUS', 'SEPTEMBER', 'OKTOBER', 'NOVEMBER', 'DESEMBER'];
+
+app.get('/api/sales/export.xlsx', auth, requireAdmin, async (req, res) => {
+  try {
+    const year = parseInt(req.query.year, 10);
+    if (!Number.isInteger(year) || year < 2000 || year > 2100) {
+      return res.status(400).json({ error: 'Pick a year' });
+    }
+    const monthly = String(req.query.period || 'month') === 'month';
+    const month = parseInt(req.query.month, 10);
+    if (monthly && (!Number.isInteger(month) || month < 1 || month > 12)) {
+      return res.status(400).json({ error: 'Pick a month' });
+    }
+
+    // The period, as dates in the shop's own timezone. A report for October
+    // must hold the evening of the 31st, which by UTC is already November.
+    const from = monthly ? `${year}-${String(month).padStart(2, '0')}-01` : `${year}-01-01`;
+    const to = monthly
+      ? (month === 12 ? `${year + 1}-01-01` : `${year}-${String(month + 1).padStart(2, '0')}-01`)
+      : `${year + 1}-01-01`;
+
+    const params = [req.user.businessId, from, to, SHOP_TZ];
+    let moveScope = '';
+    let bookScope = '';
+    const ids = await scopeShopIds(req);
+    if (ids) {
+      params.push(ids);
+      moveScope = ` AND m.shop_id = ANY($${params.length}::int[])`;
+      bookScope = ` AND i.shop_id = ANY($${params.length}::int[])`;
+    }
+
+    const { rows } = await pool.query(
+      `SELECT * FROM (
+         ${SALE_SELECT}
+          WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}
+            AND (m.occurred_at AT TIME ZONE $4)::date >= $2::date
+            AND (m.occurred_at AT TIME ZONE $4)::date < $3::date${moveScope}
+         UNION ALL
+         ${LEDGER_SELECT}
+          WHERE sh.business_id = $1
+            AND i.sold_on >= $2::date AND i.sold_on < $3::date${bookScope}
+       ) s
+       ORDER BY s.occurred_at ASC, s.id ASC`,
+      params
+    );
+
+    const sales = rows.map(shapeSale);
+    const { rows: shopRows } = await pool.query(
+      `SELECT name FROM shops WHERE business_id = $1${ids ? ' AND id = ANY($2::int[])' : ''} ORDER BY name`,
+      ids ? [req.user.businessId, ids] : [req.user.businessId]
+    );
+    const shopLabel = shopRows.length === 1 ? shopRows[0].name : 'SEMUA TOKO';
+    const periodLabel = monthly ? `${MONTH_NAMES[month - 1]} ${year}` : `TAHUN ${year}`;
+
+    // What each line was paid with, in the shop's own columns. A part-cash
+    // sale puts its two halves in two columns, which is exactly what the
+    // handwritten book does.
+    const BANK_COLUMN = { BNI: 'BNI', BCA: 'BCA', PAYPAL: 'PAYPALL' };
+    const paidInto = (r) => {
+      const { cash, card } = splitOf(r);
+      const col = { CASH: cash, BNI: 0, BCA: 0, PAYPALL: 0, unbanked: 0 };
+      // A card whose machine was never recorded has no honest column to sit
+      // in, so it is counted apart rather than guessed into one of them.
+      if (card) {
+        const where = BANK_COLUMN[r.bank];
+        if (where) col[where] += card; else col.unbanked += card;
+      }
+      return col;
+    };
+
+    const ExcelJS = require('exceljs');
+    const wb = new ExcelJS.Workbook();
+    wb.creator = 'Mitra Samadi';
+    wb.created = new Date();
+    const ws = wb.addWorksheet(periodLabel.slice(0, 31), {
+      views: [{ state: 'frozen', ySplit: 9 }],
+      pageSetup: { paperSize: 9, orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0 },
+    });
+
+    const money = '#,##0';
+    const wide = REPORT_COLUMNS.length;
+    const titleAt = (row, text, size) => {
+      ws.mergeCells(row, 1, row, wide);
+      const c = ws.getCell(row, 1);
+      c.value = text;
+      c.font = { bold: true, size: size || 12 };
+    };
+    titleAt(1, shopLabel.toUpperCase(), 14);
+    titleAt(2, 'REKAP OMSET');
+    titleAt(3, periodLabel);
+
+    // ── the whole period, at the top ──────────────────────
+    const totals = sales.reduce((acc, r) => {
+      const p = paidInto(r);
+      acc.units += r.units;
+      acc.value += r.value;
+      acc.CASH += p.CASH; acc.BNI += p.BNI; acc.BCA += p.BCA;
+      acc.PAYPALL += p.PAYPALL; acc.unbanked += p.unbanked;
+      return acc;
+    }, { units: 0, value: 0, CASH: 0, BNI: 0, BCA: 0, PAYPALL: 0, unbanked: 0 });
+
+    const summary = [
+      ['POTONG', totals.units], ['TOTAL OMSET', totals.value], ['CASH', totals.CASH],
+      ['BNI', totals.BNI], ['BCA', totals.BCA], ['PAYPALL', totals.PAYPALL],
+      ['KARTU TANPA BANK', totals.unbanked], ['TRANSAKSI', sales.length],
+    ];
+    // Laid out as a row of labels over a row of figures, which reads at a
+    // glance and survives being printed on one page.
+    summary.forEach(([label, v], i) => {
+      const c = ws.getCell(5, i + 1);
+      c.value = label;
+      c.font = { bold: true, size: 9 };
+      c.alignment = { horizontal: 'center' };
+      const f = ws.getCell(6, i + 1);
+      f.value = v;
+      f.numFmt = money;
+      f.font = { bold: true, size: 11 };
+      f.alignment = { horizontal: 'center' };
+    });
+
+    // ── the lines, a day at a time ────────────────────────
+    const HEADER_ROW = 9;
+    REPORT_COLUMNS.forEach(([name, width], i) => {
+      const c = ws.getCell(HEADER_ROW, i + 1);
+      c.value = name;
+      c.font = { bold: true, size: 10 };
+      c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+      c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
+      c.border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
+      ws.getColumn(i + 1).width = width;
+    });
+
+    const dayKey = (iso) => new Date(iso).toLocaleDateString('en-CA', { timeZone: SHOP_TZ });
+    const byDay = new Map();
+    for (const r of sales) {
+      const k = dayKey(r.occurredAt);
+      if (!byDay.has(k)) byDay.set(k, []);
+      byDay.get(k).push(r);
+    }
+
+    let at = HEADER_ROW + 1;
+    const line = (values, bold) => {
+      const row = ws.getRow(at);
+      values.forEach((v, i) => {
+        const c = row.getCell(i + 1);
+        c.value = v === 0 ? null : v;     // an empty cell reads better than a nought
+        if (typeof v === 'number') c.numFmt = money;
+        if (bold) c.font = { bold: true };
+        c.border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
+      });
+      at += 1;
+      return row;
+    };
+
+    for (const [day, lines] of byDay) {
+      const sum = { units: 0, value: 0, CASH: 0, BNI: 0, BCA: 0, PAYPALL: 0 };
+      for (const r of lines) {
+        const p = paidInto(r);
+        sum.units += r.units; sum.value += r.value;
+        sum.CASH += p.CASH; sum.BNI += p.BNI; sum.BCA += p.BCA; sum.PAYPALL += p.PAYPALL;
+        line([
+          day, r.fromBook ? '' : String(r.id), r.sku, r.itemName,
+          r.units, r.price, r.discountPct ? r.price - r.netPrice : 0, r.value,
+          p.CASH, p.BNI, p.BCA, p.PAYPALL, r.staffName === '(not recorded)' ? '' : r.staffName,
+        ]);
+      }
+      // The day's takings, under the day — the shop's own habit, and the
+      // figure anyone checking the report adds up first.
+      const total = line([
+        '', '', '', 'TOTAL ' + day, sum.units, '', '', sum.value,
+        sum.CASH, sum.BNI, sum.BCA, sum.PAYPALL, '',
+      ], true);
+      total.eachCell(c => {
+        c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF7F3E8' } };
+      });
+    }
+
+    if (sales.length === 0) line(['', '', '', 'TIDAK ADA PENJUALAN', '', '', '', '', '', '', '', '', '']);
+
+    const name = `${shopLabel.replace(/[^A-Za-z0-9]+/g, '-')}-${monthly ? `${year}-${String(month).padStart(2, '0')}` : year}.xlsx`;
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    logger.error('sales.export.error', { err: err.message });
+    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.get('/api/sales/history.csv', auth, requireAdmin, async (req, res) => {
   try {
     const { where, params } = await salesFilter(req, 3);
