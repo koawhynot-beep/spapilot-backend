@@ -46,6 +46,10 @@ await db.exec(`
     sold_on DATE, units INT, value NUMERIC(14,2) DEFAULT 0,
     cash NUMERIC(14,2) DEFAULT 0, card NUMERIC(14,2) DEFAULT 0, bank TEXT DEFAULT ''
   );
+  CREATE UNIQUE INDEX idx_stock_shop_sku ON stock_items (shop_id, UPPER(sku)) WHERE COALESCE(sku,'') <> '';
+  CREATE TABLE stock_movements (id SERIAL PRIMARY KEY, item_id INT, shop_id INT);
+  CREATE TABLE stock_check_marks (id SERIAL PRIMARY KEY, item_id INT);
+  CREATE TABLE stock_transfer_lines (id SERIAL PRIMARY KEY, item_id INT);
   INSERT INTO shops (business_id, name, code) VALUES
     (1,'Office','OF'), (1,'Goldust','GD'), (1,'Rose Gold','RG');
 `);
@@ -84,7 +88,7 @@ const seed = new Function('pool', 'logger', 'require', `
 
 console.log('\n  the first boot');
 await seed();
-const loaded = logs.find(l => l[0] === 'stock.opening.loaded');
+const loaded = logs.find(l => l[0] === 'stock.shelves.loaded');
 check('it says what it put on the shelves', Boolean(loaded) && loaded[1].items === 6,
   loaded ? JSON.stringify(loaded[1]) : 'silent');
 check('every code lands in every shop', (await one(`SELECT COUNT(*)::int AS n FROM stock_items`)).n === 6,
@@ -100,19 +104,36 @@ check('and it carries its price, fabric and colour',
   (await one(`SELECT price, fabric, color FROM stock_items WHERE sku = 'NI-1005' LIMIT 1`)).fabric === 'RAYON KRINKLE',
   'the description was lost');
 
-console.log('\n  every boot after, once the shop is counting for itself');
-await db.query(`UPDATE stock_items SET qty = 99 WHERE sku = 'NI-1005'`);
-await db.query(`DELETE FROM stock_items WHERE sku = 'GI-2009' AND shop_id = 2`);
+console.log('\n  the same file again, and then a corrected one');
 logs.length = 0;
 await seed();
-check('a count the shop has changed is left exactly alone',
-  (await one(`SELECT MIN(qty)::int AS q FROM stock_items WHERE sku = 'NI-1005'`)).q === 99,
-  'the loader reset the shelves');
-check('but a code the shop no longer has is put back, at its opening count',
-  (await one(`SELECT qty FROM stock_items WHERE sku = 'GI-2009' AND shop_id = 2`)).qty === 2,
-  'it stayed missing');
+check('the same file is not loaded twice', logs.length === 0, 'it ran again');
+
+// The shop counted 99 in the app; the office has just corrected the
+// workbook. The workbook is the count that was checked last, so it wins.
+await db.query(`UPDATE stock_items SET qty = 99 WHERE sku = 'NI-1005'`);
+// Two codes the corrected workbook drops: one that has sold, one that has
+// never been touched.
+await db.query(`INSERT INTO stock_items (shop_id, sku, name, qty)
+                VALUES (2,'OLD-1','OLD THING',4), (2,'OLD-2','OTHER OLD THING',4)`);
+await db.query(`INSERT INTO stock_movements (item_id, shop_id)
+                SELECT id, 2 FROM stock_items WHERE sku = 'OLD-1' AND shop_id = 2`);
+FIXTURE.source = 'test opening stock \u00b7 beef5678';
+FIXTURE.rows[0][8] = 7;
+logs.length = 0;
+await seed();
+check('a corrected file is loaded', Boolean(logs.find(l => l[0] === 'stock.shelves.loaded')),
+  'it was skipped');
+check("and the workbook's figure replaces what was there",
+  (await one(`SELECT qty FROM stock_items WHERE sku = 'NI-1005' AND shop_id = 2`)).qty === 7,
+  'the old count survived');
+check('a dropped code with nothing against it comes off the list',
+  (await one(`SELECT COUNT(*)::int AS n FROM stock_items WHERE sku = 'OLD-2'`)).n === 0, 'it stayed');
+check('a dropped code that sold is kept, at nothing, so its history survives',
+  (await one(`SELECT qty FROM stock_items WHERE sku = 'OLD-1' AND shop_id = 2`)).qty === 0,
+  'it was deleted, taking the sale with it');
 check('nothing is duplicated',
-  (await one(`SELECT COUNT(*)::int AS n FROM stock_items`)).n === 6, 'rows were doubled');
+  (await one(`SELECT COUNT(*)::int AS n FROM stock_items`)).n === 7, 'rows were doubled');
 
 // ── One garment, one name ────────────────────────────────────────────────
 console.log('\n  the history calls a garment what the shelf calls it');
@@ -146,9 +167,9 @@ check('and the selling shop\'s own shelf is the one that decides',
 
 console.log('\n  what the code guarantees');
 const fn = grab('async function seedOpeningStock() {', '\n}');
-check('the loader only ever inserts', !/UPDATE stock_items|DELETE FROM stock_items/.test(fn),
-  'it rewrites what is on the shelves');
-check('and skips a code the shop already holds', /already\.has\(sku\)/.test(fn), 'it would double up');
+check('it never deletes a row something else points at',
+  /has_history/.test(fn) && /NOT has_history/.test(fn), 'history could be cascaded away');
+check('and it runs once per version of the file', /seed_marks/.test(fn), 'it would run every boot');
 check('a code is matched to the shelf by code, never by name',
   /UPPER\(si\.sku\) = i\.sku/.test(src), 'names are matched to names');
 

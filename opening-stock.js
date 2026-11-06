@@ -1,31 +1,21 @@
-// ═══════════════════════════════════════════════════════════
-// OPENING STOCK  ·  what is on the shelves
-// ═══════════════════════════════════════════════════════════
-// 1201 codes, counted into three shops: Office 1487, Goldust 911, Rose Gold 524.
-// Read out of the master workbook's ALL STOCK sheet (the garments) and ACC
-// (the jewellery, bags and skincare), each of which carries a column of
-// counts per shop.
+// ══════════════════════════════
+// THE SHELVES  ·  what each shop holds
+// ══════════════════════════════
+// 1135 codes, counted into three shops: Office 1470, Goldust 858, Rose Gold 524.
+//
+// Read out of the master workbook's ALL STOCK sheet and nothing else. That
+// sheet is the one the shop keeps its count in; the other sheets hold the
+// same codes at older or partial figures, and mixing them is what put the
+// wrong numbers on the shelves the first time.
 //
 // Codes counted at zero are here too. A garment with none left is still a
 // garment the shop sells: it belongs on the list so it can be found,
 // reordered, and so its sales history has something to hang on.
 //
-// This is a starting count, not a running one. It is loaded once into a
-// shop that does not already hold the code, and never overwrites a count
-// that is already there — once the shop is counting in the app, the app is
-// right and this file is history.
-//
 // rows: [sku, name, style, fabric, colour, size, price, office, goldust, rosegold]
 module.exports = {
-  source: "opening stock \u00b7 3058d8f3",
+  source: "all stock \u00b7 752060fe",
   rows: [
-    ["42-012", "HA THA BAR BRACELET", "HA", "", "THA BAR BRACELET", "", 3750000, 0, 0, 0],
-    ["42-013", "HA THA ROUND PENDANT NECKLACE", "HA", "", "THA ROUND PENDANT NECKLACE", "", 5400000, 0, 1, 0],
-    ["46-002", "LUNA ROSE FLIP PENDANT NECKLACE", "LUNA", "", "ROSE FLIP PENDANT NECKLACE", "", 5900000, 0, 1, 0],
-    ["46-003", "LUNA ROSE FLIP PENDANT BRACELET", "LUNA", "", "ROSE FLIP PENDANT BRACELET", "", 5250000, 0, 1, 0],
-    ["46-004", "LUNA ROSE STUD EARRINGS", "LUNA", "", "ROSE STUD EARRINGS", "", 4250000, 0, 1, 0],
-    ["46-005", "LUNA ROSE FLIP RING SIZE 6 & 7", "LUNA", "", "ROSE FLIP RING SIZE 6 & 7", "", 4250000, 0, 2, 0],
-    ["46-006", "LUNA ROSE DUO EARRING", "LUNA", "", "ROSE DUO EARRING", "", 3300000, 0, 1, 0],
     ["AG-1001", "AGUSTINE DRESS LONG CHEETAH BLACK BEIGE O/S", "AGUSTINE DRESS LONG", "RAYON VOIL", "CHEETAH BLACK BEIGE", "O/S", 950000, 0, 0, 0],
     ["AG-1004", "AGUSTINE DRESS LONG BULU KUDA LINEN O/S", "AGUSTINE DRESS LONG", "RAYON LINEN", "BULU KUDA LINEN", "O/S", 950000, 5, 3, 2],
     ["AG-1005", "AGUSTINE DRESS LONG TERRACOTA LINEN O/S", "AGUSTINE DRESS LONG", "RAYON LINEN", "TERRACOTA LINEN", "O/S", 950000, 0, 0, 0],
@@ -67,38 +57,6 @@ module.exports = {
     ["AG-3015", "AGUA SHIRT KHAKI X/L", "AGUA SHIRT", "LINEN", "KHAKI", "X/L", 1600000, 0, 1, 1],
     ["AG-3016", "AGUA SHIRT BALTIC AMBER S/M", "AGUA SHIRT", "LINEN", "BALTIC AMBER", "S/M", 1600000, 0, 0, 0],
     ["AG-3017", "AGUA SHIRT BALTIC AMBER M/L", "AGUA SHIRT", "LINEN", "BALTIC AMBER", "M/L", 1600000, 1, 1, 1],
-    ["AL-2001", "ALTERATION (SEWING COST)", "ALTERATION", "", "(SEWING COST)", "", 100000, 0, 0, 0],
-    ["AS-2001", "ADJUSTABLE SILVER RING", "ADJUSTABLE", "", "SILVER RING", "", 1200000, 0, 3, 0],
-    ["BA-2001", "BAG OVALE GOLDUST LARGE", "BAG OVALE GOLDUST", "", "LARGE", "", 500000, 11, 5, 0],
-    ["BA-2002", "BAG OVALE GOLDUST SMALL", "BAG OVALE GOLDUST", "", "SMALL", "", 450000, 1, 5, 0],
-    ["BA-4001", "BALI ISLAND (PENDANT)", "BALI ISLAND", "", "(PENDANT)", "", 1200000, 0, 0, 0],
-    ["BA-4002", "BALI ISLAND (PENDANT)", "BALI ISLAND", "", "(PENDANT)", "", 1400000, 0, 0, 0],
-    ["BA-4004", "BALI ISLAND (EARING)", "BALI ISLAND", "", "(EARING)", "", 1000000, 0, 0, 0],
-    ["BA-4005", "BALI ISLAND (EARING)", "BALI ISLAND", "", "(EARING)", "", 1000000, 0, 0, 0],
-    ["BA-4006", "BALI ISLAND (EARING)", "BALI ISLAND", "", "(EARING)", "", 1200000, 0, 0, 0],
-    ["BA-4007", "BALI ISLAND (RING)", "BALI ISLAND", "", "(RING)", "", 1000000, 0, 0, 0],
-    ["BA-4008", "BALI ISLAND (RING)", "BALI ISLAND", "", "(RING)", "", 1000000, 0, 0, 0],
-    ["BA-4009", "BALI ISLAND (RING)", "BALI ISLAND", "", "(RING)", "", 1000000, 0, 0, 0],
-    ["BA-4010", "BALI ISLAND (RING)", "BALI ISLAND", "", "(RING)", "", 1000000, 0, 0, 0],
-    ["BA-4011", "BALI ISLAND (RING)", "BALI ISLAND", "", "(RING)", "", 1000000, 0, 0, 0],
-    ["BA-4012", "BALI ISLAND (RING)", "BALI ISLAND", "", "(RING)", "", 1000000, 0, 0, 0],
-    ["BA-4013", "BALI ISLAND (RING)", "BALI ISLAND", "", "(RING)", "", 1000000, 0, 0, 0],
-    ["BA-4014", "BALI ISLAND (RING)", "BALI ISLAND", "", "(RING)", "", 1200000, 0, 0, 0],
-    ["BA-4015", "BALI ISLAND (RING)", "BALI ISLAND", "", "(RING)", "", 1200000, 0, 0, 0],
-    ["BA-4016", "BALI ISLAND (RING)", "BALI ISLAND", "", "(RING)", "", 1200000, 0, 0, 0],
-    ["BA-4017", "BALI ISLAND (RING)", "BALI ISLAND", "", "(RING)", "", 800000, 0, 0, 0],
-    ["BA-4018", "BALI ISLAND (RING)", "BALI ISLAND", "", "(RING)", "", 700000, 0, 0, 0],
-    ["BA-4019", "BALI NECKLACE SILVER", "BALI NECKLACE", "", "SILVER", "", 1200000, 0, 1, 0],
-    ["BA-4020", "BALI NECKLACE GOLD", "BALI NECKLACE", "", "GOLD", "", 1400000, 0, 1, 0],
-    ["BA-4021", "BALI ISLAND (PENDANT)", "BALI ISLAND", "", "(PENDANT)", "", 400000, 0, 1, 0],
-    ["BA-4022", "BALI ISLAND (PENDANT)", "BALI ISLAND", "", "(PENDANT)", "", 400000, 0, 1, 0],
-    ["BA-4023", "BALI ISLAND (PENDANT)", "BALI ISLAND", "", "(PENDANT)", "", 400000, 0, 0, 0],
-    ["BA-4024", "BALI ISLAND (RING)", "BALI ISLAND", "", "(RING)", "", 1800000, 0, 0, 0],
-    ["BA-4025", "BALI ISLAND (RING)", "BALI ISLAND", "", "(RING)", "", 1300000, 0, 0, 0],
-    ["BA-4027", "BALI ISLAND (RING)", "BALI ISLAND", "", "(RING)", "", 1450000, 0, 1, 0],
-    ["BA-4028", "BALI ISLAND (RING)", "BALI ISLAND", "", "(RING)", "", 2000000, 0, 1, 0],
-    ["BA-4029", "BALI ISLAND (RING)", "BALI ISLAND", "", "(RING)", "", 1450000, 0, 1, 0],
-    ["BA-5001", "BAG SHELL LARGE", "BAG SHELL", "", "LARGE", "", 480000, 4, 0, 0],
     ["BE-1001", "BEE REMPEL WHITE GREEN O/S", "BEE REMPEL", "FUJET", "WHITE GREEN", "O/S", 1300000, 2, 2, 2],
     ["BM-1021", "BOOBTUBE AEGEAN TEAL O/S", "BOOBTUBE", "COTTON LCY", "AEGEAN TEAL", "O/S", 350000, 2, 0, 0],
     ["BM-1022", "BOOBTUBE LILAC O/S", "BOOBTUBE", "COTTON LCY", "LILAC", "O/S", 350000, 2, 0, 1],
@@ -908,10 +866,6 @@ module.exports = {
     ["MA-4010", "MARCELLA DRESS MAROON O/S", "MARCELLA DRESS", "RAYON KRINKLE", "MAROON", "O/S", 895000, 6, 1, 2],
     ["MA-4011", "MARCELLA DRESS NEW TERACOTA O/S", "MARCELLA DRESS", "RAYON KRINKLE", "NEW TERACOTA", "O/S", 895000, 0, 2, 0],
     ["MA-6002", "MARCELLA DRESS ELECTRIC BLUE O/S", "MARCELLA DRESS", "RAYON FUJET", "ELECTRIC BLUE", "O/S", 895000, 0, 0, 0],
-    ["MA-8001", "MARCABA SHORT SILVER", "MARCABA SHORT", "", "SILVER", "", 1550000, 0, 2, 0],
-    ["MA-8002", "MARCABA SHORT GOLD", "MARCABA SHORT", "", "GOLD", "", 1750000, 0, 2, 0],
-    ["MA-8003", "MARCABA LONG GOLD", "MARCABA LONG", "", "GOLD", "", 1950000, 0, 4, 0],
-    ["MA-8005", "MARCABA LONG SILVER", "MARCABA LONG", "", "SILVER", "", 1750000, 0, 2, 0],
     ["ME-2002", "MERRY DRESS SHORT BLACK O/S", "MERRY DRESS SHORT", "RAYON KRINKLE", "BLACK", "O/S", 795000, 1, 2, 2],
     ["ME-2003", "MERRY DRESS SHORT BLUE PETROL O/S", "MERRY DRESS SHORT", "RAYON KRINKLE", "BLUE PETROL", "O/S", 795000, 9, 2, 2],
     ["ME-2004", "MERRY DRESS SHORT BURGUNDY O/S", "MERRY DRESS SHORT", "RAYON KRINKLE", "BURGUNDY", "O/S", 795000, 4, 2, 0],
@@ -929,25 +883,6 @@ module.exports = {
     ["ME-2018", "MERRY DRESS SHORT RED CHILLI O/S", "MERRY DRESS SHORT", "RAYON KRINKLE", "RED CHILLI", "O/S", 795000, 0, 0, 0],
     ["ME-2019", "MERRY DRESS SHORT NEW TERACOTA O/S", "MERRY DRESS SHORT", "RAYON KRINKLE", "NEW TERACOTA", "O/S", 795000, 0, 0, 1],
     ["ME-2020", "MERRY DRESS SHORT NUDE O/S", "MERRY DRESS SHORT", "RAYON KRINKLE", "NUDE", "O/S", 795000, 0, 0, 0],
-    ["N-33012", "UMBRA SMALL OVAL ONYX STACK RING 6 & 5", "UMBRA", "", "SMALL OVAL ONYX STACK RING", "6 & 5", 2500000, 0, 2, 0],
-    ["N-33015", "UMBRA OVAL ONYX STUD EARRINGS", "UMBRA", "", "OVAL ONYX STUD EARRINGS", "", 3100000, 0, 1, 0],
-    ["N-35010", "ZAYAH LAPIS LAZULI OVAL STACKING RING 5 & 9", "ZAYAH", "", "LAPIS LAZULI OVAL STACKING RING", "5 & 9", 2500000, 0, 2, 0],
-    ["N-35012", "ZAYAH LAPIS LAZULI OVAL STUD EARRINGS", "ZAYAH", "", "LAPIS LAZULI OVAL STUD EARRINGS", "", 3100000, 0, 1, 0],
-    ["N-39004", "ESKA DROP EARRINGS", "ESKA", "", "DROP EARRINGS", "", 3400000, 0, 2, 0],
-    ["N-39005", "ESKA DROP PENDANT EARRINGS", "ESKA", "", "DROP PENDANT EARRINGS", "", 5900000, 0, 1, 0],
-    ["N-39009", "ESKA GLACIER OVAL STUD EARRINGS", "ESKA", "", "GLACIER OVAL STUD EARRINGS", "", 3250000, 0, 1, 0],
-    ["N-39011", "ESKA GLACIER DUO RING 8 & 9", "ESKA", "", "GLACIER DUO RING", "8 & 9", 5100000, 0, 2, 0],
-    ["N-39012", "ESKA GLACIER DUO EARRING", "ESKA", "", "GLACIER DUO EARRING", "", 3300000, 0, 1, 0],
-    ["N-43006", "VIDA AMAZONITE OVAL STACK RING 6 & 8", "VIDA", "", "AMAZONITE OVAL STACK RING", "6 & 8", 2500000, 0, 0, 0],
-    ["N-43019", "VIDA AMAZONITE OVAL STUD RING", "VIDA", "", "AMAZONITE OVAL STUD RING", "", 3100000, 0, 1, 0],
-    ["N-43020", "VIDA CAGE RING 8 & 6", "VIDA", "", "CAGE RING", "8 & 6", 4600000, 0, 0, 0],
-    ["N-43021", "VIDA CAGE EARRINGS", "VIDA", "", "CAGE EARRINGS", "", 7150000, 0, 1, 0],
-    ["N-43022", "VIDA CAGE PENDANT NECKLACE", "VIDA", "", "CAGE PENDANT NECKLACE", "", 5900000, 0, 0, 0],
-    ["N-45002", "LUNA INLAID PENDANT NECKLACE", "LUNA", "", "INLAID PENDANT NECKLACE", "", 6800000, 0, 0, 0],
-    ["N-45003", "LUNA INLAID PENDANT EARRINGS", "LUNA", "", "INLAID PENDANT EARRINGS", "", 3750000, 0, 0, 0],
-    ["N-45006", "LUNA CHAIN PENDANT EARRINGS", "LUNA", "", "CHAIN PENDANT EARRINGS", "", 5250000, 0, 0, 0],
-    ["N-45008", "LUNA FLIP PENDANT BRACELET", "LUNA", "", "FLIP PENDANT BRACELET", "", 5250000, 0, 0, 0],
-    ["N-45011", "LUNA FLIP RING 7 & 8", "LUNA", "", "FLIP RING", "7 & 8", 4250000, 0, 0, 0],
     ["NI-1002", "NICOL DRESS TERRACOTA O/S", "NICOL DRESS", "RAYON KRINKLE", "TERRACOTA", "O/S", 895000, 1, 2, 0],
     ["NI-1003", "NICOL DRESS ANIS O/S", "NICOL DRESS", "RAYON KRINKLE", "ANIS", "O/S", 895000, 0, 0, 0],
     ["NI-1004", "NICOL DRESS BLUE PETROL O/S", "NICOL DRESS", "RAYON KRINKLE", "BLUE PETROL", "O/S", 895000, 3, 2, 0],
@@ -1008,7 +943,6 @@ module.exports = {
     ["NY-5024", "NY JUMPSUIT MOCCHA MOUSSE O/S", "NY JUMPSUIT", "RAYON KRINKLE", "MOCCHA MOUSSE", "O/S", 895000, 0, 0, 0],
     ["NY-5025", "NY JUMPSUIT SAFARI BROWN O/S", "NY JUMPSUIT", "RAYON KRINKLE", "SAFARI BROWN", "O/S", 895000, 0, 0, 0],
     ["NY-5029", "NY JUMPSUIT MAROON O/S", "NY JUMPSUIT", "RAYON KRINKLE", "MAROON", "O/S", 895000, 0, 0, 0],
-    ["PR-108 (5&6)", "BAISE ROSE GOLD OVAL STACK RING 5 & 6", "BAISE", "", "ROSE GOLD OVAL STACK RING", "5 & 6", 2500000, 0, 1, 0],
     ["PT-1001", "POCKET TOP GREEN BLUE STATE S/M", "POCKET TOP", "COTTON LCY", "GREEN BLUE STATE", "S/M", 900000, 0, 0, 0],
     ["PT-1002", "POCKET TOP MOCCHA S/M", "POCKET TOP", "COTTON LCY", "MOCCHA", "S/M", 900000, 0, 0, 0],
     ["PT-1003", "POCKET TOP SOFT MINT S/M", "POCKET TOP", "COTTON LCY", "SOFT MINT", "S/M", 900000, 0, 0, 0],
@@ -1088,7 +1022,6 @@ module.exports = {
     ["SA-3005", "SAROONG DAY OF THE DOG WHITE", "SAROONG", "RAYON BATISTE", "DAY OF THE DOG WHITE", "", 750000, 0, 5, 0],
     ["SC-6001", "SCARF CLOUD WHITE", "SCARF", "RAYON BATISTE", "CLOUD WHITE", "", 500000, 0, 0, 0],
     ["SC-6002", "SCARF BLACK", "SCARF", "RAYON BATISTE", "BLACK", "", 500000, 0, 3, 2],
-    ["SE-1001", "SHELL EARING", "SHELL EARING", "", "", "", 100000, 0, 0, 0],
     ["SH-2001", "SHEN JKT FREY APPLE O/S", "SHEN JKT FREY", "RAYON BATISTE", "APPLE", "O/S", 1400000, 0, 0, 0],
     ["SH-2002", "SHEN JKT FREY BALTIC AMBER O/S", "SHEN JKT FREY", "RAYON BATISTE", "BALTIC AMBER", "O/S", 1400000, 2, 1, 1],
     ["SH-2003", "SHEN JKT FREY BLACK O/S", "SHEN JKT FREY", "RAYON BATISTE", "BLACK", "O/S", 1400000, 0, 0, 0],
@@ -1102,7 +1035,6 @@ module.exports = {
     ["SH-3002", "SHEN JKT FREY LIME O/S", "SHEN JKT FREY", "COTTON LCY", "LIME", "O/S", 1500000, 0, 1, 0],
     ["SH-3003", "SHEN JKT FREY PERIWINKLE O/S", "SHEN JKT FREY", "COTTON LCY", "PERIWINKLE", "O/S", 1500000, 0, 1, 1],
     ["SH-4001", "SHEN JKT FREY NATURAL O/S", "SHEN JKT FREY", "BULU KUDA RAYON LINEN", "NATURAL", "O/S", 1300000, 7, 1, 1],
-    ["SP-2001", "SILVER POLISHING CLOTH", "SILVER POLISHING CLOTH", "", "", "", 25000, 0, 0, 0],
     ["SU-1002", "SUMMER DRESS TIE DYE GRAY O/S", "SUMMER DRESS", "RAYON VOIL", "TIE DYE GRAY", "O/S", 950000, 3, 2, 0],
     ["SU-1004", "SUMMER DRESS NATURAL O/S", "SUMMER DRESS", "BULU KUDA RAYON LINEN", "NATURAL", "O/S", 950000, 12, 3, 0],
     ["SU-1013", "SUMMER DRESS TERACCOTA O/S", "SUMMER DRESS", "BULU KUDA RAYON LINEN", "TERACCOTA", "O/S", 950000, 0, 1, 0],
@@ -1219,6 +1151,5 @@ module.exports = {
     ["WR-1301", "WRAP FRILL DRESS CLOUD WHITE S/M", "WRAP FRILL DRESS", "RAYON BATISTE", "CLOUD WHITE", "S/M", 1300000, 0, 0, 0],
     ["WR-1302", "WRAP FRILL DRESS CLOUD WHITE M/L", "WRAP FRILL DRESS", "RAYON BATISTE", "CLOUD WHITE", "M/L", 1300000, 0, 0, 0],
     ["WR-1303", "WRAP FRILL DRESS CLOUD WHITE X/S", "WRAP FRILL DRESS", "RAYON BATISTE", "CLOUD WHITE", "X/S", 1300000, 0, 0, 0],
-    ["ZA-1001", "ZARA DRESS GRAY  O/S", "ZARA DRESS", "", "GRAY", "O/S", 650000, 1, 0, 0],
   ],
 };

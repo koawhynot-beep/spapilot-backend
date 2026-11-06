@@ -839,8 +839,8 @@ async function initDB() {
   // Once, and never again: every record out and Atriq closed.
   await startFresh();
 
-  // What was on the shelves when the app took over. Only ever adds a code
-  // a shop does not have; it never rewrites a count.
+  // The shelves, as the workbook counts them. Runs once per version of
+  // the file; history is never deleted to make room for it.
   await seedOpeningStock();
 
   // The shops' own till books, for the three screens that ask what sells.
@@ -3197,47 +3197,58 @@ async function removeSheetSalesHistory() {
   }
 }
 
-// What was on the shelves when the app took over.
+// The shelves, as the workbook counts them.
 //
-// A starting count, not a running one: a code is only added to a shop that
-// does not already hold it, and a count already in the app is never
-// touched. Once the shop is counting in here, the app is right and the
-// workbook is history — so this can run on every boot and will quietly do
-// nothing from the second one onwards.
+// This is the shop's own count, and it wins: when the file changes, every
+// code in it is written onto the shelves — the figure, the price and the
+// description — and codes the workbook no longer lists are cleared off.
+//
+// What it will not do is lose history. A code with movements against it, a
+// tick on a stock check or a line on a transfer is never deleted, because
+// deleting it would take those records with it; it is set to nothing and
+// left on the list instead, which is what a garment the shop no longer
+// carries should look like anyway.
+//
+// It runs once per version of the file. The file's name ends in a
+// fingerprint of its own rows, so a corrected workbook is a name the app
+// has not seen and is loaded; a boot with the same file does nothing.
 //
 // Codes counted at zero are loaded too. A garment with none left is still a
-// garment the shop sells: it belongs on the list so it can be found and
+// garment the shop sells: it belongs on the list so it can be found,
 // reordered, and so its sales history has something to hang on.
 async function seedOpeningStock() {
   const client = await pool.connect();
   try {
     const { rows, source } = require('./opening-stock.js');
+    await client.query(`CREATE TABLE IF NOT EXISTS seed_marks (
+      key TEXT PRIMARY KEY, done_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`);
+    const { rows: seen } = await client.query(`SELECT 1 FROM seed_marks WHERE key = $1`, [source]);
+    if (seen.length) return;
+
     const { rows: shops } = await client.query(
       `SELECT id, code FROM shops WHERE code = ANY($1::text[])`, [['OF', 'GD', 'RG']]
     );
     if (!shops.length) return;
     const COLUMN = { OF: 7, GD: 8, RG: 9 };
 
-    let added = 0;
+    let written = 0;
     let pieces = 0;
+    let retired = 0;
+    let kept = 0;
     await client.query('BEGIN');
     for (const shop of shops) {
       const at = COLUMN[shop.code];
       if (at === undefined) continue;
-      const { rows: have } = await client.query(
-        `SELECT UPPER(sku) AS sku FROM stock_items WHERE shop_id = $1 AND COALESCE(sku,'') <> ''`,
-        [shop.id]
-      );
-      const already = new Set(have.map(r => r.sku));
       const col = { sku: [], name: [], style: [], fabric: [], color: [], size: [], price: [], qty: [] };
       for (const r of rows) {
-        const sku = String(r[0]).toUpperCase();
-        if (already.has(sku)) continue;
-        col.sku.push(sku); col.name.push(r[1]); col.style.push(r[2]);
+        col.sku.push(String(r[0]).toUpperCase()); col.name.push(r[1]); col.style.push(r[2]);
         col.fabric.push(r[3]); col.color.push(r[4]); col.size.push(r[5]);
         col.price.push(r[6]); col.qty.push(r[at]);
       }
-      if (!col.sku.length) continue;
+      // The workbook's figure is the figure. Anything the shop set in the
+      // app is a count of the same shelf, and the workbook is the one that
+      // has just been corrected.
       await client.query(
         `INSERT INTO stock_items
            (shop_id, sku, name, category, fabric, color, size, price, qty,
@@ -3245,14 +3256,47 @@ async function seedOpeningStock() {
          SELECT $1, UNNEST($2::text[]), UNNEST($3::text[]), UNNEST($4::text[]),
                 UNNEST($5::text[]), UNNEST($6::text[]), UNNEST($7::text[]),
                 UNNEST($8::numeric[]), UNNEST($9::int[]),
-                '', '', 0, '', '', '', 0, 0`,
+                '', '', 0, '', '', '', 0, 0
+         ON CONFLICT (shop_id, UPPER(sku)) WHERE COALESCE(sku,'') <> ''
+         DO UPDATE SET name = EXCLUDED.name, category = EXCLUDED.category,
+                       fabric = EXCLUDED.fabric, color = EXCLUDED.color,
+                       size = EXCLUDED.size, price = EXCLUDED.price,
+                       qty = EXCLUDED.qty`,
         [shop.id, col.sku, col.name, col.style, col.fabric, col.color, col.size, col.price, col.qty]
       );
-      added += col.sku.length;
+      written += col.sku.length;
       pieces += col.qty.reduce((n, q) => n + q, 0);
+
+      // Codes the workbook no longer lists. The ones nothing points at go;
+      // the ones with history behind them stay on the list at nothing.
+      const gone = await client.query(
+        `WITH stale AS (
+           SELECT si.id,
+                  EXISTS (SELECT 1 FROM stock_movements m WHERE m.item_id = si.id)
+               OR EXISTS (SELECT 1 FROM stock_check_marks c WHERE c.item_id = si.id)
+               OR EXISTS (SELECT 1 FROM stock_transfer_lines l WHERE l.item_id = si.id) AS has_history
+             FROM stock_items si
+            WHERE si.shop_id = $1 AND UPPER(COALESCE(si.sku,'')) <> ALL($2::text[])
+         ),
+         emptied AS (
+           UPDATE stock_items SET qty = 0
+            WHERE id IN (SELECT id FROM stale WHERE has_history) AND qty <> 0
+           RETURNING 1
+         ),
+         dropped AS (
+           DELETE FROM stock_items WHERE id IN (SELECT id FROM stale WHERE NOT has_history)
+           RETURNING 1
+         )
+         SELECT (SELECT COUNT(*)::int FROM dropped) AS dropped,
+                (SELECT COUNT(*)::int FROM stale WHERE has_history) AS kept`,
+        [shop.id, col.sku]
+      );
+      retired += gone.rows[0].dropped;
+      kept += gone.rows[0].kept;
     }
+    await client.query(`INSERT INTO seed_marks (key) VALUES ($1) ON CONFLICT DO NOTHING`, [source]);
     await client.query('COMMIT');
-    if (added) logger.warn('stock.opening.loaded', { source, items: added, pieces });
+    logger.warn('stock.shelves.loaded', { source, items: written, pieces, retired, keptWithHistory: kept });
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch {}
     logger.error('stock.opening.error', { err: err.message });
