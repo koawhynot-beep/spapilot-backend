@@ -3394,6 +3394,110 @@ const saleEditSchema = z.object({
 // being rewritten.
 const EDIT_WINDOW_DAYS = 7;
 
+// A line out of the shop's own book, corrected.
+//
+// The sales log shows two kinds of row — movements this app recorded, and
+// lines out of the book the shop kept before it. The owner corrects the one
+// the same way as the other, because from the counter they are both just
+// "that sale, which is wrong". They carry negative ids in the log precisely
+// so the two can be told apart here.
+//
+// A book line moves no stock, so this is a plain edit of the record: no
+// quantities to undo, nothing to put back on a shelf.
+//
+// One caveat worth knowing: loading a newer copy of a book replaces its
+// rows, and corrections made here go with them. There is no book queued to
+// be replaced, and the alternative — keeping edits against lines that may
+// no longer exist in the new copy — would be worse.
+async function correctBookLine(req, res, client, lineId) {
+  const { rows } = await client.query(
+    `SELECT i.*, sh.business_id
+       FROM imported_sales i JOIN shops sh ON sh.id = i.shop_id
+      WHERE i.id = $1 AND sh.business_id = $2
+      FOR UPDATE OF i`,
+    [lineId, req.user.businessId]
+  );
+  if (!rows.length) {
+    await client.query('ROLLBACK');
+    return res.status(404).json({ error: 'That record no longer exists' });
+  }
+  const line = rows[0];
+  if (!shopAllowed(req, line.shop_id)) {
+    await client.query('ROLLBACK');
+    return denyShop(res);
+  }
+
+  const units = req.body.qty === undefined ? line.units : Math.max(1, Math.round(req.body.qty));
+  const was = Number(line.units) ? Number(line.value) / Number(line.units) : 0;
+  const each = req.body.unitPrice === undefined || req.body.unitPrice === null
+    ? was
+    : Number(req.body.unitPrice);
+  const value = Math.round(each * units);
+
+  // Pointed at a different garment: the book's own description is replaced
+  // by the shelf's, because the shelf is the thing that was actually sold.
+  let { sku, name, style, fabric, color, size } = line;
+  if (req.body.itemId !== undefined) {
+    const { rows: it } = await client.query(
+      `SELECT si.* FROM stock_items si JOIN shops sh ON sh.id = si.shop_id
+        WHERE si.id = $1 AND sh.business_id = $2`,
+      [req.body.itemId, req.user.businessId]
+    );
+    if (!it.length) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'That item does not exist' });
+    }
+    const g = it[0];
+    sku = String(g.sku || '').toUpperCase();
+    name = g.name; style = g.category || ''; fabric = g.fabric || '';
+    color = g.color || ''; size = g.size || '';
+  }
+
+  let soldOn = line.sold_on;
+  if (req.body.occurredAt !== undefined) {
+    const when = new Date(req.body.occurredAt);
+    if (Number.isNaN(when.getTime())) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'That is not a date' });
+    }
+    soldOn = when.toISOString().slice(0, 10);
+  }
+
+  // How it was paid, in the book's own two columns.
+  const method = req.body.payment === undefined
+    ? (Number(line.cash) > 0 && Number(line.card) > 0 ? 'split'
+      : Number(line.cash) > 0 ? 'cash' : Number(line.card) > 0 ? 'card' : '')
+    : cleanPayment(req.body.payment);
+  let cash = 0;
+  let card = 0;
+  if (method === 'cash') cash = value;
+  else if (method === 'card') card = value;
+  else if (method === 'split') {
+    cash = Math.min(cleanMoney(req.body.cashAmount === undefined ? line.cash : req.body.cashAmount), value);
+    card = value - cash;
+  }
+  const bank = (method === 'card' || method === 'split')
+    ? (req.body.bank === undefined ? (line.bank || '') : cleanBank(req.body.bank))
+    : '';
+
+  await client.query(
+    `UPDATE imported_sales
+        SET sku = $1, name = $2, style = $3, fabric = $4, color = $5, size = $6,
+            sold_on = $7, units = $8, value = $9, cash = $10, card = $11, bank = $12
+      WHERE id = $13`,
+    [sku, name, style, fabric, color, size, soldOn, units, value, cash, card, bank, lineId]
+  );
+  await client.query('COMMIT');
+  await audit(req, {
+    action: 'sale.corrected', entity: 'book line', entityId: lineId,
+    summary: `${line.units} × ${line.sku} → ${units} × ${sku} @ ${Math.round(each)}`,
+    before: { sku: line.sku, units: line.units, value: Number(line.value), soldOn: line.sold_on },
+    after: { sku, units, value, soldOn },
+  });
+  // Shaped like the row the screen sent, so the list can put it straight back.
+  return res.json({ ok: true, id: -lineId, fromBook: true });
+}
+
 app.patch('/api/sales/:id', auth, validate(saleEditSchema), async (req, res) => {
   const client = await pool.connect();
   try {
@@ -3403,6 +3507,9 @@ app.patch('/api/sales/:id', auth, validate(saleEditSchema), async (req, res) => 
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Bad sale id' });
     }
+    // Negative is a line out of the shop's book, which the log numbers that
+    // way on purpose.
+    if (saleId < 0) return await correctBookLine(req, res, client, -saleId);
 
     const { rows: mv } = await client.query(
       `SELECT m.*, sh.business_id
@@ -3601,6 +3708,32 @@ app.delete('/api/movements/:id', auth, requireAdmin, async (req, res) => {
     if (!Number.isInteger(moveId)) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Bad record id' });
+    }
+
+    // A line out of the shop's book: no stock to put back, just the record.
+    if (moveId < 0) {
+      const { rows: bl } = await client.query(
+        `SELECT i.*, sh.business_id FROM imported_sales i
+           JOIN shops sh ON sh.id = i.shop_id
+          WHERE i.id = $1 AND sh.business_id = $2 FOR UPDATE OF i`,
+        [-moveId, req.user.businessId]
+      );
+      if (!bl.length) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'That record no longer exists' });
+      }
+      if (!shopAllowed(req, bl[0].shop_id)) {
+        await client.query('ROLLBACK');
+        return denyShop(res);
+      }
+      await client.query(`DELETE FROM imported_sales WHERE id = $1`, [-moveId]);
+      await client.query('COMMIT');
+      await audit(req, {
+        action: 'sale.deleted', entity: 'book line', entityId: -moveId,
+        summary: `${bl[0].units} × ${bl[0].sku} out of the shop's book`,
+        before: { sku: bl[0].sku, units: bl[0].units, value: Number(bl[0].value) },
+      });
+      return res.json({ ok: true });
     }
 
     const { rows: mv } = await client.query(
