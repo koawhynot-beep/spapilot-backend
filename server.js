@@ -3041,6 +3041,10 @@ app.get('/api/sales/history', auth, async (req, res) => {
     // two sources put together and the table aliases are gone.
     const SALE_ORDERS = {
       recent: 's.occurred_at DESC, s.id DESC',
+      oldest: 's.occurred_at ASC, s.id ASC',
+      // By garment, for reading down a list looking for one thing rather
+      // than for what happened lately.
+      name: 's.item_name ASC, s.occurred_at DESC',
       fabric: "NULLIF(s.fabric,'') ASC NULLS LAST, s.occurred_at DESC, s.id DESC",
     };
     const orderBy = SALE_ORDERS[req.query.sort] || SALE_ORDERS.recent;
