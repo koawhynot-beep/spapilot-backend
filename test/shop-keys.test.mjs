@@ -70,10 +70,10 @@ await scenario('live shape: Gold Dust (GD) + Atriq (AT), with stock',
 await scenario('single unkeyed shop named Gold Dust',
   `INSERT INTO shops (business_id, name, address) VALUES (1,'Gold Dust','');
    INSERT INTO stock_items (shop_id, name, sku, qty) VALUES (1,'MAX TOP','MT-1001',5);`,
-  { shops: 'AT:Atriq | GD:Goldust | OF:Office | RG:Rose Gold', keepsIdOf: 1 });
+  { shops: 'GD:Goldust | OF:Office | RG:Rose Gold', keepsIdOf: 1 });
 
 // Nothing at all — a fresh database.
-await scenario('empty database', null, { shops: 'AT:Atriq | GD:Goldust | OF:Office | RG:Rose Gold' });
+await scenario('empty database', null, { shops: 'GD:Goldust | OF:Office | RG:Rose Gold' });
 
 // Already correct: the migration must be a no-op, not create duplicates.
 await scenario('already Rose Gold + Atriq (re-running the migration)',
@@ -102,7 +102,7 @@ await scenario('old Gold Dust keyed GD still becomes Rose Gold',
   `INSERT INTO shops (business_id, name, address, code) VALUES (1,'Gold Dust','','GD');
    INSERT INTO stock_items (shop_id, name, sku, qty) VALUES (1,'MAX TOP','MT-1001',5);
    INSERT INTO stock_movements (item_id, shop_id, type, qty_change) VALUES (1,1,'sale',-1);`,
-  { shops: 'AT:Atriq | GD:Goldust | OF:Office | RG:Rose Gold', keepsIdOf: 1 });
+  { shops: 'GD:Goldust | OF:Office | RG:Rose Gold', keepsIdOf: 1 });
 
 // ── Code → shop mapping ───────────────────────────────────
 console.log('\n  code → shop mapping (SHOP_CODE_* scanning)');

@@ -49,37 +49,16 @@ const one = async (sql, p) => (await db.query(sql, p)).rows[0];
 console.log('\nReal Postgres · the shops\' own sales books\n');
 
 // ── The books that ship ──────────────────────────────────────────────────
-console.log('  the books as they ship');
 // eslint-disable-next-line no-eval
 const BOOKS = eval(grab('const IMPORTED_BOOKS = [', '];').slice('const IMPORTED_BOOKS = '.length));
-check('each book names a shop and a file',
-  BOOKS.length >= 1 && BOOKS.every(b => /^[A-Z]{2}$/.test(b.shop) && b.file.startsWith('./')),
-  JSON.stringify(BOOKS));
-check('no shop is loaded twice', new Set(BOOKS.map(b => b.shop)).size === BOOKS.length,
-  BOOKS.map(b => b.shop).join(','));
-
-const sources = new Set();
-for (const b of BOOKS) {
-  const book = (await import(new URL('../' + b.file.replace('./', ''), import.meta.url))).default;
-  const rows = book.rows;
-  const pieces = rows.reduce((n, r) => n + r[7], 0);
-  const value = rows.reduce((n, r) => n + r[8], 0);
-  console.log(`  ${b.shop}: ${rows.length} lines · ${pieces} pieces · ${value.toLocaleString('en-US')} IDR`);
-  check(`${b.shop}: every line has a code, a day and at least one piece`,
-    rows.every(r => r[0] && /^\d{4}-\d{2}-\d{2}$/.test(r[6]) && r[7] > 0), 'a malformed line');
-  check(`${b.shop}: no line is worth less than nothing`, rows.every(r => r[8] >= 0), 'a negative sale');
-  check(`${b.shop}: cash and card never come to more than the line`,
-    rows.every(r => r[9] + r[10] <= r[8]), 'a line claims more money than it took');
-  check(`${b.shop}: alterations are not in it — they sell no garment`,
-    !rows.some(r => r[0] === 'AL-2001'), 'the sewing service is counted as stock sold');
-  const described = rows.filter(r => r[2] || r[3]).length;
-  check(`${b.shop}: the garments are described — ${Math.round((described / rows.length) * 100)}% carry a style or fabric`,
-    described / rows.length > 0.8, `only ${described} of ${rows.length}`);
-  check(`${b.shop}: the book is named, and named only once`,
-    typeof book.source === 'string' && book.source.length > 0 && !sources.has(book.source),
-    `source "${book.source}" is missing or shared`);
-  sources.add(book.source);
-}
+console.log('  no book is listed');
+// The owner cleared the app to start from what the shops actually count and
+// ring up, so the list is empty. The sweep below is what makes that stick:
+// it keeps exactly the books named here, and with none named it empties the
+// table on every boot. Listing one again is all it takes to load it.
+check('no book is listed', BOOKS.length === 0, JSON.stringify(BOOKS));
+check('and no data file is left to list', !/-history\.js/.test(src),
+  'a loader still points at a spreadsheet');
 
 // ── The loader ───────────────────────────────────────────────────────────
 const FIXTURE = {
@@ -111,9 +90,7 @@ await seedOne({ shop: 'GD', file: './fixture.js' });
 check('a second run loads nothing again',
   (await one(`SELECT COUNT(*)::int AS n FROM imported_sales`)).n === 2, 'it doubled the book');
 
-console.log('\n  a newer copy replaces the old');
-await db.query(`INSERT INTO imported_sales (shop_id, source, sku, sold_on, units)
-                VALUES (1, 'last month''s copy', 'NI-1005', '2025-01-05', 9)`);
+console.log('\n  the sweep keeps exactly the books that are listed');
 const sweep = new Function('pool', 'logger', 'require', 'seedOneBook', `
   ${grab('const IMPORTED_BOOKS = [', '];')}
   ${grab('async function seedImportedSales() {', '\n}')}
@@ -121,12 +98,11 @@ const sweep = new Function('pool', 'logger', 'require', 'seedOneBook', `
 `)(pool, logger, () => FIXTURE, async () => {});
 logs.length = 0;
 await sweep();
-check('the superseded copy is swept out before anything is loaded',
-  (await one(`SELECT COUNT(*)::int AS n FROM imported_sales WHERE source LIKE 'last month%'`)).n === 0,
-  'two copies of one book would double every figure that reads it');
-check('and the current book is left alone',
-  (await one(`SELECT COUNT(*)::int AS n FROM imported_sales WHERE source = $1`, [FIXTURE.source])).n === 2,
-  'the sweep took the book it was meant to keep');
+check('with none listed, the table is emptied',
+  (await one(`SELECT COUNT(*)::int AS n FROM imported_sales`)).n === 0,
+  'rows survived a boot that lists no book');
+check('and it says what it removed',
+  logs.some(l => l[0] === 'ledger.superseded'), JSON.stringify(logs));
 
 // ── Where the book may be read, and where it may not ─────────────────────
 console.log('\n  three screens, and no others');
@@ -134,6 +110,7 @@ const BLOCKS = {
   'the table itself': grab("    -- What each shop sold before the app", 'card NUMERIC(14,2) NOT NULL DEFAULT 0\n    );'),
   'its indexes': grab('  await pool.query(`CREATE INDEX IF NOT EXISTS idx_imported_sales ', 'idx_imported_sales_on ON imported_sales(sold_on)`);'),
   'the loader': grab("// The shops' own sales books. Each is loaded once", '\n}'),
+  'the clean slate': grab('async function startFresh() {', '\n}'),
   'one book at a time': grab('async function seedOneBook({ shop, file }) {', '\n}'),
   'the stock list': grab("app.get('/api/shops/:shopId/stock'", '\n});'),
   'Quick check': grab("app.get('/api/quick-check'", '\n});'),
@@ -164,9 +141,10 @@ check('the years offered cover both books, since the lists do',
 check('the loader is the only thing that writes to it',
   (src.match(/INSERT INTO imported_sales/g) || []).length === 1
   && !/UPDATE imported_sales/.test(src), 'something else writes to it');
-check('the one DELETE only ever takes books that are no longer listed',
-  (src.match(/DELETE FROM imported_sales/g) || []).length === 1
-  && /DELETE FROM imported_sales WHERE source <> ALL\(\$1::text\[\]\)/.test(src),
+check('one DELETE sweeps books that are no longer listed, the other is the clean slate',
+  (src.match(/DELETE FROM imported_sales/g) || []).length === 2
+  && /DELETE FROM imported_sales WHERE source <> ALL\(\$1::text\[\]\)/.test(src)
+  && /DELETE FROM imported_sales WHERE shop_id IN/.test(src),
   'a delete could take a book that is still wanted');
 check('it cannot move stock: the loader touches no other table',
   !/stock_items|stock_movements/.test(BLOCKS['one book at a time']), 'the loader reaches into the stock');

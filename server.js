@@ -670,7 +670,10 @@ async function initDB() {
     // The shops the business actually runs. Rose Gold replaces what an
     // earlier migration created as "Gold Dust" — that name came from this
     // code assuming a single shop, not from the business.
-    const WANTED = [['RG', 'Rose Gold'], ['AT', 'Atriq'], ['GD', 'Goldust'], ['OF', 'Office']];
+    // Atriq was closed in November 2026 and is deliberately not here: this
+    // list is what the next boot creates, so leaving it would bring the shop
+    // back the moment it was deleted.
+    const WANTED = [['RG', 'Rose Gold'], ['GD', 'Goldust'], ['OF', 'Office']];
 
     // Rename before keying, so the row that already carries all the history
     // becomes Rose Gold rather than a fresh empty shop being made alongside
@@ -822,14 +825,20 @@ async function initDB() {
   // the sales rung up in the app are left. The stock is not touched.
   await removeSheetSalesHistory();
 
+  // Once, and never again: every record out and Atriq closed.
+  await startFresh();
+
   // The shops' own till books, for the three screens that ask what sells.
-  // Their own table; not stock, not takings, not anybody's sales figures.
+  // No book is listed, so this only keeps the table empty.
   await seedImportedSales();
 
 
   // Office's opening stock. Not a migration — it is data, and it runs after
   // every table it touches exists. Once, and only into an empty shop.
-  await seedOfficeStock();
+  // Office's opening stock is NOT seeded any more. It ran once, into an
+  // empty shop — which is exactly what every shop is after the clean slate
+  // below, so leaving it in would refill one of them on the next deploy.
+
 
   // Cleanup expired blacklist tokens hourly
   setInterval(() => {
@@ -1190,7 +1199,12 @@ app.get('/api/shops/:shopId/stock', auth, scopedShop, async (req, res) => {
     const search = (req.query.search || '').trim().toLowerCase();
     const groupParam = req.query.group; // 'all' | id | 'none'
     const params = [req.params.shopId];
-    let sql = 'SELECT * FROM stock_items WHERE shop_id=$1 AND COALESCE(sku, \'\') <> \'\'';
+    // Everything on this shop's shelves, code or no code. The code is
+    // optional when a garment is added, so filtering on it here hid rows
+    // that had just been created — added, then gone, with nothing to say
+    // why. A garment with no code is a garment with a missing code, and the
+    // place to see that is the list it is missing from.
+    let sql = 'SELECT * FROM stock_items WHERE shop_id=$1';
     if (search) {
       params.push(`%${search}%`);
       sql += ` AND (LOWER(name) LIKE $${params.length} OR LOWER(category) LIKE $${params.length} OR LOWER(fabric) LIKE $${params.length} OR LOWER(print) LIKE $${params.length} OR LOWER(color) LIKE $${params.length} OR LOWER(size) LIKE $${params.length} OR LOWER(sku) LIKE $${params.length} OR LOWER(brand) LIKE $${params.length})`;
@@ -2126,10 +2140,10 @@ app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
                 MAX(si.price) AS price,
                 COALESCE(si.size,'') AS size,
                 SUM(si.qty)::int AS qty,
-                ARRAY_AGG(DISTINCT si.sku) AS skus
+                ARRAY_AGG(DISTINCT si.sku) FILTER (WHERE COALESCE(si.sku,'') <> '') AS skus
            FROM stock_items si
            JOIN shops sh ON sh.id = si.shop_id
-          WHERE sh.business_id = $1 AND COALESCE(si.sku,'') <> ''${stockScope}
+          WHERE sh.business_id = $1${stockScope}
           GROUP BY 1, 7`,
         stockParams
       ),
@@ -2203,7 +2217,8 @@ app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
       }
       const g = garments.get(r.key);
       g.sizes.push({ size: r.size, qty: r.qty, sold: 0 });
-      g.skus.push(...r.skus);
+      // A garment with no code yet contributes no code to the card.
+      g.skus.push(...(r.skus || []));
       g.stock += r.qty;
     }
     // A garment the shops have stopped carrying has no shelf to be read
@@ -3040,12 +3055,12 @@ async function removeSheetSalesHistory() {
 // into the shop whose book it is. Replacing one means pointing it at a
 // newer file: the rows carry a new source name, the copy they supersede is
 // swept out first, and nothing else has to be remembered.
-const IMPORTED_BOOKS = [
-  { shop: 'GD', file: './goldust-history.js' },
-  { shop: 'RG', file: './rosegold-history.js' },
-  // Atriq's book starts in June 2026, when the shop opened.
-  { shop: 'AT', file: './atriq-history.js' },
-];
+// Empty, and the table follows it: the sweep below keeps exactly the books
+// named here, so with none named the table is emptied on every boot and
+// stays that way. The owner cleared the app to start from what the shops
+// actually count and ring up. Listing a book here is all it takes to load
+// one again, and nothing else needs to change.
+const IMPORTED_BOOKS = [];
 
 async function seedImportedSales() {
   // The table holds exactly the books in the list above and nothing else.
@@ -3121,6 +3136,88 @@ async function seedOneBook({ shop, file }) {
   }
 }
 
+// Everything out, once.
+//
+// The app had been filled four times over from copies of the shops' books,
+// and corrected by hand on top of that, until nobody could say which figure
+// came from where. The owner's decision is to start from nothing and let
+// the app record only what it is told from now on.
+//
+// This runs once and then never again: the marker it leaves in the audit
+// log is what says so, and the audit log is the one thing not cleared,
+// because "where did everything go" must always have an answer.
+//
+// It is deliberately not a migration that could run twice. A second run
+// after a month of real trading would be a catastrophe, so the guard is
+// checked first and the whole thing is one transaction.
+const FRESH_START = 'fresh start 2026-11-06';
+
+async function startFresh() {
+  const client = await pool.connect();
+  try {
+    const { rows: done } = await client.query(
+      `SELECT 1 FROM audit_log WHERE action = 'reset' AND summary LIKE $1 LIMIT 1`,
+      ['%' + FRESH_START + '%']
+    );
+    if (done.length) return;
+
+    const { rows: biz } = await client.query('SELECT id FROM businesses ORDER BY id ASC LIMIT 1');
+    if (!biz.length) return;
+    const businessId = biz[0].id;
+
+    await client.query('BEGIN');
+    const shops = `(SELECT id FROM shops WHERE business_id = $1)`;
+    const count = async (sql) => Number((await client.query(sql, [businessId])).rows[0].n);
+    const before = {
+      items: await count(`SELECT COUNT(*)::int AS n FROM stock_items WHERE shop_id IN ${shops}`),
+      movements: await count(`SELECT COUNT(*)::int AS n FROM stock_movements WHERE shop_id IN ${shops}`),
+      imported: await count(`SELECT COUNT(*)::int AS n FROM imported_sales WHERE shop_id IN ${shops}`),
+      transfers: await count(`SELECT COUNT(*)::int AS n FROM stock_transfers WHERE business_id = $1`),
+    };
+
+    // Children before parents, so nothing is left pointing at a row that
+    // has gone. Most of these would cascade, but a delete that states its
+    // own order can be read and checked.
+    await client.query(
+      `DELETE FROM stock_transfer_lines WHERE transfer_id IN
+         (SELECT id FROM stock_transfers WHERE business_id = $1)`, [businessId]);
+    await client.query(`DELETE FROM stock_transfers WHERE business_id = $1`, [businessId]);
+    await client.query(`DELETE FROM stock_check_marks WHERE shop_id IN ${shops}`, [businessId]);
+    await client.query(`DELETE FROM stock_check_rounds WHERE shop_id IN ${shops}`, [businessId]);
+    await client.query(`DELETE FROM imported_sales WHERE shop_id IN ${shops}`, [businessId]);
+    await client.query(`DELETE FROM stock_movements WHERE shop_id IN ${shops}`, [businessId]);
+    await client.query(`DELETE FROM stock_items WHERE shop_id IN ${shops}`, [businessId]);
+    await client.query(`DELETE FROM item_groups WHERE shop_id IN ${shops}`, [businessId]);
+
+    // Atriq closes with it. The shop row goes last, once nothing points at
+    // it, and the WANTED list above no longer recreates it.
+    const { rowCount: closed } = await client.query(
+      `DELETE FROM shops WHERE business_id = $1 AND (code = 'AT' OR name ILIKE 'atriq')`,
+      [businessId]
+    );
+
+    // Every audit entry points at something that no longer exists, so they
+    // go too — except the one written here, which is the record of why.
+    await client.query(`DELETE FROM audit_log WHERE business_id = $1`, [businessId]);
+    await client.query(
+      `INSERT INTO audit_log (business_id, action, entity, summary, before_val, actor_role)
+       VALUES ($1, 'reset', 'everything', $2, $3, 'system')`,
+      [businessId,
+       `Cleared everything (${FRESH_START}): ${before.items} products, ${before.movements} movements, ` +
+       `${before.imported} imported lines, ${before.transfers} transfers. ` +
+       `${closed ? 'Atriq closed. ' : ''}Shops and staff kept.`,
+       JSON.stringify({ ...before, atriqClosed: closed })]
+    );
+    await client.query('COMMIT');
+    logger.warn('admin.fresh_start', { ...before, atriqClosed: closed });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    logger.error('admin.fresh_start.error', { err: err.message });
+  } finally {
+    client.release();
+  }
+}
+
 // The markers the four sheet imports wrote into the note. They are what
 // tells a workbook entry from one somebody rang up, so each must read
 // exactly as it did when those entries were written — a misspelt marker
@@ -3132,74 +3229,6 @@ const SALES_IMPORT_NOTES = [
   'from the 2025-2026 sales sheet, 4th import (month only, no day recorded)',
 ];
 
-async function seedOfficeStock() {
-  const client = await pool.connect();
-  try {
-    const { rows: shops } = await client.query(
-      `SELECT id, code FROM shops WHERE code IN ('OF','RG')`
-    );
-    const office = shops.find(x => x.code === 'OF');
-    const roseGold = shops.find(x => x.code === 'RG');
-    if (!office || !roseGold) return;
-
-    const { rows: already } = await client.query(
-      'SELECT COUNT(*)::int AS n FROM stock_items WHERE shop_id = $1', [office.id]
-    );
-    if (already[0].n > 0) return;
-
-    const { rows: source } = await client.query(
-      'SELECT COUNT(*)::int AS n FROM stock_items WHERE shop_id = $1', [roseGold.id]
-    );
-    if (source[0].n === 0) {
-      logger.warn('office.seed.skipped', { why: 'Rose Gold has no catalogue to copy' });
-      return;
-    }
-
-    await client.query('BEGIN');
-    // The catalogue, at zero. last_sold_at is deliberately not copied: those
-    // sales happened at Rose Gold, and carrying the date over would tell the
-    // dead-stock report that Office had sold something it never had.
-    await client.query(
-      `INSERT INTO stock_items
-         (shop_id, name, category, fabric, print, size, color, sku, brand,
-          qty, threshold, supplier, notes, position, image_url, price, cost)
-       SELECT $1, name, category, fabric, print, size, color, sku, brand,
-              0, threshold, supplier, notes, position, image_url, price, cost
-         FROM stock_items WHERE shop_id = $2`,
-      [office.id, roseGold.id]
-    );
-
-    const wanted = require('./office-stock.js');
-    const codes = Object.keys(wanted);
-    const { rows: updated } = await client.query(
-      `UPDATE stock_items si
-          SET qty = v.qty, updated_at = NOW()
-         FROM (SELECT UNNEST($1::text[]) AS sku, UNNEST($2::int[]) AS qty) v
-        WHERE si.shop_id = $3 AND UPPER(si.sku) = UPPER(v.sku)
-        RETURNING si.sku`,
-      [codes, codes.map(c => wanted[c]), office.id]
-    );
-
-    // A code that matched nothing is a garment Office holds and Rose Gold has
-    // never listed. Saying so is the point: it is stock that would otherwise
-    // be invisible.
-    const landed = new Set(updated.map(r => String(r.sku).toUpperCase()));
-    const missing = codes.filter(c => !landed.has(c.toUpperCase()));
-
-    await client.query('COMMIT');
-    logger.info('office.seed.done', {
-      catalogue: source[0].n,
-      codesGiven: codes.length,
-      codesApplied: updated.length,
-      missing: missing.length ? missing.join(',') : 'none',
-    });
-  } catch (err) {
-    try { await client.query('ROLLBACK'); } catch {}
-    logger.error('office.seed.error', { err: err.message });
-  } finally {
-    client.release();
-  }
-}
 
 // ── Correcting a recorded sale ───────────────────────
 // A customer who swaps a garment for a different style has not returned
