@@ -179,5 +179,16 @@ check('a shop with none of it says zero rather than going missing',
 check('and the shops add up to the stock on the card',
   (bb2.inShops || []).reduce((n, r) => n + r.qty, 0) === bb2.stock, JSON.stringify(bb2.inShops));
 
+console.log('\n  what sold, in which size, in which year');
+const gdLine = (bb2.perShop || []).find(x => x.shop === 'Goldust');
+const y2025 = (gdLine.soldYears || []).find(x => x.year === 2025);
+check('the year carries its sizes, not just a number',
+  Boolean(y2025) && y2025.sizes.length > 0, JSON.stringify(y2025));
+check('and those sizes add up to the year',
+  y2025.sizes.reduce((n, z) => n + z.sold, 0) === y2025.sold, JSON.stringify(y2025));
+check('every year is listed, so an empty one can be shown on request',
+  (gdLine.soldYears || []).length === withBook.years.length,
+  String((gdLine.soldYears || []).length));
+
 console.log(failures === 0 ? '\nall checks passed' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

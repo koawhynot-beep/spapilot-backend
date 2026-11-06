@@ -2223,6 +2223,8 @@ app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
     const ORDER = ['X/S', 'XS', 'S', 'S/M', 'M', 'M/L', 'L', 'L/XL', 'X/L', 'XL', 'XXL', 'O/S'];
     const rank = (sz) => { const i = ORDER.indexOf(String(sz).toUpperCase()); return i < 0 ? 99 : i; };
 
+    const sortSizes = (a, b) => rank(a.size) - rank(b.size) || a.size.localeCompare(b.size);
+
     const years = [];
     for (let y = firstYear; y <= thisYear; y++) years.push(y);
 
@@ -2236,7 +2238,7 @@ app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
     // shop missing from the card reads as "not asked", and "Rose Gold, none"
     // is the answer someone at the counter is waiting for.
     const shopOf = (g, name) => {
-      if (!g.shops.has(name)) g.shops.set(name, { shop: name, sizes: new Map(), byYear: {} });
+      if (!g.shops.has(name)) g.shops.set(name, { shop: name, sizes: new Map(), byYear: {}, sizesByYear: {} });
       return g.shops.get(name);
     };
     const sizeOf = (shop, size) => {
@@ -2261,24 +2263,34 @@ app.get('/api/quick-check', auth, requireAdmin, async (req, res) => {
       const g = garments.get(r.key);
       const shop = shopOf(g, r.shop);
       shop.byYear[r.year] = (shop.byYear[r.year] || 0) + r.sold;
+      // Which size went, in which year. "Seventeen sold" and "seventeen
+      // S/M sold in 2026" are different facts, and only the second one
+      // tells her what to reorder.
+      const inYear = (shop.sizesByYear[r.year] ||= {});
+      inYear[r.size] = (inYear[r.size] || 0) + r.sold;
       // A size that has sold out everywhere and been taken off the list
       // still sold — it gets a cell of its own, at zero on the rail.
       sizeOf(shop, r.size).sold += r.sold;
     }
-
-    const sortSizes = (a, b) => rank(a.size) - rank(b.size) || a.size.localeCompare(b.size);
 
     res.json({
       years,
       shops: shopNames,
       garments: [...garments.values()].map(g => {
         const perShop = shopNames.map(name => {
-          const held = g.shops.get(name) || { sizes: new Map(), byYear: {} };
+          const held = g.shops.get(name) || { sizes: new Map(), byYear: {}, sizesByYear: {} };
           const sizes = [...held.sizes.values()].sort(sortSizes);
           return {
             shop: name,
             sizes,
             byYear: years.map(y => held.byYear[y] || 0),
+            soldYears: years.map(y => ({
+              year: y,
+              sold: held.byYear[y] || 0,
+              sizes: Object.entries(held.sizesByYear[y] || {})
+                .map(([size, sold]) => ({ size, sold }))
+                .sort(sortSizes),
+            })),
             stock: sizes.reduce((n, z) => n + z.qty, 0),
             sold: sizes.reduce((n, z) => n + z.sold, 0),
           };
