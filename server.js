@@ -822,6 +822,9 @@ async function initDB() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_transfers_pending ON stock_transfers(business_id, status)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_transfer_lines ON stock_transfer_lines(transfer_id)`);
   await pool.query(`ALTER TABLE imported_sales ADD COLUMN IF NOT EXISTS bank TEXT DEFAULT ''`);
+  // The sales log matches a book line to the shelf by code, across shops,
+  // which the per-shop unique index cannot answer.
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_stock_sku_upper ON stock_items (UPPER(sku))`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_imported_sales ON imported_sales(shop_id, sku)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_imported_sales_on ON imported_sales(sold_on)`);
 
@@ -835,6 +838,10 @@ async function initDB() {
 
   // Once, and never again: every record out and Atriq closed.
   await startFresh();
+
+  // What was on the shelves when the app took over. Only ever adds a code
+  // a shop does not have; it never rewrites a count.
+  await seedOpeningStock();
 
   // The shops' own till books, for the three screens that ask what sells.
   // No book is listed, so this only keeps the table empty.
@@ -2756,11 +2763,22 @@ const SALE_SELECT = `
 // book records. There is no "ticket price struck through" for these,
 // because the book never wrote one.
 const LEDGER_PRICE_SQL = `ROUND(i.value / NULLIF(i.units, 0))`;
+// Where the shelf knows the code, the shelf names it. The book and the
+// stock list were written by different hands over two years, so the same
+// garment is "NICOLE DRESS" in one and "NICOL DRESS" in the other — and a
+// list that spells one garment two ways reads as two garments. The code is
+// the thing both agree on, so it decides, and a code no shop carries keeps
+// whatever the book called it.
 const LEDGER_SELECT = `
   SELECT (-i.id) AS id, 'sale'::text AS type, (-i.units) AS qty_change,
          i.sold_on::timestamptz AS occurred_at, ''::text AS reason, ''::text AS note,
          ''::text AS staff_name, NULL::int AS staff_id,
-         i.sku, i.name AS item_name, i.color, i.size, i.style AS category, i.fabric,
+         i.sku,
+         COALESCE(NULLIF(shelf.name,''), i.name) AS item_name,
+         COALESCE(NULLIF(shelf.color,''), i.color) AS color,
+         COALESCE(NULLIF(shelf.size,''), i.size) AS size,
+         COALESCE(NULLIF(shelf.category,''), i.style) AS category,
+         COALESCE(NULLIF(shelf.fabric,''), i.fabric) AS fabric,
          ${LEDGER_PRICE_SQL} AS price, ${LEDGER_PRICE_SQL} AS net_price,
          0::numeric AS discount_pct, 0::numeric AS cost,
          ${LEDGER_PRICE_SQL} AS unit_price, NULL::int AS item_id,
@@ -2774,6 +2792,14 @@ const LEDGER_SELECT = `
          i.shop_id, sh.name AS shop_name, TRUE AS from_book
   FROM imported_sales i
   JOIN shops sh ON sh.id = i.shop_id
+  LEFT JOIN LATERAL (
+    SELECT si.name, si.category, si.fabric, si.color, si.size
+      FROM stock_items si
+      JOIN shops sh2 ON sh2.id = si.shop_id
+     WHERE sh2.business_id = sh.business_id AND UPPER(si.sku) = i.sku
+     ORDER BY (si.shop_id = i.shop_id) DESC, si.id
+     LIMIT 1
+  ) shelf ON TRUE
 `;
 
 // Units and money off the combined rows, where the table aliases are gone
@@ -3168,6 +3194,70 @@ async function removeSheetSalesHistory() {
     if (rowCount) logger.warn('sales.sheet.removed', { entries: rowCount });
   } catch (err) {
     logger.error('sales.sheet.remove.error', { err: err.message });
+  }
+}
+
+// What was on the shelves when the app took over.
+//
+// A starting count, not a running one: a code is only added to a shop that
+// does not already hold it, and a count already in the app is never
+// touched. Once the shop is counting in here, the app is right and the
+// workbook is history — so this can run on every boot and will quietly do
+// nothing from the second one onwards.
+//
+// Codes counted at zero are loaded too. A garment with none left is still a
+// garment the shop sells: it belongs on the list so it can be found and
+// reordered, and so its sales history has something to hang on.
+async function seedOpeningStock() {
+  const client = await pool.connect();
+  try {
+    const { rows, source } = require('./opening-stock.js');
+    const { rows: shops } = await client.query(
+      `SELECT id, code FROM shops WHERE code = ANY($1::text[])`, [['OF', 'GD', 'RG']]
+    );
+    if (!shops.length) return;
+    const COLUMN = { OF: 7, GD: 8, RG: 9 };
+
+    let added = 0;
+    let pieces = 0;
+    await client.query('BEGIN');
+    for (const shop of shops) {
+      const at = COLUMN[shop.code];
+      if (at === undefined) continue;
+      const { rows: have } = await client.query(
+        `SELECT UPPER(sku) AS sku FROM stock_items WHERE shop_id = $1 AND COALESCE(sku,'') <> ''`,
+        [shop.id]
+      );
+      const already = new Set(have.map(r => r.sku));
+      const col = { sku: [], name: [], style: [], fabric: [], color: [], size: [], price: [], qty: [] };
+      for (const r of rows) {
+        const sku = String(r[0]).toUpperCase();
+        if (already.has(sku)) continue;
+        col.sku.push(sku); col.name.push(r[1]); col.style.push(r[2]);
+        col.fabric.push(r[3]); col.color.push(r[4]); col.size.push(r[5]);
+        col.price.push(r[6]); col.qty.push(r[at]);
+      }
+      if (!col.sku.length) continue;
+      await client.query(
+        `INSERT INTO stock_items
+           (shop_id, sku, name, category, fabric, color, size, price, qty,
+            print, brand, threshold, supplier, notes, image_url, cost, position)
+         SELECT $1, UNNEST($2::text[]), UNNEST($3::text[]), UNNEST($4::text[]),
+                UNNEST($5::text[]), UNNEST($6::text[]), UNNEST($7::text[]),
+                UNNEST($8::numeric[]), UNNEST($9::int[]),
+                '', '', 0, '', '', '', 0, 0`,
+        [shop.id, col.sku, col.name, col.style, col.fabric, col.color, col.size, col.price, col.qty]
+      );
+      added += col.sku.length;
+      pieces += col.qty.reduce((n, q) => n + q, 0);
+    }
+    await client.query('COMMIT');
+    if (added) logger.warn('stock.opening.loaded', { source, items: added, pieces });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    logger.error('stock.opening.error', { err: err.message });
+  } finally {
+    client.release();
   }
 }
 
