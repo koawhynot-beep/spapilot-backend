@@ -107,8 +107,15 @@ check('it is admin-only — one person’s takings are not another’s business'
   /app\.get\('\/api\/sales\/by-staff', auth, requireAdmin/.test(src), 'requireAdmin missing');
 check('it respects the period and shop filters on screen',
   /by-staff[\s\S]{0,600}salesFilter\(req, 3\)/.test(src), 'salesFilter not applied');
+// The page now adds the shop's own book to what the app rang up, so the
+// money comes off the combined rows. The chain still has to end at the
+// discounted price: ROW_VALUE_SQL multiplies by net_price, and net_price is
+// SALE_NET_SQL for a movement and the price the book recorded for a line.
 check('revenue is net of discounts, not the ticket price',
-  /by-staff[\s\S]{0,900}SALE_NET_SQL/.test(src), 'it sums the undiscounted price');
+  /by-staff[\s\S]{0,1400}ROW_VALUE_SQL/.test(src)
+  && /const ROW_VALUE_SQL = `\$\{ROW_UNITS_SQL} \* s\.net_price`/.test(src)
+  && /\$\{SALE_NET_SQL} AS net_price/.test(src),
+  'it sums the undiscounted price');
 check('the ordering is written out, not left to a column number',
   !/ORDER BY 5 DESC/.test(src), 'ORDER BY 5 breaks the moment a column is added');
 

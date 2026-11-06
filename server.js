@@ -2718,11 +2718,48 @@ const SALE_SELECT = `
          COALESCE(m.discount_pct, 0) AS discount_pct, COALESCE(si.cost,0) AS cost,
          m.unit_price AS unit_price, m.item_id, m.qty_change AS raw_qty_change,
          COALESCE(m.payment,'') AS payment, m.cash_amount,
-         m.shop_id, sh.name AS shop_name
+         m.shop_id, sh.name AS shop_name, FALSE AS from_book
   FROM stock_movements m
   JOIN stock_items si ON si.id = m.item_id
   JOIN shops sh ON sh.id = m.shop_id
 `;
+
+// The book, shaped exactly like a sale: same column names, same meanings,
+// so a query that reads movements can read it too by putting the two
+// together. Everything a movement knows and the book does not is stated as
+// what it is — no salesperson, no cost, no row to edit.
+//
+// A line's price is what it actually fetched, which is the only price the
+// book records. There is no "ticket price struck through" for these,
+// because the book never wrote one.
+const LEDGER_PRICE_SQL = `ROUND(i.value / NULLIF(i.units, 0))`;
+const LEDGER_SELECT = `
+  SELECT (-i.id) AS id, 'sale'::text AS type, (-i.units) AS qty_change,
+         i.sold_on::timestamptz AS occurred_at, ''::text AS reason, ''::text AS note,
+         ''::text AS staff_name, NULL::int AS staff_id,
+         i.sku, i.name AS item_name, i.color, i.size, i.style AS category, i.fabric,
+         ${LEDGER_PRICE_SQL} AS price, ${LEDGER_PRICE_SQL} AS net_price,
+         0::numeric AS discount_pct, 0::numeric AS cost,
+         ${LEDGER_PRICE_SQL} AS unit_price, NULL::int AS item_id,
+         (-i.units) AS raw_qty_change,
+         CASE WHEN i.cash > 0 AND i.card > 0 THEN 'split'
+              WHEN i.cash > 0 THEN 'cash'
+              WHEN i.card > 0 THEN 'card'
+              ELSE '' END AS payment,
+         CASE WHEN i.cash > 0 AND i.card > 0 THEN i.cash ELSE NULL::numeric END AS cash_amount,
+         i.shop_id, sh.name AS shop_name, TRUE AS from_book
+  FROM imported_sales i
+  JOIN shops sh ON sh.id = i.shop_id
+`;
+
+// The same local-time and week expressions, for the combined rows.
+const ROW_LOCAL_AT_SQL = `(s.occurred_at AT TIME ZONE '${SHOP_TZ.replace(/'/g, "''")}')`;
+const ROW_WEEK_OF_SQL = WEEK_OF_MONTH_SQL.replace('local_at', ROW_LOCAL_AT_SQL);
+
+// Units and money off the combined rows, where the table aliases are gone
+// and only the output columns are left.
+const ROW_UNITS_SQL = `CASE WHEN s.type IN ('sale','return') THEN -s.qty_change ELSE 0 END`;
+const ROW_VALUE_SQL = `${ROW_UNITS_SQL} * s.net_price`;
 
 const shapeSale = (r) => {
   const units = -r.qty_change;                 // sale: +n · return: -n
@@ -2759,6 +2796,9 @@ const shapeSale = (r) => {
     staffName: r.staff_name,
     reason: r.reason || '',
     payment: r.payment || '',
+    // A line out of the shop's own book, not something this app watched
+    // happen. It has no movement behind it, so there is nothing to correct.
+    fromBook: Boolean(r.from_book),
     // Only a part-cash row has one. Null everywhere else, so a screen that
     // reads it cannot mistake "paid entirely in cash" for "nothing in cash".
     cashAmount: r.cash_amount === null || r.cash_amount === undefined ? null : Number(r.cash_amount),
@@ -2865,7 +2905,7 @@ const LEDGER_PARTS = [
   ['day',   (v) => v >= 1 && v <= 31,      `EXTRACT(DAY FROM i.sold_on)`],
 ];
 
-async function ledgerFilter(req, startParamIndex) {
+async function ledgerFilter(req, startParamIndex, skip) {
   const params = [];
   let where = '';
   const push = (v) => { params.push(v); return startParamIndex + params.length - 1; };
@@ -2887,6 +2927,9 @@ async function ledgerFilter(req, startParamIndex) {
     where += ` AND (i.sku ILIKE $${n} OR i.name ILIKE $${n} OR i.color ILIKE $${n})`;
   }
   for (const [name, valid, expr] of LEDGER_PARTS) {
+    // `skip` lets a facet count leave its own part out, so the list of
+    // months still shows every month once one of them is chosen.
+    if (name === skip) continue;
     const n = parseInt(req.query[name], 10);
     if (!Number.isInteger(n) || !valid(n)) continue;
     where += ` AND ${expr} = $${push(n)}`;
@@ -2953,25 +2996,36 @@ app.get('/api/sales/history', auth, async (req, res) => {
     // fabric answers a different question — what has the linen been doing —
     // and within a fabric the rows stay newest first, so it reads as a set of
     // small histories rather than one shuffled list.
+    // Ordered on the output columns, because by this point the rows are
+    // two sources put together and the table aliases are gone.
     const SALE_ORDERS = {
-      recent: 'm.occurred_at DESC, m.id DESC',
-      fabric: "NULLIF(si.fabric,'') ASC NULLS LAST, m.occurred_at DESC, m.id DESC",
+      recent: 's.occurred_at DESC, s.id DESC',
+      fabric: "NULLIF(s.fabric,'') ASC NULLS LAST, s.occurred_at DESC, s.id DESC",
     };
     const orderBy = SALE_ORDERS[req.query.sort] || SALE_ORDERS.recent;
 
+    // The log is what sold, and the shop's own book is part of that. The
+    // two are put together here rather than in a view, so the movements
+    // half stays exactly the query it always was.
+    const ledger = await ledgerFilter(req, all.length + 1);
+    const both = `(
+      ${SALE_SELECT} WHERE ${windowSql}
+      UNION ALL
+      ${LEDGER_SELECT} WHERE sh.business_id = $1
+        AND i.sold_on >= (NOW() - ($2 || ' months')::interval)::date${ledger.where}
+    ) s`;
+    const bothParams = [...all, ...ledger.params];
+
     const { rows } = await pool.query(
-      `${SALE_SELECT} WHERE ${windowSql} ORDER BY ${orderBy} LIMIT ${limit} OFFSET ${offset}`,
-      all
+      `SELECT * FROM ${both} ORDER BY ${orderBy} LIMIT ${limit} OFFSET ${offset}`,
+      bothParams
     );
     const { rows: agg } = await pool.query(
       `SELECT COUNT(*)::int AS n,
-              COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units,
-              COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_NET_SQL}),0)::numeric AS revenue
-       FROM stock_movements m
-       JOIN stock_items si ON si.id = m.item_id
-       JOIN shops sh ON sh.id = m.shop_id
-       WHERE ${windowSql}`,
-      all
+              COALESCE(SUM(${ROW_UNITS_SQL}),0)::int AS units,
+              COALESCE(SUM(${ROW_VALUE_SQL}),0)::numeric AS revenue
+       FROM ${both}`,
+      bothParams
     );
     res.json({
       total: agg[0].n, limit, offset, windowMonths: HISTORY_MONTHS,
@@ -3055,12 +3109,13 @@ async function removeSheetSalesHistory() {
 // into the shop whose book it is. Replacing one means pointing it at a
 // newer file: the rows carry a new source name, the copy they supersede is
 // swept out first, and nothing else has to be remembered.
-// Empty, and the table follows it: the sweep below keeps exactly the books
-// named here, so with none named the table is emptied on every boot and
-// stays that way. The owner cleared the app to start from what the shops
-// actually count and ring up. Listing a book here is all it takes to load
-// one again, and nothing else needs to change.
-const IMPORTED_BOOKS = [];
+// The sweep below keeps exactly the books named here: a book not listed is
+// a book whose rows are deleted on the next boot, and a book listed under a
+// new name replaces the copy it supersedes. That is the whole mechanism for
+// swapping one in or out.
+const IMPORTED_BOOKS = [
+  { shop: 'GD', file: './goldust-history.js' },
+];
 
 async function seedImportedSales() {
   // The table holds exactly the books in the list above and nothing else.
@@ -3631,27 +3686,34 @@ app.get('/api/sales/by-staff', auth, requireAdmin, async (req, res) => {
   try {
     const { where, params } = await salesFilter(req, 3);
     const all = [req.user.businessId, String(HISTORY_MONTHS), ...params];
+    // The book is in here too, under the unnamed row: it records no
+    // salesperson, and leaving it out would make this page disagree with
+    // the log beside it. Nobody is paid commission on it — commission is
+    // worked out per named staff member, and these rows name nobody.
+    const ledger = await ledgerFilter(req, all.length + 1);
     const { rows } = await pool.query(
-      `SELECT COALESCE(NULLIF(m.staff_name,''), '') AS name,
-              MIN(m.staff_id) AS staff_id,
+      `SELECT COALESCE(NULLIF(s.staff_name,''), '') AS name,
+              MIN(s.staff_id) AS staff_id,
               COUNT(*)::int AS entries,
-              COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units,
-              COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_NET_SQL}),0)::numeric AS revenue,
-              MAX(m.occurred_at) AS last_at
-         FROM stock_movements m
-         JOIN stock_items si ON si.id = m.item_id
-         JOIN shops sh ON sh.id = m.shop_id
-        WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}
-          AND m.occurred_at >= NOW() - ($2 || ' months')::interval ${where}
+              COALESCE(SUM(${ROW_UNITS_SQL}),0)::int AS units,
+              COALESCE(SUM(${ROW_VALUE_SQL}),0)::numeric AS revenue,
+              MAX(s.occurred_at) AS last_at
+         FROM (
+           ${SALE_SELECT} WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}
+             AND m.occurred_at >= NOW() - ($2 || ' months')::interval ${where}
+           UNION ALL
+           ${LEDGER_SELECT} WHERE sh.business_id = $1
+             AND i.sold_on >= (NOW() - ($2 || ' months')::interval)::date${ledger.where}
+         ) s
         GROUP BY 1
         -- Biggest first, but the unnamed row last whatever it comes to: it is
         -- not a person, and it should not sit in the middle of a list of them.
         -- The name breaks ties, so two equal totals do not swap places between
         -- one look at the page and the next.
-        ORDER BY (COALESCE(NULLIF(m.staff_name,''), '') = '') ASC,
-                 COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_NET_SQL}),0) DESC,
+        ORDER BY (COALESCE(NULLIF(s.staff_name,''), '') = '') ASC,
+                 COALESCE(SUM(${ROW_VALUE_SQL}),0) DESC,
                  1 ASC`,
-      all
+      [...all, ...ledger.params]
     );
 
     const items = rows.map(r => ({
@@ -3692,25 +3754,29 @@ app.get('/api/sales/by-staff', auth, requireAdmin, async (req, res) => {
 app.get('/api/sales/periods', auth, requireAdmin, async (req, res) => {
   try {
     const bucketSql = {
-      year:  `EXTRACT(YEAR FROM ${LOCAL_AT_SQL})::int`,
-      month: `EXTRACT(MONTH FROM ${LOCAL_AT_SQL})::int`,
-      week:  WEEK_OF_SQL,
-      day:   `EXTRACT(DAY FROM ${LOCAL_AT_SQL})::int`,
+      year:  `EXTRACT(YEAR FROM ${ROW_LOCAL_AT_SQL})::int`,
+      month: `EXTRACT(MONTH FROM ${ROW_LOCAL_AT_SQL})::int`,
+      week:  ROW_WEEK_OF_SQL,
+      day:   `EXTRACT(DAY FROM ${ROW_LOCAL_AT_SQL})::int`,
     };
 
+    // Both books, as in the log beside it: a month's figures that leave out
+    // what the shop's own book says would disagree with the list under them.
     const countFor = async (level) => {
       const { where, params } = await salesFilter(req, 2, level);
+      const ledger = await ledgerFilter(req, 2 + params.length, level);
       const { rows } = await pool.query(
         `SELECT ${bucketSql[level]} AS key,
                 COUNT(*)::int AS entries,
-                COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units,
-                COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_NET_SQL}),0)::numeric AS revenue
-           FROM stock_movements m
-           JOIN stock_items si ON si.id = m.item_id
-           JOIN shops sh ON sh.id = m.shop_id
-          WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL} ${where}
+                COALESCE(SUM(${ROW_UNITS_SQL}),0)::int AS units,
+                COALESCE(SUM(${ROW_VALUE_SQL}),0)::numeric AS revenue
+           FROM (
+             ${SALE_SELECT} WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL} ${where}
+             UNION ALL
+             ${LEDGER_SELECT} WHERE sh.business_id = $1${ledger.where}
+           ) s
           GROUP BY 1 ORDER BY 1 ${level === 'year' ? 'DESC' : 'ASC'}`,
-        [req.user.businessId, ...params]
+        [req.user.businessId, ...params, ...ledger.params]
       );
       return rows.map(r => ({
         key: Number(r.key), entries: r.entries, units: r.units, revenue: Number(r.revenue),
@@ -3719,15 +3785,17 @@ app.get('/api/sales/periods', auth, requireAdmin, async (req, res) => {
 
     // The totals for what is actually selected — every part applied.
     const { where, params, period } = await salesFilter(req, 2);
+    const totalLedger = await ledgerFilter(req, 2 + params.length);
     const { rows: [t] } = await pool.query(
       `SELECT COUNT(*)::int AS entries,
-              COALESCE(SUM(${NET_UNITS_SQL}),0)::int AS units,
-              COALESCE(SUM(${NET_UNITS_SQL} * ${SALE_NET_SQL}),0)::numeric AS revenue
-         FROM stock_movements m
-         JOIN stock_items si ON si.id = m.item_id
-         JOIN shops sh ON sh.id = m.shop_id
-        WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL} ${where}`,
-      [req.user.businessId, ...params]
+              COALESCE(SUM(${ROW_UNITS_SQL}),0)::int AS units,
+              COALESCE(SUM(${ROW_VALUE_SQL}),0)::numeric AS revenue
+         FROM (
+           ${SALE_SELECT} WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL} ${where}
+           UNION ALL
+           ${LEDGER_SELECT} WHERE sh.business_id = $1${totalLedger.where}
+         ) s`,
+      [req.user.businessId, ...params, ...totalLedger.params]
     );
 
     const [years, months, weeks, days] = await Promise.all(
@@ -3780,17 +3848,24 @@ app.get('/api/sales/history.csv', auth, requireAdmin, async (req, res) => {
   try {
     const { where, params } = await salesFilter(req, 3);
     const all = [req.user.businessId, String(HISTORY_MONTHS), ...params];
+    const ledger = await ledgerFilter(req, all.length + 1);
     const { rows } = await pool.query(
-      `${SALE_SELECT}
-       WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}
-         AND m.occurred_at >= NOW() - ($2 || ' months')::interval ${where}
-       ORDER BY m.occurred_at DESC, m.id DESC LIMIT 20000`,
-      all
+      `SELECT * FROM (
+         ${SALE_SELECT}
+          WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}
+            AND m.occurred_at >= NOW() - ($2 || ' months')::interval ${where}
+         UNION ALL
+         ${LEDGER_SELECT}
+          WHERE sh.business_id = $1
+            AND i.sold_on >= (NOW() - ($2 || ' months')::interval)::date${ledger.where}
+       ) s
+       ORDER BY s.occurred_at DESC, s.id DESC LIMIT 20000`,
+      [...all, ...ledger.params]
     );
     const body = csvDoc(
       ['Date', 'Time', 'Shop', 'Type', 'SKU', 'Item', 'Colour', 'Size', 'Units',
        'Price (IDR)', 'Discount %', 'Charged (IDR)', 'Value (IDR)', 'Staff', 'Paid by',
-       'In cash (IDR)', 'On card (IDR)', 'Reason'],
+       'In cash (IDR)', 'On card (IDR)', 'Reason', 'Source'],
       rows.map(shapeSale).map(r => {
         const d = new Date(r.occurredAt);
         // Whoever reconciles the till adds these two columns up, so they are
@@ -3799,7 +3874,8 @@ app.get('/api/sales/history.csv', auth, requireAdmin, async (req, res) => {
         return [d.toISOString().slice(0, 10), d.toISOString().slice(11, 19), r.shopName,
                 r.type, r.sku, r.itemName, r.color, r.size, r.units,
                 r.price, r.discountPct, r.netPrice, r.value,
-                r.staffName, r.payment, cash, r.value - cash, r.reason];
+                r.staffName, r.payment, cash, r.value - cash, r.reason,
+                r.fromBook ? 'shop book' : 'app'];
       })
     );
     sendCsv(res, `sales-${new Date().toISOString().slice(0, 10)}.csv`, body);

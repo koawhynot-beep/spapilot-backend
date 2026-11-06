@@ -51,14 +51,26 @@ console.log('\nReal Postgres · the shops\' own sales books\n');
 // ── The books that ship ──────────────────────────────────────────────────
 // eslint-disable-next-line no-eval
 const BOOKS = eval(grab('const IMPORTED_BOOKS = [', '];').slice('const IMPORTED_BOOKS = '.length));
-console.log('  no book is listed');
-// The owner cleared the app to start from what the shops actually count and
-// ring up, so the list is empty. The sweep below is what makes that stick:
-// it keeps exactly the books named here, and with none named it empties the
-// table on every boot. Listing one again is all it takes to load it.
-check('no book is listed', BOOKS.length === 0, JSON.stringify(BOOKS));
-check('and no data file is left to list', !/-history\.js/.test(src),
-  'a loader still points at a spreadsheet');
+console.log('  the book as it ships');
+check('one book is listed, and it names a shop and a file',
+  BOOKS.length === 1 && /^[A-Z]{2}$/.test(BOOKS[0].shop) && BOOKS[0].file.startsWith('./'),
+  JSON.stringify(BOOKS));
+
+const book = (await import(new URL('../' + BOOKS[0].file.replace('./', ''), import.meta.url))).default;
+const pieces = book.rows.reduce((n, r) => n + r[7], 0);
+const value = book.rows.reduce((n, r) => n + r[8], 0);
+console.log(`  ${BOOKS[0].shop}: ${book.rows.length} lines · ${pieces} pieces · ${value.toLocaleString('en-US')} IDR`);
+check('every line has a code, a day and at least one piece',
+  book.rows.every(r => r[0] && /^\d{4}-\d{2}-\d{2}$/.test(r[6]) && r[7] > 0), 'a malformed line');
+check('no line is worth less than nothing', book.rows.every(r => r[8] >= 0), 'a negative sale');
+check('cash and card never come to more than the line',
+  book.rows.every(r => r[9] + r[10] <= r[8]), 'a line claims more money than it took');
+check('alterations are not in it — they sell no garment',
+  !book.rows.some(r => r[0] === 'AL-2001'), 'the sewing service is counted as stock sold');
+const described = book.rows.filter(r => r[2] || r[3]).length;
+check(`the garments are described — ${Math.round((described / book.rows.length) * 100)}% carry a style or fabric`,
+  described / book.rows.length > 0.8, `only ${described} of ${book.rows.length}`);
+check('the book is named', typeof book.source === 'string' && book.source.length > 0, 'no source');
 
 // ── The loader ───────────────────────────────────────────────────────────
 const FIXTURE = {
@@ -90,7 +102,9 @@ await seedOne({ shop: 'GD', file: './fixture.js' });
 check('a second run loads nothing again',
   (await one(`SELECT COUNT(*)::int AS n FROM imported_sales`)).n === 2, 'it doubled the book');
 
-console.log('\n  the sweep keeps exactly the books that are listed');
+console.log('\n  a newer copy supersedes the old');
+await db.query(`INSERT INTO imported_sales (shop_id, source, sku, sold_on, units)
+                VALUES (1, 'last month''s copy', 'NI-1005', '2025-01-05', 9)`);
 const sweep = new Function('pool', 'logger', 'require', 'seedOneBook', `
   ${grab('const IMPORTED_BOOKS = [', '];')}
   ${grab('async function seedImportedSales() {', '\n}')}
@@ -98,14 +112,14 @@ const sweep = new Function('pool', 'logger', 'require', 'seedOneBook', `
 `)(pool, logger, () => FIXTURE, async () => {});
 logs.length = 0;
 await sweep();
-check('with none listed, the table is emptied',
-  (await one(`SELECT COUNT(*)::int AS n FROM imported_sales`)).n === 0,
-  'rows survived a boot that lists no book');
+check('the superseded copy is swept out before anything is loaded',
+  (await one(`SELECT COUNT(*)::int AS n FROM imported_sales WHERE source LIKE 'last month%'`)).n === 0,
+  'two copies of one book would double every figure that reads it');
 check('and it says what it removed',
   logs.some(l => l[0] === 'ledger.superseded'), JSON.stringify(logs));
 
 // ── Where the book may be read, and where it may not ─────────────────────
-console.log('\n  three screens, and no others');
+console.log('\n  where the book may be read, and where it may not');
 const BLOCKS = {
   'the table itself': grab("    -- What each shop sold before the app", 'card NUMERIC(14,2) NOT NULL DEFAULT 0\n    );'),
   'its indexes': grab('  await pool.query(`CREATE INDEX IF NOT EXISTS idx_imported_sales ', 'idx_imported_sales_on ON imported_sales(sold_on)`);'),
@@ -113,12 +127,17 @@ const BLOCKS = {
   'the clean slate': grab('async function startFresh() {', '\n}'),
   'one book at a time': grab('async function seedOneBook({ shop, file }) {', '\n}'),
   'the stock list': grab("app.get('/api/shops/:shopId/stock'", '\n});'),
+  'the sales log': grab("app.get('/api/sales/history', auth", '\n});'),
+  'the day-by-day figures': grab("app.get('/api/sales/periods'", '\n});'),
+  'per seller': grab("app.get('/api/sales/by-staff'", '\n});'),
+  'the export': grab("app.get('/api/sales/history.csv'", '\n});'),
+  'the sale-shaped view of it': grab('const LEDGER_SELECT = `', '`;'),
   'Quick check': grab("app.get('/api/quick-check'", '\n});'),
   'best and worst': grab("app.get('/api/analytics/summary'", '\n});'),
 };
 let rest = src;
 for (const b of Object.values(BLOCKS)) rest = rest.split(b).join('');
-check('nothing outside the table, the loader and those three screens names it',
+check('nothing outside the table, the loader and the screens that report what sold names it',
   !rest.includes('imported_sales'),
   `${rest.split('imported_sales').length - 1} other mentions`);
 
@@ -137,6 +156,17 @@ check('nor the dead-stock and fast-moving report',
 check('the years offered cover both books, since the lists do',
   /SELECT EXTRACT\(YEAR FROM i\.sold_on\)::int/.test(sliceOf('Which years there is anything')),
   'a year in the book would not be offered');
+
+// Today's till roll is the one sales screen the book stays out of: it
+// answers "what happened today", and a book of past trade cannot.
+check('the till roll counts only what the app rang up',
+  !/imported_sales|LEDGER_SELECT/.test(grab("app.get('/api/sales/today'", '\n});')),
+  'the book reached the till roll');
+check('and so does the commission',
+  !/imported_sales|LEDGER_SELECT/.test(grab('const COMMISSION_SQL = `', '`;')),
+  'somebody would be paid commission on the book');
+check('the book records no salesperson, so it can never be credited to one',
+  /''::text AS staff_name, NULL::int AS staff_id/.test(src), 'it names a person');
 
 check('the loader is the only thing that writes to it',
   (src.match(/INSERT INTO imported_sales/g) || []).length === 1
