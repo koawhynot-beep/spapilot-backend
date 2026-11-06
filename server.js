@@ -2752,10 +2752,6 @@ const LEDGER_SELECT = `
   JOIN shops sh ON sh.id = i.shop_id
 `;
 
-// The same local-time and week expressions, for the combined rows.
-const ROW_LOCAL_AT_SQL = `(s.occurred_at AT TIME ZONE '${SHOP_TZ.replace(/'/g, "''")}')`;
-const ROW_WEEK_OF_SQL = WEEK_OF_MONTH_SQL.replace('local_at', ROW_LOCAL_AT_SQL);
-
 // Units and money off the combined rows, where the table aliases are gone
 // and only the output columns are left.
 const ROW_UNITS_SQL = `CASE WHEN s.type IN ('sale','return') THEN -s.qty_change ELSE 0 END`;
@@ -2881,6 +2877,13 @@ const LOCAL_AT_SQL = `(m.occurred_at AT TIME ZONE '${SHOP_TZ.replace(/'/g, "''")
 // pull in days belonging to the month that was not picked.
 const WEEK_OF_MONTH_SQL = `LEAST(5, FLOOR((EXTRACT(DAY FROM local_at) - 1) / 7) + 1)::int`;
 const WEEK_OF_SQL = WEEK_OF_MONTH_SQL.replace('local_at', LOCAL_AT_SQL);
+
+// The same two expressions over the combined rows, where the movement
+// aliases are gone. They live here, below SHOP_TZ and the week rule they
+// are built from: declared above them they read fine and crash at boot,
+// which is exactly what happened.
+const ROW_LOCAL_AT_SQL = `(s.occurred_at AT TIME ZONE '${SHOP_TZ.replace(/'/g, "''")}')`;
+const ROW_WEEK_OF_SQL = WEEK_OF_MONTH_SQL.replace('local_at', ROW_LOCAL_AT_SQL);
 
 // Year, month, week and day are four independent filters, not four steps.
 // Any of them can be set without the others: a day on its own means that date
