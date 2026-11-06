@@ -22,7 +22,7 @@
 //
 // rows: [sku, name, style, fabric, colour, size, date, units, value, cash, card, bank]
 module.exports = {
-  source: "gold dust ledger to 5 Nov 2026",
+  source: "gold dust ledger to 5 Nov 2026 \u00b7 c7133951",
   rows: [
     ["BA-2001", "BAG OVALE GOLDUST LARGE", "BAG OVALE GOLDUST", "", "LARGE", "", "2025-01-01", 1, 350000, 0, 350000, "BNI"],
     ["BO-1001", "BOOBTUBE PITA NATURAL O/S", "BOOBTUBE PITA", "RAMIE", "NATURAL", "O/S", "2025-01-01", 1, 295000, 0, 295000, "BNI"],

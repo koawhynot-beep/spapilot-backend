@@ -72,6 +72,11 @@ const described = book.rows.filter(r => r[2] || r[3]).length;
 check(`the garments are described — ${Math.round((described / book.rows.length) * 100)}% carry a style or fabric`,
   described / book.rows.length > 0.8, `only ${described} of ${book.rows.length}`);
 check('the book is named', typeof book.source === 'string' && book.source.length > 0, 'no source');
+// The name ends in a fingerprint of the lines, so a file that changes is a
+// book the loader has not seen and therefore reloads. Without it, adding a
+// column to the data file left the loaded copy silently one version behind.
+check('and its name follows its contents, so a changed file is reloaded',
+  / · [0-9a-f]{8}$/.test(book.source), book.source);
 
 // ── The loader ───────────────────────────────────────────────────────────
 const FIXTURE = {
