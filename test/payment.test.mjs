@@ -241,5 +241,14 @@ check('the sale with no method is in the takings but in neither half',
   Number(till.taken) - Number(till.cash) - Number(till.card) === 1000000,
   String(Number(till.taken) - Number(till.cash) - Number(till.card)));
 
+console.log('\n  the sales log carries the same split');
+check('the log totals report cash and card, not just revenue',
+  /COALESCE\(SUM\(\$\{ROW_CASH_SQL}\),0\)::numeric AS cash/.test(src)
+  && /COALESCE\(SUM\(\$\{ROW_CARD_SQL}\),0\)::numeric AS card/.test(src),
+  'the totals cannot be counted against a drawer');
+check('and the card half is the rest of the row, never stored twice',
+  /WHEN 'split' THEN \$\{ROW_VALUE_SQL} - \$\{ROW_CASH_SQL}/.test(src),
+  'the two halves can drift apart');
+
 console.log(failures === 0 ? '\nall checks passed' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

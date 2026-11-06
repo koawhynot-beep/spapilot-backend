@@ -2757,6 +2757,19 @@ const LEDGER_SELECT = `
 const ROW_UNITS_SQL = `CASE WHEN s.type IN ('sale','return') THEN -s.qty_change ELSE 0 END`;
 const ROW_VALUE_SQL = `${ROW_UNITS_SQL} * s.net_price`;
 
+// The same money, split the way the customer paid it. A part-cash row
+// carries only its cash half; the card half is whatever is left of the row,
+// so the two always add back up to the takings. Anything with no method
+// recorded is in neither, which is the honest place for it.
+const ROW_CASH_SQL = `(CASE s.payment
+    WHEN 'cash'  THEN ${ROW_VALUE_SQL}
+    WHEN 'split' THEN SIGN(${ROW_VALUE_SQL}) * LEAST(COALESCE(s.cash_amount, 0), ABS(${ROW_VALUE_SQL}))
+    ELSE 0 END)`;
+const ROW_CARD_SQL = `(CASE s.payment
+    WHEN 'card'  THEN ${ROW_VALUE_SQL}
+    WHEN 'split' THEN ${ROW_VALUE_SQL} - ${ROW_CASH_SQL}
+    ELSE 0 END)`;
+
 const shapeSale = (r) => {
   const units = -r.qty_change;                 // sale: +n · return: -n
   const price = Number(r.price);
@@ -3026,13 +3039,20 @@ app.get('/api/sales/history', auth, async (req, res) => {
     const { rows: agg } = await pool.query(
       `SELECT COUNT(*)::int AS n,
               COALESCE(SUM(${ROW_UNITS_SQL}),0)::int AS units,
-              COALESCE(SUM(${ROW_VALUE_SQL}),0)::numeric AS revenue
+              COALESCE(SUM(${ROW_VALUE_SQL}),0)::numeric AS revenue,
+              COALESCE(SUM(${ROW_CASH_SQL}),0)::numeric AS cash,
+              COALESCE(SUM(${ROW_CARD_SQL}),0)::numeric AS card
        FROM ${both}`,
       bothParams
     );
     res.json({
       total: agg[0].n, limit, offset, windowMonths: HISTORY_MONTHS,
-      totals: { units: agg[0].units, revenue: Number(agg[0].revenue) },
+      totals: {
+        units: agg[0].units, revenue: Number(agg[0].revenue),
+        // What of it came in each way, so a day on screen can be counted
+        // against the drawer without exporting it first.
+        cash: Number(agg[0].cash), card: Number(agg[0].card),
+      },
       items: rows.map(shapeSale),
     });
   } catch (err) {
