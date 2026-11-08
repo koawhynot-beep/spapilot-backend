@@ -3001,6 +3001,26 @@ const LEDGER_PARTS = [
   ['day',   (v) => v >= 1 && v <= 31,      `EXTRACT(DAY FROM i.sold_on)`],
 ];
 
+// What the shelf calls this code, for a filter asked of a book line.
+//
+// The books were written against the catalogue of their day: FL-1032 is
+// "RAYON LINEN / BULU KUDA LINEN" in the book and "BULU KUDA RAYON LINEN /
+// NATURAL" on today's shelf. Filtering the book by its own words therefore
+// threw away every line of its history the moment a fabric was picked, and
+// a garment with two years of sales came back showing one — the one sale
+// the app itself had rung up.
+//
+// So a filter asks the shelf, by code, exactly as the sales log does when
+// it decides what to call a line, and only falls back to the book's own
+// word for a code no shop carries any more.
+const SHELF_FACET = (col) => `COALESCE(NULLIF((
+    SELECT si.${col} FROM stock_items si
+      JOIN shops sh2 ON sh2.id = si.shop_id
+     WHERE sh2.business_id = sh.business_id AND UPPER(si.sku) = i.sku
+     ORDER BY (si.shop_id = i.shop_id) DESC, si.id
+     LIMIT 1
+  ), '')`;
+
 async function ledgerFilter(req, startParamIndex, skip) {
   const params = [];
   let where = '';
@@ -3012,10 +3032,10 @@ async function ledgerFilter(req, startParamIndex, skip) {
   if (shopIds) where += ` AND i.shop_id = ANY($${push(shopIds)}::int[])`;
   if (req.query.from) where += ` AND i.sold_on >= $${push(new Date(req.query.from))}`;
   if (req.query.to) where += ` AND i.sold_on <= $${push(new Date(req.query.to))}`;
-  if (req.query.color) where += ` AND i.color = $${push(req.query.color)}`;
-  if (req.query.fabric) where += ` AND i.fabric = $${push(req.query.fabric)}`;
-  if (req.query.size) where += ` AND i.size = $${push(req.query.size)}`;
-  if (req.query.style) where += ` AND i.style = $${push(req.query.style)}`;
+  if (req.query.color) where += ` AND ${SHELF_FACET('color')}, i.color) = $${push(req.query.color)}`;
+  if (req.query.fabric) where += ` AND ${SHELF_FACET('fabric')}, i.fabric) = $${push(req.query.fabric)}`;
+  if (req.query.size) where += ` AND ${SHELF_FACET('size')}, i.size) = $${push(req.query.size)}`;
+  if (req.query.style) where += ` AND ${SHELF_FACET('category')}, i.style) = $${push(req.query.style)}`;
   if (req.query.sku) where += ` AND i.sku ILIKE $${push(req.query.sku)}`;
   const q = String(req.query.q || '').trim();
   if (q) {

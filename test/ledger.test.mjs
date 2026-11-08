@@ -33,6 +33,7 @@ await db.exec(`
   CREATE TABLE shops (id SERIAL PRIMARY KEY, business_id INT, name TEXT, code TEXT);
   CREATE TABLE stock_items (
     id SERIAL PRIMARY KEY, shop_id INT, name TEXT, sku TEXT, fabric TEXT DEFAULT '',
+    category TEXT DEFAULT '', size TEXT DEFAULT '',
     color TEXT DEFAULT '', qty INT DEFAULT 0, price NUMERIC(14,2) DEFAULT 0
   );
   CREATE TABLE imported_sales (
@@ -297,6 +298,39 @@ check('and so does a deletion',
 check('correcting one touches no stock',
   !/stock_items SET|stock_movements/.test(grab('async function correctBookLine(req, res, client, lineId) {', '\n}')),
   'it moves stock');
+
+// ── A filter asks the shelf, not the book ────────────────────────────────
+// The books were written against the catalogue of their day: the same code
+// is "RAYON LINEN / BULU KUDA LINEN" in the book and "BULU KUDA RAYON LINEN
+// / NATURAL" on today's shelf. Filtering the book by its own words threw
+// away two years of a garment's history the moment a fabric was picked, and
+// the best-seller list showed it at one piece — the one sale the app itself
+// had rung up.
+console.log('\n  a filter asks the shelf, not the book');
+// eslint-disable-next-line no-eval
+const SHELF_FACET = eval('(' + grab('const SHELF_FACET = (col) =>', '`;').replace('const SHELF_FACET = ', '').replace(/;$/, '') + ')');
+
+await db.query(`INSERT INTO stock_items (shop_id, name, sku, fabric, color, size, qty, price)
+                VALUES (1, 'FLOWY DRESS LONG NATURAL O/S', 'FL-1032', 'BULU KUDA RAYON LINEN', 'NATURAL', 'O/S', 2, 980000)`);
+await db.query(`INSERT INTO imported_sales (shop_id, source, sku, name, style, fabric, color, size, sold_on, units, value)
+                VALUES (1, 'test book', 'FL-1032', 'FLOWY DRESS LONG BULU KUDA LINEN O/S', 'FLOWY DRESS LONG',
+                        'RAYON LINEN', 'BULU KUDA LINEN', 'O/S', '2025-01-17', 1, 980000),
+                       (1, 'test book', 'GONE-7', 'OLD KAFTAN', 'OLD KAFTAN', 'RAMIE', 'RUSH', 'O/S', '2025-02-02', 1, 500000)`);
+
+const matching = async (col, val) => (await db.query(
+  `SELECT COUNT(*)::int AS n
+     FROM imported_sales i JOIN shops sh ON sh.id = i.shop_id
+    WHERE sh.business_id = 1 AND i.sku IN ('FL-1032','GONE-7') AND ${SHELF_FACET(col)}, i.${col === 'category' ? 'style' : col}) = $1`,
+  [val])).rows[0].n;
+
+check('a book line is found by what the shelf calls the fabric',
+  (await matching('fabric', 'BULU KUDA RAYON LINEN')) === 1, 'the book\'s own word was used');
+check('and not by the word the book used, which is two catalogues old',
+  (await matching('fabric', 'RAYON LINEN')) === 0, 'the stale word still matches');
+check('a code no shop carries keeps the book\'s word, so it stays findable',
+  (await matching('fabric', 'RAMIE')) === 1, 'the line fell out of every filter');
+check('the same for colour',
+  (await matching('color', 'NATURAL')) === 1, 'colour still reads the book');
 
 console.log(failures === 0 ? '\nall checks passed' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);
