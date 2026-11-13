@@ -32,6 +32,8 @@ const grab = (decl, end) => {
 
 const db = new PGlite();
 await db.exec(`
+  CREATE TABLE businesses (id SERIAL PRIMARY KEY);
+  INSERT INTO businesses DEFAULT VALUES;
   CREATE TABLE shops (id SERIAL PRIMARY KEY, business_id INT, name TEXT, code TEXT);
   CREATE TABLE stock_items (
     id SERIAL PRIMARY KEY, shop_id INT, name TEXT, sku TEXT, category TEXT DEFAULT '',

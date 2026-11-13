@@ -487,6 +487,9 @@ async function initDB() {
   `);
   const isFirstEmailVerifiedMigration = !emailColCheck.length;
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE`);
+  // 'clothing' is the original business. 'cosmetics' is a sibling with its own
+  // shops, stock, staff and sales, so nothing in one can leak into the other.
+  await pool.query(`ALTER TABLE businesses ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'clothing'`);
   if (isFirstEmailVerifiedMigration) {
     const { rowCount } = await pool.query(`UPDATE users SET email_verified=TRUE`);
     logger.info('migration.email_verified.grandfathered', { rows: rowCount });
@@ -923,7 +926,7 @@ app.post('/api/auth/access-login', authLimiter, validate(accessSchema), async (r
     res.json({
       token: makeToken(masterUser, access),
       user: formatUser(masterUser, access),
-      business: { id: biz.id, name: biz.name },
+      business: { id: biz.id, name: biz.name, kind: biz.kind || 'clothing' },
       shop: shopRows[0] || null,
     });
   } catch (err) {
@@ -940,9 +943,12 @@ app.get('/api/auth/me', auth, async (req, res) => {
     const { rows } = await pool.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
     if (!rows.length) return res.status(401).json({ error: 'User not found' });
     let business = null;
-    if (rows[0].business_id) {
-      const b = await pool.query('SELECT * FROM businesses WHERE id=$1', [rows[0].business_id]);
-      if (b.rows[0]) business = { id: b.rows[0].id, name: b.rows[0].name };
+    // The business comes from the token, not the user row: the same login can
+    // be looking at clothing or at cosmetics.
+    const bizId = req.user.businessId || rows[0].business_id;
+    if (bizId) {
+      const b = await pool.query('SELECT * FROM businesses WHERE id=$1', [bizId]);
+      if (b.rows[0]) business = { id: b.rows[0].id, name: b.rows[0].name, kind: b.rows[0].kind || 'clothing' };
     }
     // Carry the session's access level and shop through a page reload, so a
     // staff code does not come back as the manager.
@@ -954,6 +960,95 @@ app.get('/api/auth/me', auth, async (req, res) => {
   } catch (err) {
     logger.error('me.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── Auth: switch between clothing and cosmetics ───────────
+// Cosmetics (bags, purses and the like) is a second business under the same
+// login. It has its own shops, stock, staff and sales, so it never shows up in
+// the clothing stock or the clothing sales history. Switching hands back a
+// token for the other business; the access level and shop key carry over.
+const modeSchema = z.object({ mode: z.enum(['clothing', 'cosmetics']) });
+
+// Created the first time someone switches to it. Shops mirror the clothing
+// ones (same names, same shop keys) so a shop key opens the same shop in both,
+// and the staff list is copied once so nobody has to be added twice.
+async function ensureCosmeticsBusiness(client, clothing, ownerId) {
+  const found = (await client.query(
+    `SELECT * FROM businesses WHERE kind = 'cosmetics' ORDER BY id ASC LIMIT 1`
+  )).rows[0];
+  if (found) return found;
+
+  await client.query('BEGIN');
+  try {
+    const biz = (await client.query(
+      `INSERT INTO businesses (name, owner_id, kind) VALUES ($1,$2,'cosmetics') RETURNING *`,
+      [`${clothing.name} Cosmetics`, ownerId]
+    )).rows[0];
+    const { rows: src } = await client.query(
+      'SELECT id, name, address, code FROM shops WHERE business_id=$1 ORDER BY id ASC', [clothing.id]
+    );
+    const shopFor = new Map();
+    for (const sh of src) {
+      const made = (await client.query(
+        'INSERT INTO shops (business_id, name, address, code) VALUES ($1,$2,$3,$4) RETURNING id',
+        [biz.id, sh.name, sh.address || '', sh.code]
+      )).rows[0];
+      shopFor.set(sh.id, made.id);
+    }
+    const { rows: people } = await client.query(
+      'SELECT name, shop_id, commission_rate FROM staff WHERE business_id=$1 AND active=TRUE', [clothing.id]
+    );
+    for (const p of people) {
+      await client.query(
+        'INSERT INTO staff (business_id, shop_id, name, commission_rate) VALUES ($1,$2,$3,$4)',
+        [biz.id, p.shop_id ? (shopFor.get(p.shop_id) || null) : null, p.name, p.commission_rate || 0]
+      );
+    }
+    await client.query('COMMIT');
+    logger.info('cosmetics.created', { businessId: biz.id, shops: src.length, staff: people.length });
+    return biz;
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  }
+}
+
+app.post('/api/auth/mode', auth, validate(modeSchema), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { rows: users } = await client.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
+    if (!users.length) return res.status(401).json({ error: 'User not found' });
+    const clothing = (await client.query(
+      `SELECT * FROM businesses WHERE kind = 'clothing' ORDER BY id ASC LIMIT 1`
+    )).rows[0];
+    if (!clothing) return res.status(409).json({ error: 'No business set up yet' });
+
+    const biz = req.body.mode === 'cosmetics'
+      ? await ensureCosmeticsBusiness(client, clothing, users[0].id)
+      : clothing;
+
+    const access = { role: req.accessRole, shopCode: req.user.shopCode || null };
+    // A shop key must land on a shop that exists in the business it asked for.
+    let shop = null;
+    if (access.role === 'staff') {
+      shop = (await client.query(
+        'SELECT id, name, code FROM shops WHERE business_id=$1 AND code=$2', [biz.id, access.shopCode]
+      )).rows[0];
+      if (!shop) return res.status(403).json({ error: 'That shop key has no shop here yet' });
+    }
+    const token = makeToken({ ...users[0], business_id: biz.id }, access);
+    res.json({
+      token,
+      user: { ...formatUser({ ...users[0], business_id: biz.id }, access) },
+      business: { id: biz.id, name: biz.name, kind: biz.kind || 'clothing' },
+      shop,
+    });
+  } catch (err) {
+    logger.error('mode.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
   }
 });
 
@@ -3276,7 +3371,9 @@ async function seedOpeningStock() {
     if (seen.length) return;
 
     const { rows: shops } = await client.query(
-      `SELECT id, code FROM shops WHERE code = ANY($1::text[])`, [['OF', 'GD', 'RG']]
+      `SELECT id, code FROM shops WHERE code = ANY($1::text[])
+         AND business_id = (SELECT MIN(id) FROM businesses)`,
+      [['OF', 'GD', 'RG']]
     );
     if (!shops.length) return;
     const COLUMN = { OF: 7, GD: 8, RG: 9 };
@@ -3389,7 +3486,9 @@ async function seedOneBook({ shop, file }) {
   const client = await pool.connect();
   try {
     const { rows: shops } = await client.query(
-      `SELECT id FROM shops WHERE code = $1 LIMIT 1`, [shop]
+      `SELECT id FROM shops WHERE code = $1
+         AND business_id = (SELECT MIN(id) FROM businesses)
+       ORDER BY id ASC LIMIT 1`, [shop]
     );
     if (!shops.length) {
       logger.warn('ledger.seed.skipped', { why: 'that shop does not exist yet', shop });
