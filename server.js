@@ -521,6 +521,20 @@ async function initDB() {
   // than on each sale, because the rate is a standing arrangement.
   await pool.query(`ALTER TABLE staff ADD COLUMN IF NOT EXISTS commission_rate NUMERIC(6,3) NOT NULL DEFAULT 0`);
 
+  // One-time: everyone on the floor earns 2% except Sandra, who is left as
+  // she is. Marked in seed_marks so it runs on the first boot only — a rate
+  // someone edits later must not be put back on the next deploy.
+  await pool.query(`CREATE TABLE IF NOT EXISTS seed_marks (
+    key TEXT PRIMARY KEY, done_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  const { rowCount: flatRateDue } = await pool.query(
+    `INSERT INTO seed_marks (key) VALUES ('commission-2pct-except-sandra') ON CONFLICT DO NOTHING`
+  );
+  if (flatRateDue) {
+    await pool.query(`UPDATE staff SET commission_rate = 2 WHERE LOWER(TRIM(name)) <> 'sandra'`);
+    logger.info('migration.commission_rate', { rate: 2, except: 'sandra' });
+  }
+
   // staff_name is a snapshot, not just the join: if someone leaves and is
   // removed from the list, the history of what they scanned must survive.
   await pool.query(`
@@ -4843,93 +4857,135 @@ app.get('/api/analytics/summary', auth, requireAdmin, async (req, res) => {
   }
 });
 
-// ── Commission ────────────────────────────────────────────
+// ── Staff: what each person sold, and what they earned ────
 // Decided rather than left configurable, because a shop this size needs one
 // rule everyone understands:
-//   · a percentage of what the person sold, not a flat fee per garment —
-//     prices run from a few hundred thousand to over a million rupiah, and
-//     per-unit would pay the same for either;
-//   · the rate lives on the staff row, so it can differ per person, and one
-//     shared rate is simply the case where they all match;
+//   · commission is a percentage of what the person sold, not a flat fee per
+//     garment — prices run from a few hundred thousand to over a million
+//     rupiah, and per-unit would pay the same for either;
+//   · the rate lives on the staff row, so it can differ per person;
 //   · returns are deducted. Without that, ringing up a sale, taking the
 //     commission and refunding it next week is free money.
-// Write-offs (damaged, lost, sample) are NOT deducted: no commission was
+// Write-offs (damaged, lost, sample) are not deducted: no commission was
 // earned on them, so there is nothing to claw back.
-const COMMISSION_SQL = `
-  SELECT COALESCE(NULLIF(m.staff_name,''), '(not recorded)') AS name,
-         MIN(m.staff_id) AS staff_id,
-         COALESCE(SUM(CASE WHEN m.type='sale'   THEN -m.qty_change ELSE 0 END),0)::int AS sold_units,
-         COALESCE(SUM(CASE WHEN m.type='return' THEN  m.qty_change ELSE 0 END),0)::int AS returned_units,
-         COALESCE(SUM(CASE WHEN m.type='sale'   THEN -m.qty_change * ${SALE_NET_SQL} ELSE 0 END),0)::numeric AS gross,
-         COALESCE(SUM(CASE WHEN m.type='return' THEN  m.qty_change * ${SALE_NET_SQL} ELSE 0 END),0)::numeric AS returned
-  FROM stock_movements m
-  JOIN stock_items si ON si.id = m.item_id
-  JOIN shops sh ON sh.id = m.shop_id
-`;
-
-async function commissionRows(req) {
+//
+// Both books are counted, as in the sales log beside it: the shop's own book
+// names who served, and a person's total that left out two years of it would
+// disagree with the log. Sales are matched to the staff list by name, ignoring
+// case, because the book was written by hand. Nothing here writes to a sale.
+async function staffSummaryRows(req) {
   const { where, params } = await salesFilter(req, 3);
   const all = [req.user.businessId, String(HISTORY_MONTHS), ...params];
+  const ledger = await ledgerFilter(req, all.length + 1);
   const { rows } = await pool.query(
-    `${COMMISSION_SQL}
-     WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}
-       AND m.occurred_at >= NOW() - ($2 || ' months')::interval ${where}
-     GROUP BY 1`,
-    all
+    `SELECT s.key,
+            MIN(s.staff_name) FILTER (WHERE s.key <> '') AS name,
+            MIN(s.staff_id) AS staff_id,
+            COUNT(*) FILTER (WHERE s.type = 'sale')::int AS entries,
+            COALESCE(SUM(CASE WHEN s.type='sale'   THEN -s.qty_change ELSE 0 END),0)::int AS sold_units,
+            COALESCE(SUM(CASE WHEN s.type='return' THEN  s.qty_change ELSE 0 END),0)::int AS returned_units,
+            COALESCE(SUM(CASE WHEN s.type='sale'   THEN -s.qty_change * s.net_price ELSE 0 END),0)::numeric AS gross,
+            COALESCE(SUM(CASE WHEN s.type='return' THEN  s.qty_change * s.net_price ELSE 0 END),0)::numeric AS returned,
+            MAX(s.occurred_at) AS last_at
+       FROM (
+         SELECT x.*,
+                CASE WHEN x.staff_name IN ('', '(not recorded)') THEN ''
+                     ELSE LOWER(TRIM(x.staff_name)) END AS key
+           FROM (
+             ${SALE_SELECT} WHERE sh.business_id = $1 AND ${SALE_TYPES_SQL}
+               AND m.occurred_at >= NOW() - ($2 || ' months')::interval ${where}
+             UNION ALL
+             ${LEDGER_SELECT} WHERE sh.business_id = $1
+               AND i.sold_on >= (NOW() - ($2 || ' months')::interval)::date${ledger.where}
+           ) x
+       ) s
+      GROUP BY s.key`,
+    [...all, ...ledger.params]
   );
-  const { rows: staffRows } = await pool.query(
-    'SELECT id, name, commission_rate FROM staff WHERE business_id=$1', [req.user.businessId]
+  const { rows: people } = await pool.query(
+    `SELECT st.id, st.name, st.shop_id, st.active, st.commission_rate, sh.name AS shop_name
+       FROM staff st LEFT JOIN shops sh ON sh.id = st.shop_id
+      WHERE st.business_id = $1`,
+    [req.user.businessId]
   );
-  const rateById = new Map(staffRows.map(r => [r.id, Number(r.commission_rate) || 0]));
-  const rateByName = new Map(staffRows.map(r => [r.name.toLowerCase(), Number(r.commission_rate) || 0]));
+  const listed = new Map(people.map(p => [String(p.name).trim().toLowerCase(), p]));
+  const sold = new Map(rows.map(r => [r.key, r]));
 
-  return rows.map(r => {
-    const gross = Number(r.gross);
-    const returned = Number(r.returned);
+  const build = (key, r, p) => {
+    const gross = r ? Number(r.gross) : 0;
+    const returned = r ? Number(r.returned) : 0;
     const net = gross - returned;
-    const rate = r.staff_id != null && rateById.has(r.staff_id)
-      ? rateById.get(r.staff_id)
-      : (rateByName.get(String(r.name).toLowerCase()) || 0);
+    const rate = p ? Number(p.commission_rate) || 0 : 0;
     return {
-      staffId: r.staff_id, name: r.name, rate,
-      soldUnits: r.sold_units, returnedUnits: r.returned_units,
-      netUnits: r.sold_units - r.returned_units,
+      name: p ? p.name : (r && r.name) || '',
+      staffId: p ? p.id : (r ? r.staff_id : null),
+      listed: !!p,
+      active: p ? p.active : false,
+      shopId: p ? p.shop_id : null,
+      shopName: p ? (p.shop_name || '') : '',
+      rate,
+      entries: r ? r.entries : 0,
+      soldUnits: r ? r.sold_units : 0,
+      returnedUnits: r ? r.returned_units : 0,
+      netUnits: r ? r.sold_units - r.returned_units : 0,
       gross, returned, net,
       commission: Math.round(net * rate) / 100,
+      lastAt: r ? r.last_at : null,
     };
-  }).sort((a, b) => b.net - a.net);
+  };
+
+  const items = [];
+  // Everyone on the staff list, whether or not they sold anything in the
+  // period; a person who has left appears only if they sold something.
+  for (const [key, p] of listed) {
+    const r = sold.get(key);
+    if (!p.active && !r) continue;
+    items.push(build(key, r, p));
+  }
+  // Names in the books that are not on the list: shown, so the totals still
+  // add up, but earning nothing until someone adds them.
+  for (const [key, r] of sold) {
+    if (key === '' || listed.has(key)) continue;
+    items.push(build(key, r, null));
+  }
+  items.sort((a, b) => b.net - a.net || a.name.localeCompare(b.name));
+
+  const unnamed = sold.get('');
+  const unnamedRow = unnamed ? build('', unnamed, null) : null;
+  return { items, unnamed: unnamedRow };
 }
 
-app.get('/api/commission', auth, requireAdmin, async (req, res) => {
+app.get('/api/staff/summary', auth, requireAdmin, async (req, res) => {
   try {
-    const items = await commissionRows(req);
+    const { items, unnamed } = await staffSummaryRows(req);
+    const all = unnamed ? [...items, unnamed] : items;
+    const sum = (f) => all.reduce((n, i) => n + i[f], 0);
     res.json({
       items,
+      unnamed,
       totals: {
-        soldUnits: items.reduce((n, i) => n + i.soldUnits, 0),
-        returnedUnits: items.reduce((n, i) => n + i.returnedUnits, 0),
-        gross: items.reduce((n, i) => n + i.gross, 0),
-        returned: items.reduce((n, i) => n + i.returned, 0),
-        net: items.reduce((n, i) => n + i.net, 0),
+        soldUnits: sum('soldUnits'), returnedUnits: sum('returnedUnits'),
+        gross: sum('gross'), returned: sum('returned'), net: sum('net'),
         commission: items.reduce((n, i) => n + i.commission, 0),
+        sellers: items.filter(i => i.soldUnits > 0).length,
       },
     });
   } catch (err) {
-    logger.error('commission.error', { err: err.message });
+    logger.error('staff.summary.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.get('/api/commission.csv', auth, requireAdmin, async (req, res) => {
+app.get('/api/staff/summary.csv', auth, requireAdmin, async (req, res) => {
   try {
-    const items = await commissionRows(req);
+    const { items } = await staffSummaryRows(req);
     const body = csvDoc(
-      ['Staff', 'Sold (units)', 'Returned (units)', 'Gross (IDR)', 'Returned (IDR)', 'Net (IDR)', 'Rate (%)', 'Commission (IDR)'],
-      items.map(r => [r.name, r.soldUnits, r.returnedUnits, r.gross, r.returned, r.net, r.rate, r.commission])
+      ['Staff', 'Shop', 'Rate (%)', 'Sold (units)', 'Returned (units)', 'Gross (IDR)', 'Returned (IDR)', 'Net (IDR)', 'Commission (IDR)'],
+      items.map(r => [r.name, r.shopName, r.rate, r.soldUnits, r.returnedUnits, r.gross, r.returned, r.net, r.commission])
     );
-    sendCsv(res, `commission-${new Date().toISOString().slice(0, 10)}.csv`, body);
+    sendCsv(res, `staff-${new Date().toISOString().slice(0, 10)}.csv`, body);
   } catch (err) {
-    logger.error('commission.csv.error', { err: err.message });
+    logger.error('staff.summary.csv.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
