@@ -5800,8 +5800,31 @@ app.post('/api/admin/import-stock', auth, requireAdmin, validate(importSchema), 
     );
     let position = posRows[0].p;
 
+    // A code another shop already stocks keeps that shop's spelling. The
+    // sheets were written by different hands — "LADY DIANA'S DRESS" in one
+    // and "LADY DIANA DRESS" in the shop's own list — and Quick check puts a
+    // garment's sizes together by style, fabric and colour, so a differently
+    // spelled copy lands on a card of its own and reads as stock that is
+    // missing. The code is what the sheets agree on, so the catalogue decides
+    // what the garment is called; the sheet decides how many and the price.
+    const { rows: known } = await client.query(
+      `SELECT DISTINCT ON (UPPER(si.sku))
+              UPPER(si.sku) AS sku, si.name, si.category, si.fabric, si.color, si.size
+         FROM stock_items si JOIN shops sh ON sh.id = si.shop_id
+        WHERE sh.business_id = $1 AND si.shop_id <> $2 AND COALESCE(si.sku,'') <> ''
+        ORDER BY UPPER(si.sku), si.shop_id`,
+      [req.user.businessId, shopId]
+    );
+    const catalogue = new Map(known.map(k => [k.sku, k]));
+
     let created = 0, updated = 0;
-    for (const r of deduped) {
+    for (const sheetRow of deduped) {
+      const cat = catalogue.get(sheetRow.sku.toUpperCase());
+      const r = cat
+        ? { ...sheetRow, name: cat.name || sheetRow.name, style: cat.category || sheetRow.style,
+            fabric: cat.fabric || sheetRow.fabric, color: cat.color || sheetRow.color,
+            size: cat.size || sheetRow.size }
+        : sheetRow;
       const id = idByCode.get(r.sku.toUpperCase());
       // STYLE is the grouping the shop reads by — "all the Agustine dresses"
       // — and it fills the category. FABRIC is what the garment is made of,
