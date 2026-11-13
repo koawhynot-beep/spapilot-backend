@@ -5882,7 +5882,14 @@ const RESET_PHRASE = 'DELETE ALL STOCK';
 app.get('/api/admin/data-counts', auth, requireAdmin, async (req, res) => {
   try {
     const businessId = req.user.businessId;
-    const one = async (sql) => Number((await pool.query(sql, [businessId])).rows[0].n);
+    // Optionally for one shop only, so the confirmation screen for clearing a
+    // single shop states that shop's numbers, not the whole business's.
+    const shopId = parseInt(req.query.shopId, 10);
+    const scoped = Number.isInteger(shopId);
+    const one = async (sql) => Number((await pool.query(
+      sql + (scoped ? ' AND sh.id = $2' : ''),
+      scoped ? [businessId, shopId] : [businessId]
+    )).rows[0].n);
     res.json({
       items: await one(
         `SELECT COUNT(*)::int AS n FROM stock_items si
@@ -5893,9 +5900,13 @@ app.get('/api/admin/data-counts', auth, requireAdmin, async (req, res) => {
       groups: await one(
         `SELECT COUNT(*)::int AS n FROM item_groups g
          JOIN shops sh ON sh.id = g.shop_id WHERE sh.business_id = $1`),
+      // The shop's own sales book, which a one-shop clear removes as well.
+      sales: await one(
+        `SELECT COUNT(*)::int AS n FROM imported_sales i
+         JOIN shops sh ON sh.id = i.shop_id WHERE sh.business_id = $1`),
       // Kept by the reset — shown so it is clear what survives.
-      shops: await one(`SELECT COUNT(*)::int AS n FROM shops WHERE business_id = $1`),
-      staff: await one(`SELECT COUNT(*)::int AS n FROM staff WHERE business_id = $1 AND active = TRUE`),
+      shops: Number((await pool.query(`SELECT COUNT(*)::int AS n FROM shops WHERE business_id = $1`, [businessId])).rows[0].n),
+      staff: Number((await pool.query(`SELECT COUNT(*)::int AS n FROM staff WHERE business_id = $1 AND active = TRUE`, [businessId])).rows[0].n),
     });
   } catch (err) {
     logger.error('admin.counts.error', { err: err.message });
@@ -5960,6 +5971,64 @@ app.post('/api/admin/reset-stock', auth, requireAdmin, async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     logger.error('admin.reset.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// ── Clear one shop's stock ────────────────────────────────
+// For when a shop's list has to be rebuilt from its workbook: the stock, every
+// movement, the groups, the shop's sales book, and any transfer that touches
+// it. The other shops, the staff list and the audit trail are left alone, and
+// the clear itself is recorded. Same confirmation phrase as the full reset.
+app.post('/api/admin/reset-shop-stock', auth, requireAdmin, async (req, res) => {
+  if (String(req.body && req.body.confirm) !== RESET_PHRASE) {
+    return res.status(400).json({ error: `Type "${RESET_PHRASE}" to confirm` });
+  }
+  const shopId = parseInt(req.body && req.body.shopId, 10);
+  if (!Number.isInteger(shopId)) return res.status(400).json({ error: 'Pick a shop' });
+  const client = await pool.connect();
+  try {
+    const businessId = req.user.businessId;
+    const { rows: shop } = await client.query(
+      'SELECT id, name FROM shops WHERE id = $1 AND business_id = $2', [shopId, businessId]
+    );
+    if (!shop.length) return res.status(404).json({ error: 'Shop not found' });
+
+    await client.query('BEGIN');
+    const n = async (sql) => Number((await client.query(sql, [shopId])).rows[0].n);
+    const before = {
+      items: await n(`SELECT COUNT(*)::int AS n FROM stock_items WHERE shop_id = $1`),
+      movements: await n(`SELECT COUNT(*)::int AS n FROM stock_movements WHERE shop_id = $1`),
+      groups: await n(`SELECT COUNT(*)::int AS n FROM item_groups WHERE shop_id = $1`),
+      sales: await n(`SELECT COUNT(*)::int AS n FROM imported_sales WHERE shop_id = $1`),
+    };
+
+    // Children before parents, so the order can be read and checked.
+    await client.query(
+      `DELETE FROM stock_transfers WHERE business_id = $2 AND (from_shop_id = $1 OR to_shop_id = $1)`,
+      [shopId, businessId]);
+    await client.query(`DELETE FROM stock_check_marks WHERE shop_id = $1`, [shopId]);
+    await client.query(`DELETE FROM stock_check_rounds WHERE shop_id = $1`, [shopId]);
+    await client.query(`DELETE FROM imported_sales WHERE shop_id = $1`, [shopId]);
+    await client.query(`DELETE FROM stock_movements WHERE shop_id = $1`, [shopId]);
+    await client.query(`DELETE FROM stock_items WHERE shop_id = $1`, [shopId]);
+    await client.query(`DELETE FROM item_groups WHERE shop_id = $1`, [shopId]);
+
+    await client.query(
+      `INSERT INTO audit_log (business_id, action, entity, summary, before_val, actor_role)
+       VALUES ($1, 'reset', 'stock', $2, $3, $4)`,
+      [businessId,
+       `Cleared ${shop[0].name}: ${before.items} products, ${before.movements} movements, ${before.groups} groups, ${before.sales} book sales. Other shops and staff kept.`,
+       JSON.stringify({ shop: shop[0].name, ...before }), req.accessRole]
+    );
+    await client.query('COMMIT');
+    logger.warn('admin.reset_shop_stock', { businessId, shopId, ...before });
+    res.json({ ok: true, shop: shop[0].name, removed: before });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    logger.error('admin.reset_shop.error', { err: err.message });
     res.status(500).json({ error: 'Internal server error' });
   } finally {
     client.release();
