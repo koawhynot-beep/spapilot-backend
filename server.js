@@ -3237,13 +3237,22 @@ app.get('/api/sales/history', auth, async (req, res) => {
     // two are put together here rather than in a view, so the movements
     // half stays exactly the query it always was.
     const ledger = await ledgerFilter(req, all.length + 1);
-    const both = `(
+    // One person's sales, for the Staff tab. Matched on the name the way the
+    // Staff totals are — ignoring case and spaces — so the rows listed here
+    // are exactly the ones counted in that person's total, book included.
+    const seller = String(req.query.seller || '').trim().toLowerCase();
+    const sellerAt = all.length + ledger.params.length + 1;
+    const sellerSql = seller
+      ? ` WHERE (CASE WHEN x.staff_name IN ('', '(not recorded)') THEN ''
+                      ELSE LOWER(TRIM(x.staff_name)) END) = $${sellerAt}`
+      : '';
+    const both = `(SELECT x.* FROM (
       ${SALE_SELECT} WHERE ${windowSql}
       UNION ALL
       ${LEDGER_SELECT} WHERE sh.business_id = $1
         AND i.sold_on >= (NOW() - ($2 || ' months')::interval)::date${ledger.where}
-    ) s`;
-    const bothParams = [...all, ...ledger.params];
+    ) x${sellerSql}) s`;
+    const bothParams = [...all, ...ledger.params, ...(seller ? [seller] : [])];
 
     const { rows } = await pool.query(
       `SELECT * FROM ${both} ORDER BY ${orderBy} LIMIT ${limit} OFFSET ${offset}`,

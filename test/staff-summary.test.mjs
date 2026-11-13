@@ -86,5 +86,24 @@ const whole = Number((await db.query(`
 const total = items.reduce((n, r) => n + r.net, 0) + unnamed.net;
 check('the rows add up to everything sold, with nothing lost', total === whole, `${total} vs ${whole}`);
 
+// ── Clicking a person: their rows, the same ones the total counts ─────────
+console.log("\n  one person's sales");
+const sql = new Function(`${consts}\nreturn { SALE_SELECT, LEDGER_SELECT, SALE_TYPES_SQL };`)();
+const KEY = `CASE WHEN x.staff_name IN ('', '(not recorded)') THEN '' ELSE LOWER(TRIM(x.staff_name)) END`;
+const rowsOf = async (who) => (await db.query(
+  `SELECT x.* FROM (
+     ${sql.SALE_SELECT} WHERE sh.business_id = 1 AND ${sql.SALE_TYPES_SQL}
+     UNION ALL
+     ${sql.LEDGER_SELECT} WHERE sh.business_id = 1
+   ) x WHERE ${KEY} = $1`, [who])).rows;
+const wayan = await rowsOf('wayan');
+check('the rows listed for a person are the ones in their total, app and book together',
+  wayan.length === 3 && wayan.filter(r => r.from_book).length === 1, String(wayan.length));
+check('the same name written another way finds the same rows',
+  (await rowsOf('sandra')).length === 1, 'sandra');
+check('the route filters on exactly that expression',
+  src.includes("WHEN x.staff_name IN ('', '(not recorded)') THEN ''") && src.includes('LOWER(TRIM(x.staff_name))'),
+  'route expression differs');
+
 console.log(failures ? `\n${failures} FAILED` : '\nall checks passed');
 process.exit(failures ? 1 : 0);
