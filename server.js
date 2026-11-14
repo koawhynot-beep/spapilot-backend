@@ -866,6 +866,12 @@ async function initDB() {
   // No book is listed, so this only keeps the table empty.
   await seedImportedSales();
 
+  // Accessories were sold at the same till as the clothes, so the shops' books
+  // carry their sales in with everything else. Those lines belong to the
+  // cosmetics side: moved, not deleted, so the history is whole and shows up
+  // there instead of in the clothing sales and rankings.
+  await moveAccessorySales();
+
 
   // Office's opening stock. Not a migration — it is data, and it runs after
   // every table it touches exists. Once, and only into an empty shop.
@@ -3502,6 +3508,30 @@ async function seedImportedSales() {
   }
   for (const book of IMPORTED_BOOKS) {
     await seedOneBook(book);
+  }
+}
+
+// A book line whose code the cosmetics business stocks moves to the cosmetics
+// shop with the same shop key (Goldust's accessories to Goldust Cosmetics).
+// Decided by the cosmetics stock list itself rather than a list kept here, so
+// an accessory added later is picked up on the next boot. Safe to run every
+// boot: once moved, there is nothing left to match.
+async function moveAccessorySales() {
+  try {
+    const { rowCount } = await pool.query(
+      `UPDATE imported_sales i SET shop_id = cos.id
+         FROM shops s
+         JOIN businesses cl ON cl.id = s.business_id AND cl.kind = 'clothing'
+         JOIN businesses cb ON cb.kind = 'cosmetics'
+         JOIN shops cos ON cos.business_id = cb.id AND cos.code = s.code
+        WHERE s.id = i.shop_id
+          AND EXISTS (
+            SELECT 1 FROM stock_items si JOIN shops ss ON ss.id = si.shop_id
+             WHERE ss.business_id = cb.id AND UPPER(si.sku) = UPPER(i.sku))`
+    );
+    if (rowCount) logger.warn('ledger.accessories_moved', { lines: rowCount });
+  } catch (err) {
+    logger.error('ledger.accessories.error', { err: err.message });
   }
 }
 
