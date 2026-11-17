@@ -4110,6 +4110,58 @@ app.patch('/api/sales/:id', auth, validate(saleEditSchema), async (req, res) => 
 // anybody forgets pays commission on a sale that did not happen. The audit
 // log keeps the record instead: it stores what the row said before it went,
 // which is the part worth keeping.
+// Re-date a batch of stock-in / stock-out entries at once. Only the date moves:
+// quantities and stock levels are left exactly as they are, so this is safe
+// for "it actually came in yesterday". Sales and returns have their own,
+// stricter correction and are refused here.
+app.post('/api/movements/redate', auth, requireAdmin, async (req, res) => {
+  try {
+    const list = Array.isArray(req.body && req.body.moves) ? req.body.moves : [];
+    if (!list.length || list.length > 500) {
+      return res.status(400).json({ error: 'Pick between 1 and 500 entries' });
+    }
+    const ids = [], whens = [];
+    for (const m of list) {
+      const id = Number(m && m.id), d = new Date(m && m.occurredAt);
+      if (!Number.isInteger(id) || id <= 0 || Number.isNaN(d.getTime())) {
+        return res.status(400).json({ error: 'Bad entry in the list' });
+      }
+      if (d.getTime() > Date.now() + 5 * 60 * 1000) {
+        return res.status(400).json({ error: 'A stock date cannot be in the future' });
+      }
+      ids.push(id); whens.push(d.toISOString());
+    }
+    const { rows } = await pool.query(
+      `SELECT m.id, m.shop_id, m.type FROM stock_movements m
+         JOIN shops sh ON sh.id = m.shop_id
+        WHERE m.id = ANY($1::int[]) AND sh.business_id = $2`,
+      [ids, req.user.businessId]
+    );
+    if (rows.length !== new Set(ids).size) {
+      return res.status(404).json({ error: 'Some of those entries no longer exist' });
+    }
+    if (rows.some(r => !shopAllowed(req, r.shop_id))) return denyShop(res);
+    if (rows.some(r => r.type === 'sale' || r.type === 'return')) {
+      return res.status(400).json({ error: 'Sales and returns are corrected one at a time' });
+    }
+    await pool.query(
+      `UPDATE stock_movements m SET occurred_at = v.at
+         FROM (SELECT UNNEST($1::int[]) AS id, UNNEST($2::timestamptz[]) AS at) v
+        WHERE m.id = v.id`,
+      [ids, whens]
+    );
+    await audit(req, {
+      action: 'movements.redated', entity: 'stock movements', entityId: ids[0],
+      summary: `Changed the date of ${ids.length} stock entries`,
+      after: { count: ids.length },
+    });
+    res.json({ ok: true, updated: ids.length, moves: ids.map((id, i) => ({ id, occurredAt: whens[i] })) });
+  } catch (err) {
+    logger.error('movements.redate.error', { err: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.delete('/api/movements/:id', auth, requireAdmin, async (req, res) => {
   const client = await pool.connect();
   try {
