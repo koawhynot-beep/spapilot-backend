@@ -99,7 +99,7 @@ const stockItemSchema = z.object({
   sku: z.string().trim().max(100).optional().default(''),
   brand: z.string().trim().max(100).optional().default(''),
   qty: z.coerce.number().int().min(0).default(0),
-  threshold: z.coerce.number().int().min(0).default(5),
+  threshold: z.coerce.number().int().min(0).default(3),
   supplier: z.string().trim().max(200).optional().default(''),
   notes: z.string().trim().max(2000).optional().default(''),
   imageUrl: z.string().trim().max(2000).optional().default(''),
@@ -442,7 +442,7 @@ async function initDB() {
       sku           TEXT DEFAULT '',
       brand         TEXT DEFAULT '',
       qty           INTEGER DEFAULT 0,
-      threshold     INTEGER DEFAULT 5,
+      threshold     INTEGER DEFAULT 3,
       supplier      TEXT DEFAULT '',
       notes         TEXT DEFAULT '',
       last_sold_at  TIMESTAMPTZ,
@@ -527,6 +527,15 @@ async function initDB() {
   await pool.query(`CREATE TABLE IF NOT EXISTS seed_marks (
     key TEXT PRIMARY KEY, done_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
+  // One-time: low stock is 3 or fewer pieces, for every item in every shop.
+  // Marked so a level someone edits later is not put back on the next deploy.
+  const { rowCount: lowLevelDue } = await pool.query(
+    `INSERT INTO seed_marks (key) VALUES ('low-stock-3') ON CONFLICT DO NOTHING`
+  );
+  if (lowLevelDue) {
+    await pool.query(`UPDATE stock_items SET threshold = 3`);
+    logger.info('migration.low_stock', { level: 3 });
+  }
   const { rowCount: flatRateDue } = await pool.query(
     `INSERT INTO seed_marks (key) VALUES ('commission-2pct-except-sandra') ON CONFLICT DO NOTHING`
   );
@@ -5878,7 +5887,7 @@ app.post('/api/admin/import-stock', auth, requireAdmin, validate(importSchema), 
           `INSERT INTO stock_items
              (shop_id, name, category, fabric, print, size, color, sku, brand,
               qty, threshold, supplier, notes, position, image_url, price, cost)
-           VALUES ($1,$2,$3,$4,'',$5,$6,$7,'',$8,0,'','',$9,'',$10,0)`,
+           VALUES ($1,$2,$3,$4,'',$5,$6,$7,'',$8,3,'','',$9,'',$10,0)`,
           [shopId, r.name, style, fabric, r.size, r.color, r.sku, r.qty, position++, r.price]
         );
         created++;
