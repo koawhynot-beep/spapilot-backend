@@ -880,6 +880,7 @@ async function initDB() {
   // cosmetics side: moved, not deleted, so the history is whole and shows up
   // there instead of in the clothing sales and rankings.
   await moveAccessorySales();
+  await moveOfficeCosmeticsToGoldust();
 
 
   // Office's opening stock. Not a migration — it is data, and it runs after
@@ -3525,6 +3526,69 @@ async function seedImportedSales() {
 // Decided by the cosmetics stock list itself rather than a list kept here, so
 // an accessory added later is picked up on the next boot. Safe to run every
 // boot: once moved, there is nothing left to match.
+// One-time, at the owner's request: every cosmetics piece held at Office goes
+// to Goldust. A straight move, written the way a completed transfer writes it
+// (out at Office, in at Goldust, both in the movement log) but without the
+// list-and-tick step. Marked in seed_marks so it runs on one boot only.
+async function moveOfficeCosmeticsToGoldust() {
+  const { rowCount: due } = await pool.query(
+    `INSERT INTO seed_marks (key) VALUES ('cosmetics-office-to-goldust') ON CONFLICT DO NOTHING`
+  );
+  if (!due) return;
+  const client = await pool.connect();
+  try {
+    const { rows: [from] } = await client.query(
+      `SELECT s.id FROM shops s JOIN businesses b ON b.id = s.business_id
+        WHERE b.kind = 'cosmetics' AND LOWER(s.name) = 'office' LIMIT 1`);
+    const { rows: [to] } = await client.query(
+      `SELECT s.id FROM shops s JOIN businesses b ON b.id = s.business_id
+        WHERE b.kind = 'cosmetics' AND LOWER(s.name) = 'goldust' LIMIT 1`);
+    if (!from || !to) { logger.warn('migration.cosmetics_move.no_shops'); return; }
+    await client.query('BEGIN');
+    const { rows: lines } = await client.query(
+      `SELECT * FROM stock_items WHERE shop_id = $1 AND qty > 0 FOR UPDATE`, [from.id]);
+    let pieces = 0;
+    for (const l of lines) {
+      await client.query('UPDATE stock_items SET qty = 0, updated_at = NOW() WHERE id = $1', [l.id]);
+      await client.query(
+        `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note)
+         VALUES ($1,$2,NULL,'transfer-out',$3,0,NOW(),'to Goldust')`, [l.id, from.id, -l.qty]);
+      const { rows: [dest] } = await client.query(
+        `SELECT id, qty FROM stock_items WHERE shop_id = $1 AND UPPER(sku) = UPPER($2) LIMIT 1`,
+        [to.id, l.sku]);
+      let destId, after;
+      if (dest) {
+        destId = dest.id; after = dest.qty + l.qty;
+        await client.query('UPDATE stock_items SET qty = $1, updated_at = NOW() WHERE id = $2', [after, destId]);
+      } else {
+        after = l.qty;
+        const { rows: [made] } = await client.query(
+          `INSERT INTO stock_items
+             (shop_id, name, category, fabric, print, size, color, sku, brand,
+              qty, threshold, supplier, notes, position, image_url, price, cost)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
+                   (SELECT COALESCE(MAX(position), -1) + 1 FROM stock_items WHERE shop_id = $1),
+                   $14,$15,$16) RETURNING id`,
+          [to.id, l.name, l.category, l.fabric, l.print, l.size, l.color, l.sku, l.brand,
+           l.qty, l.threshold, l.supplier, l.notes, l.image_url, l.price, l.cost]);
+        destId = made.id;
+      }
+      await client.query(
+        `INSERT INTO stock_movements (item_id, shop_id, user_id, type, qty_change, qty_after, occurred_at, note)
+         VALUES ($1,$2,NULL,'transfer-in',$3,$4,NOW(),'from Office')`, [destId, to.id, l.qty, after]);
+      pieces += l.qty;
+    }
+    await client.query('COMMIT');
+    logger.warn('migration.cosmetics_move', { lines: lines.length, pieces });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    await pool.query(`DELETE FROM seed_marks WHERE key = 'cosmetics-office-to-goldust'`).catch(() => {});
+    logger.error('migration.cosmetics_move.error', { err: err.message });
+  } finally {
+    client.release();
+  }
+}
+
 async function moveAccessorySales() {
   try {
     const { rowCount } = await pool.query(
